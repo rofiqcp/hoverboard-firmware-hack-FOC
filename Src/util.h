@@ -22,6 +22,7 @@
 #define UTIL_H
 
 #include <stdint.h>
+#include "stm32f1xx_hal.h"
 
 
 // Rx Structures USART
@@ -104,14 +105,25 @@ void usart_process_command(SerialCommand *command_in, SerialCommand *command_out
 void usart_process_sideboard(SerialSideboard *Sideboard_in, SerialSideboard *Sideboard_out, uint8_t usart_idx);
 #endif
 
-// Sideboard functions
-void sideboardLeds(uint8_t *leds);
-void sideboardSensors(uint8_t sensors);
-
 // Poweroff Functions
 void saveConfig(void);
 void poweroff(void);
 void poweroffPressCheck(void);
+
+// Steering Position Controller (implemented in steering.c)
+void steerCtrl_Init(void);
+void steerCtrl_StartHoming(void);
+void steerCtrl_Update(int16_t enc_count, int16_t enc_rpm, int16_t left_curr100);
+int16_t steerCtrl_GetOutput(void);
+void steerCtrl_SetTarget(int16_t normalized_target);  // -1000..1000
+int16_t steerCtrl_GetCenter(void);
+int16_t steerCtrl_GetMin(void);
+int16_t steerCtrl_GetMax(void);
+uint8_t steerCtrl_IsReady(void);
+uint8_t steerCtrl_HomingDone(void);
+uint8_t steerCtrl_GetState(void);
+void steerCtrl_SetK(int16_t kp, int16_t ki, int16_t kd);
+void steerCtrl_SetHoming(int16_t hom_rpm, int16_t hom_curr_thr, int16_t hom_timeout);
 
 // Filtering Functions
 void filtLowPass32(int32_t u, uint16_t coef, int32_t *y);

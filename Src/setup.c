@@ -41,6 +41,7 @@ pb10 usart3 dma1 channel2/3
 
 TIM_HandleTypeDef htim_right;
 TIM_HandleTypeDef htim_left;
+TIM_HandleTypeDef htim4_encoder;
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 I2C_HandleTypeDef hi2c2;
@@ -371,6 +372,17 @@ void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_AFIO_CLK_ENABLE();
+
+  /* TIM4 encoder on PB6 (CH1) / PB7 (CH2) */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  GPIO_InitStruct.Mode  = GPIO_MODE_AF_INPUT;
+  GPIO_InitStruct.Pull  = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = GPIO_PIN_7;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
@@ -493,6 +505,37 @@ void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pin = RIGHT_TIM_WL_PIN;
   HAL_GPIO_Init(RIGHT_TIM_WL_PORT, &GPIO_InitStruct);
 }
+
+/* ======================== TIM4 Quadrature Encoder ======================== */
+#define ENCODER_TIM                TIM4
+#define ENCODER_COUNTS_PER_REV    4096   /* 1024 PPR × 4 (quadrature) */
+
+void TIM4_Encoder_Init(void) {
+  TIM_Encoder_InitTypeDef encoderConfig = {0};
+
+  __HAL_RCC_TIM4_CLK_ENABLE();
+
+  htim4_encoder.Instance = ENCODER_TIM;
+  htim4_encoder.Init.Prescaler         = 0;
+  htim4_encoder.Init.CounterMode       = TIM_COUNTERMODE_UP;
+  htim4_encoder.Init.Period            = 0xFFFF;
+  htim4_encoder.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+  htim4_encoder.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+  encoderConfig.EncoderMode        = TIM_ENCODERMODE_TI12;
+  encoderConfig.IC1Polarity        = TIM_ICPOLARITY_RISING;
+  encoderConfig.IC1Selection       = TIM_ICSELECTION_DIRECTTI;
+  encoderConfig.IC1Prescaler       = TIM_ICPSC_DIV1;
+  encoderConfig.IC1Filter          = 3;
+  encoderConfig.IC2Polarity        = TIM_ICPOLARITY_RISING;
+  encoderConfig.IC2Selection       = TIM_ICSELECTION_DIRECTTI;
+  encoderConfig.IC2Prescaler       = TIM_ICPSC_DIV1;
+  encoderConfig.IC2Filter          = 3;
+
+  HAL_TIM_Encoder_Init(&htim4_encoder, &encoderConfig);
+  HAL_TIM_Encoder_Start(&htim4_encoder, TIM_CHANNEL_ALL);
+}
+
 
 void MX_TIM_Init(void) {
   __HAL_RCC_TIM1_CLK_ENABLE();
@@ -638,11 +681,7 @@ void MX_ADC1_Init(void) {
   sConfig.Rank    = 3;
   HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
-  #if BOARD_VARIANT == 0
   sConfig.Channel = ADC_CHANNEL_12;  // pc2 vbat
-  #elif BOARD_VARIANT == 1
-  sConfig.Channel = ADC_CHANNEL_1;   // pa1 vbat
-  #endif
   sConfig.Rank    = 4;
   HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 

@@ -4,34 +4,10 @@
 
 #include "stm32f1xx_hal.h"
 
-// ############################### VARIANT SELECTION ###############################
-// PlatformIO: uncomment desired variant in platformio.ini
-// Keil uVision: select desired variant from the Target drop down menu (to the right of the Load button)
-// Ubuntu: define the desired build variant here if you want to use make in console
-// or use VARIANT environment variable for example like "make -e VARIANT=VARIANT_NUNCHUK". Select only one at a time.
-#if !defined(PLATFORMIO)
-  //#define VARIANT_ADC         // Variant for control via ADC input
-  //#define VARIANT_USART       // Variant for Serial control via USART3 input
-  //#define VARIANT_NUNCHUK     // Variant for Nunchuk controlled vehicle build
-  //#define VARIANT_PPM         // Variant for RC-Remote with PPM-Sum Signal
-  //#define VARIANT_PWM         // Variant for RC-Remote with PWM Signal
-  //#define VARIANT_IBUS        // Variant for RC-Remotes with FLYSKY IBUS
-  //#define VARIANT_HOVERCAR    // Variant for HOVERCAR build
-  //#define VARIANT_HOVERBOARD  // Variant for HOVERBOARD build
-  //#define VARIANT_TRANSPOTTER // Variant for TRANSPOTTER build https://github.com/NiklasFauth/hoverboard-firmware-hack/wiki/Build-Instruction:-TranspOtter https://hackaday.io/project/161891-transpotter-ng
-  //#define VARIANT_SKATEBOARD  // Variant for SKATEBOARD build
-#endif
-// ########################### END OF VARIANT SELECTION ############################
-
-
 // ############################### DO-NOT-TOUCH SETTINGS ###############################
 #define PWM_FREQ            16000     // PWM frequency in Hz / is also used for buzzer
 #define DEAD_TIME              48     // PWM deadtime
-#ifdef VARIANT_TRANSPOTTER
-  #define DELAY_IN_MAIN_LOOP    2
-#else
-  #define DELAY_IN_MAIN_LOOP    5     // in ms. default 5. it is independent of all the timing critical stuff. do not touch if you do not know what you are doing.
-#endif
+#define DELAY_IN_MAIN_LOOP    5     // in ms. default 5. it is independent of all the timing critical stuff. do not touch if you do not know what you are doing.
 #define TIMEOUT                20     // number of wrong / missing input commands before emergency off
 #define A2BIT_CONV             50     // A to bit for current conversion on ADC. Example: 1 A = 50, 2 A = 100, etc
 // #define PRINTF_FLOAT_SUPPORT          // [-] Uncomment this for printf to support float on Serial Debug. It will increase code size! Better to avoid it!
@@ -57,14 +33,6 @@
 // This parameter is used in setup.c
 #define ADC_TOTAL_CONV_TIME     (ADC_CLOCK_DIV * ADC_CONV_CLOCK_CYCLES) // = ((SystemCoreClock / ADC_CLOCK_HZ) * ADC_CONV_CLOCK_CYCLES), where ADC_CLOCK_HZ = SystemCoreClock/ADC_CLOCK_DIV
 // ########################### END OF  DO-NOT-TOUCH SETTINGS ############################
-
-// ############################### BOARD VARIANT ###############################
-/* Board Variant
- * 0 - Default board type
- * 1 - Alternate board type with different pin mapping for DCLINK, Buzzer and ON/OFF, Button and Charger
-*/
-#define BOARD_VARIANT           0         // change if board with alternate pin mapping
-// ######################## END OF BOARD VARIANT ###############################
 
 // ############################### BATTERY ###############################
 /* Battery voltage calibration: connect power source.
@@ -192,6 +160,15 @@
 #define DEFAULT_STEER_COEFFICIENT   8192  // Defualt for STEER_COEFFICIENT 0.5f [-] higher value == stronger. [0, 65535] = [-2.0 - 2.0]. In this case  8192 = 0.5 * 2^14. If you do not want any steering, set it to 0.
 // ######################### END OF DEFAULT SETTINGS ##########################
 
+// ############################### STEERING POSITION CONTROLLER ############################
+#define STEER_KP_INIT         50    // 0.050 (fixed-point *1000)
+#define STEER_KI_INIT          5    // 0.005 (fixed-point *1000)
+#define STEER_KD_INIT          0    // 0.000 (fixed-point *1000)
+#define STEER_HOM_SPD_INIT   150    // [rpm] homing move speed
+#define STEER_HOM_CURR_INIT  100    // [A*100] homing current threshold (100 = 1.0A)
+#define STEER_HOM_TO_INIT  10000    // [ms] homing total timeout
+// ######################## END OF STEERING POSITION CONTROLLER ############################
+
 
 
 // ############################## INPUT FORMAT ############################
@@ -211,27 +188,10 @@
  // ############################## END OF INPUT FORMAT ############################
 
 
-
-// ############################## CRUISE CONTROL SETTINGS ############################
-/* Cruise Control info:
- * enable CRUISE_CONTROL_SUPPORT and (SUPPORT_BUTTONS_LEFT or SUPPORT_BUTTONS_RIGHT depending on which cable is the button installed)
- * can be activated/deactivated by pressing button1 (Blue cable) to GND
- * when activated, it maintains the current speed by switching to SPD_MODE. Acceleration is still possible via the input request, but when released it resumes to previous set speed.
- * when deactivated, it returns to previous control MODE and follows the input request.
-*/
-// #define CRUISE_CONTROL_SUPPORT
-// #define SUPPORT_BUTTONS_LEFT              // Use button1 (Blue Left cable)  to activate/deactivate Cruise Control
-// #define SUPPORT_BUTTONS_RIGHT             // Use button1 (Blue Right cable) to activate/deactivate Cruise Control
-
-// ######################### END OF CRUISE CONTROL SETTINGS ##########################
-
-
-
 // ############################### DEBUG SERIAL ###############################
 /* Connect GND and RX of a 3.3v uart-usb adapter to the left (USART2) or right sensor board cable (USART3)
  * Be careful not to use the red wire of the cable. 15v will destroy everything.
- * If you are using VARIANT_NUNCHUK, disable it temporarily.
- * enable DEBUG_SERIAL_USART3 or DEBUG_SERIAL_USART2
+ * enable DEBUG_SERIAL_USART3
  *
  *
  * DEBUG ASCII output is:
@@ -248,8 +208,6 @@
  *
 */
 
-// #define DEBUG_SERIAL_USART2          // left sensor board cable, disable if ADC or PPM is used!
-// #define DEBUG_SERIAL_USART3          // right sensor board cable, disable if I2C (nunchuk or lcd) is used!
 #define DEBUG_SERIAL_PROTOCOL        // uncomment this to send user commands to the board, change parameters and print specific signals (see comms.c for the user commands)
 // ########################### END OF DEBUG SERIAL ############################
 
@@ -258,8 +216,9 @@
   // #define FEEDBACK_SERIAL_USART2      // left sensor board cable, disable if ADC or PPM is used!
 
   // #define SIDEBOARD_SERIAL_USART3 0
-  #define CONTROL_SERIAL_USART3  0    // right sensor board cable. Number indicates priority for dual-input. Disable if I2C (nunchuk or lcd) is used! For Arduino control check the hoverSerial.ino
+  #define CONTROL_SERIAL_USART3  1    // right sensor board cable. Number indicates priority for dual-input. Disable if I2C (nunchuk or lcd) is used! For Arduino control check the hoverSerial.ino
   #define FEEDBACK_SERIAL_USART3      // right sensor board cable, disable if I2C (nunchuk or lcd) is used!
+  #define INVERT_R_DIRECTION           // Invert rotation of right motor
 
   // #define DUAL_INPUTS                 //  UART*(Primary) + SIDEBOARD(Auxiliary). Uncomment this to use Dual-inputs
   #define PRI_INPUT1             3, -1000, 0, 1000, 0     // TYPE, MIN, MID, MAX, DEADBAND. See INPUT FORMAT section

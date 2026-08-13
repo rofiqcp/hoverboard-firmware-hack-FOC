@@ -103,13 +103,8 @@
 // #define DCLINK_ADC ADC3
 // #define DCLINK_CHANNEL
 
-#if BOARD_VARIANT == 0
 #define DCLINK_PIN GPIO_PIN_2
 #define DCLINK_PORT GPIOC
-#elif BOARD_VARIANT == 1
-#define DCLINK_PIN GPIO_PIN_1
-#define DCLINK_PORT GPIOA
-#endif
 
 // #define DCLINK_PULLUP 30000
 // #define DCLINK_PULLDOWN 1000
@@ -117,73 +112,17 @@
 #define LED_PIN GPIO_PIN_2
 #define LED_PORT GPIOB
 
-#if BOARD_VARIANT == 0
 #define BUZZER_PIN GPIO_PIN_4
 #define BUZZER_PORT GPIOA
-#elif BOARD_VARIANT == 1
-#define BUZZER_PIN GPIO_PIN_13
-#define BUZZER_PORT GPIOC
-#endif
 
-// UNUSED/REDUNDANT
-//#define SWITCH_PIN GPIO_PIN_1
-//#define SWITCH_PORT GPIOA
-
-#if BOARD_VARIANT == 0
 #define OFF_PIN GPIO_PIN_5
 #define OFF_PORT GPIOA
-#elif BOARD_VARIANT == 1
-#define OFF_PIN GPIO_PIN_15
-#define OFF_PORT GPIOC
-#endif
 
-#if BOARD_VARIANT == 0
 #define BUTTON_PIN GPIO_PIN_1
 #define BUTTON_PORT GPIOA
-#elif BOARD_VARIANT == 1
-#define BUTTON_PIN GPIO_PIN_9
-#define BUTTON_PORT GPIOB
-#endif
 
-#if BOARD_VARIANT == 0
 #define CHARGER_PIN GPIO_PIN_12
 #define CHARGER_PORT GPIOA
-#elif BOARD_VARIANT == 1
-#define CHARGER_PIN GPIO_PIN_11
-#define CHARGER_PORT GPIOA
-#endif
-
-#if defined(CONTROL_PPM_LEFT)
-#define PPM_PIN             GPIO_PIN_3
-#define PPM_PORT            GPIOA
-#elif defined(CONTROL_PPM_RIGHT)
-#define PPM_PIN             GPIO_PIN_11
-#define PPM_PORT            GPIOB
-#endif
-
-#if defined(CONTROL_PWM_LEFT)
-#define PWM_PIN_CH1         GPIO_PIN_2
-#define PWM_PORT_CH1        GPIOA
-#define PWM_PIN_CH2         GPIO_PIN_3
-#define PWM_PORT_CH2        GPIOA
-#elif defined(CONTROL_PWM_RIGHT)
-#define PWM_PIN_CH1         GPIO_PIN_10
-#define PWM_PORT_CH1        GPIOB
-#define PWM_PIN_CH2         GPIO_PIN_11
-#define PWM_PORT_CH2        GPIOB
-#endif
-
-#if defined(SUPPORT_BUTTONS_LEFT)
-#define BUTTON1_PIN         GPIO_PIN_2
-#define BUTTON1_PORT        GPIOA
-#define BUTTON2_PIN         GPIO_PIN_3
-#define BUTTON2_PORT        GPIOA
-#elif defined(SUPPORT_BUTTONS_RIGHT)
-#define BUTTON1_PIN         GPIO_PIN_10
-#define BUTTON1_PORT        GPIOB
-#define BUTTON2_PIN         GPIO_PIN_11
-#define BUTTON2_PORT        GPIOB
-#endif
 
 #define DELAY_TIM_FREQUENCY_US 1000000
 

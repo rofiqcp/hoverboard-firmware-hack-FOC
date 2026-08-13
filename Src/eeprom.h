@@ -209,7 +209,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)0x13)       /* 19 Variables */
+#define NB_OF_VAR             ((uint8_t)0x18)       /* 24 Variables: 18 original + 6 steering */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

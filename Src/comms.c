@@ -67,6 +67,22 @@ extern int16_t dc_curr;
 extern int16_t cmdL; 
 extern int16_t cmdR; 
 
+// Steering controller externs (implemented in steering.c)
+extern int16_t steer_kp;
+extern int16_t steer_ki;
+extern int16_t steer_kd;
+extern int16_t steer_homing_spd;
+extern int16_t steer_homing_curr_thr;
+extern int16_t steer_homing_timeout_ms;
+extern int16_t steer_pos_min;
+extern int16_t steer_pos_max;
+extern int16_t steer_pos_mid;
+extern uint8_t  steer_homing_done;
+extern uint8_t  steer_failure_flag;
+extern int16_t  steer_encoder_count;
+void steerCtrl_SetK(int16_t kp, int16_t ki, int16_t kd);
+void steerCtrl_SetHoming(int16_t hom_rpm, int16_t hom_curr_thr, int16_t hom_timeout);
+
 
 
 enum commandTypes {READ,WRITE};
@@ -140,8 +156,26 @@ const parameter_entry params[] = {
     {VARIABLE   ,"RATE"               ,0       , NULL                        ,NULL                      ,0          ,RATE              ,0      ,0      ,0      ,0               ,0    ,4     ,NULL               ,"Rate *10"},
     {VARIABLE   ,"SPD_COEF"           ,0       , NULL                        ,NULL                      ,0          ,SPEED_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Speed Coefficient *10"},
     {VARIABLE   ,"STR_COEF"           ,0       , NULL                        ,NULL                      ,0          ,STEER_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Steer Coefficient *10"},
-    {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},       
-    {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},       
+    {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},
+    {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},
+
+  // LEFT STEERING POSITION CONTROL (old lpos_* patch — entries at 19-21 superseded by STEER_*)
+  // STEERING POSITION CONTROLLER PARAMETERS
+  // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
+    {PARAMETER  ,"STEER_KP"          ,ADD_PARAM(steer_kp)                  ,NULL                      ,19         ,STEER_KP_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Kp *1000 (50=0.050)"},
+    {PARAMETER  ,"STEER_KI"          ,ADD_PARAM(steer_ki)                  ,NULL                      ,20         ,STEER_KI_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Ki *1000 (5=0.005)"},
+    {PARAMETER  ,"STEER_KD"          ,ADD_PARAM(steer_kd)                  ,NULL                      ,21         ,STEER_KD_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Kd *1000 (0=0.000)"},
+    {PARAMETER  ,"STEER_HOM_SPD"     ,ADD_PARAM(steer_homing_spd)          ,NULL                      ,22         ,STEER_HOM_SPD_INIT,0     ,20     ,500     ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing speed RPM"},
+    {PARAMETER  ,"STEER_HOM_CURR"    ,ADD_PARAM(steer_homing_curr_thr)     ,NULL                      ,23         ,STEER_HOM_CURR_INIT,0    ,50     ,300     ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing current thresh A*100"},
+    {PARAMETER  ,"STEER_HOM_TO"      ,ADD_PARAM(steer_homing_timeout_ms)    ,NULL                      ,24         ,STEER_HOM_TO_INIT ,0      ,2000   ,60000   ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing timeout ms"},
+  // STEERING STATUS VARIABLES
+  // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
+    {VARIABLE   ,"STR_POS"           ,ADD_PARAM(steer_encoder_count)        ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer encoder count"},
+    {VARIABLE   ,"STR_MIN"           ,ADD_PARAM(steer_pos_min)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer learned min count"},
+    {VARIABLE   ,"STR_MAX"           ,ADD_PARAM(steer_pos_max)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer learned max count"},
+    {VARIABLE   ,"STR_MID"           ,ADD_PARAM(steer_pos_mid)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer computed midpoint"},
+    {VARIABLE   ,"STR_HOMED"         ,ADD_PARAM(steer_homing_done)         ,NULL                      ,0          ,0                 ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Steer homed 0/1"},
+    {VARIABLE   ,"STR_FAIL"          ,ADD_PARAM(steer_failure_flag)        ,NULL                      ,0          ,0                 ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Steer failure flag 0/1"},
 
 };
 
@@ -155,7 +189,7 @@ const char *errors[9] = {
   "Start of line expected", // Err6
   "End of line expected", // Err7
   "Parameter expected", // Err8
-  "Uncaught error" // Err9
+  "Uncaught error", // Err9
   "Watch list is full" // Err10
 };
 
