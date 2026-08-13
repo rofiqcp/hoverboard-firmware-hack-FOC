@@ -31,9 +31,6 @@
 #include "rtwtypes.h"
 #include "comms.h"
 
-#if defined(DEBUG_I2C_LCD) || defined(SUPPORT_LCD)
-#include "hd44780.h"
-#endif
 
 void SystemClock_Config(void);
 
@@ -45,10 +42,6 @@ extern TIM_HandleTypeDef htim_right;
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern volatile adc_buf_t adc_buffer;
-#if defined(DEBUG_I2C_LCD) || defined(SUPPORT_LCD)
-  extern LCD_PCF8574_HandleTypeDef lcd;
-  extern uint8_t LCDerrorFlag;
-#endif
 
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;

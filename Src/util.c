@@ -31,9 +31,6 @@
 #include "rtwtypes.h"
 #include "comms.h"
 
-#if defined(DEBUG_I2C_LCD) || defined(SUPPORT_LCD)
-#include "hd44780.h"
-#endif
 
 /* =========================== Variable Definitions =========================== */
 
@@ -107,9 +104,6 @@ uint8_t  timeoutFlgSerial = 0;          // Timeout Flag for Rx Serial command: 0
 uint8_t  ctrlModReqRaw = CTRL_MOD_REQ;
 uint8_t  ctrlModReq    = CTRL_MOD_REQ;  // Final control mode request 
 
-#if defined(DEBUG_I2C_LCD) || defined(SUPPORT_LCD)
-LCD_PCF8574_HandleTypeDef lcd;
-#endif
 
 #if defined(CONTROL_NUNCHUK) || defined(SUPPORT_NUNCHUK)
 uint8_t nunchuk_connected = 1;
@@ -306,91 +300,6 @@ void Input_Init(void) {
   #if defined(DEBUG_SERIAL_USART3) || defined(CONTROL_SERIAL_USART3) || defined(SIDEBOARD_SERIAL_USART3)
     HAL_UART_Receive_DMA(&huart3, (uint8_t *)rx_buffer_R, sizeof(rx_buffer_R));
     UART_DisableRxErrors(&huart3);
-  #endif
-
-  #if !defined(VARIANT_HOVERBOARD) && !defined(VARIANT_TRANSPOTTER)
-    uint16_t writeCheck, readVal;
-    HAL_FLASH_Unlock();
-    EE_Init();            /* EEPROM Init */
-    EE_ReadVariable(VirtAddVarTab[0], &writeCheck);
-    if (writeCheck == FLASH_WRITE_KEY) {
-      EE_ReadVariable(VirtAddVarTab[1] , &readVal); rtP_Left.i_max = rtP_Right.i_max = (int16_t)readVal;
-      EE_ReadVariable(VirtAddVarTab[2] , &readVal); rtP_Left.n_max = rtP_Right.n_max = (int16_t)readVal;
-      for (uint8_t i=0; i<INPUTS_NR; i++) {
-        EE_ReadVariable(VirtAddVarTab[ 3+8*i] , &readVal); input1[i].typ = (uint8_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 4+8*i] , &readVal); input1[i].min = (int16_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 5+8*i] , &readVal); input1[i].mid = (int16_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 6+8*i] , &readVal); input1[i].max = (int16_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 7+8*i] , &readVal); input2[i].typ = (uint8_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 8+8*i] , &readVal); input2[i].min = (int16_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[ 9+8*i] , &readVal); input2[i].mid = (int16_t)readVal;
-        EE_ReadVariable(VirtAddVarTab[10+8*i] , &readVal); input2[i].max = (int16_t)readVal;
-      }
-    } else {
-      for (uint8_t i=0; i<INPUTS_NR; i++) {
-        if (input1[i].typDef == 3) {  // If Input type defined is 3 (auto), identify the input type based on the values from config.h
-          input1[i].typ = checkInputType(input1[i].min, input1[i].mid, input1[i].max);
-        } else {
-          input1[i].typ = input1[i].typDef;
-        }
-        if (input2[i].typDef == 3) {
-          input2[i].typ = checkInputType(input2[i].min, input2[i].mid, input2[i].max);
-        } else {
-          input2[i].typ = input2[i].typDef;
-        }
-      }
-    }
-    HAL_FLASH_Lock();
-  #endif
-
-  #ifdef VARIANT_TRANSPOTTER
-    enable = 1;
-
-    HAL_FLASH_Unlock();
-    EE_Init();            /* EEPROM Init */
-    EE_ReadVariable(VirtAddVarTab[0], &saveValue);
-    HAL_FLASH_Lock();
-
-    setDistance = saveValue / 1000.0;
-    if (setDistance < 0.2) {
-      setDistance = 1.0;
-    }
-  #endif
-
-  #if defined(DEBUG_I2C_LCD) || defined(SUPPORT_LCD)
-    I2C_Init();
-    HAL_Delay(50);
-    lcd.pcf8574.PCF_I2C_ADDRESS = 0x27;
-    lcd.pcf8574.PCF_I2C_TIMEOUT = 5;
-    lcd.pcf8574.i2c             = hi2c2;
-    lcd.NUMBER_OF_LINES         = NUMBER_OF_LINES_2;
-    lcd.type                    = TYPE0;
-
-    if(LCD_Init(&lcd)!=LCD_OK) {
-        // error occured
-        //TODO while(1);
-    }
-
-    LCD_ClearDisplay(&lcd);
-    HAL_Delay(5);
-    LCD_SetLocation(&lcd, 0, 0);
-    #ifdef VARIANT_TRANSPOTTER
-      LCD_WriteString(&lcd, "TranspOtter V2.1");
-    #else
-      LCD_WriteString(&lcd, "Hover V2.0");
-    #endif
-    LCD_SetLocation(&lcd,  0, 1); LCD_WriteString(&lcd, "Initializing...");
-  #endif
-
-  #if defined(VARIANT_TRANSPOTTER) && defined(SUPPORT_LCD)
-    LCD_ClearDisplay(&lcd);
-    HAL_Delay(5);
-    LCD_SetLocation(&lcd,  0, 1); LCD_WriteString(&lcd, "Bat:");
-    LCD_SetLocation(&lcd,  8, 1); LCD_WriteString(&lcd, "V");
-    LCD_SetLocation(&lcd, 15, 1); LCD_WriteString(&lcd, "A");
-    LCD_SetLocation(&lcd,  0, 0); LCD_WriteString(&lcd, "Len:");
-    LCD_SetLocation(&lcd,  8, 0); LCD_WriteString(&lcd, "m(");
-    LCD_SetLocation(&lcd, 14, 0); LCD_WriteString(&lcd, "m)");
   #endif
 }
 
@@ -1158,17 +1067,16 @@ void usart3_rx_check(void)
   #endif // DEBUG_SERIAL_USART3
 
   #ifdef CONTROL_SERIAL_USART3
-  uint8_t *ptr;
+  uint8_t *ptr3;
   if (pos != old_pos) {                                                 // Check change in received data
-    ptr = (uint8_t *)&commandR_raw;                                     // Initialize the pointer with command_raw address
+    ptr3 = (uint8_t *)&commandR_raw;                                     // Initialize the pointer with command_raw address
     if (pos > old_pos && (pos - old_pos) == commandR_len) {             // "Linear" buffer mode: check if current position is over previous one AND data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], commandR_len);                 // Copy data. This is possible only if command_raw is contiguous! (meaning all the structure members have the same size)
+      memcpy(ptr3, &rx_buffer_R[old_pos], commandR_len);                 // Copy data. This is possible only if command_raw is contiguous! (meaning all the structure members have the same size)
       usart_process_command(&commandR_raw, &commandR, 3);               // Process data
     } else if ((rx_buffer_R_len - old_pos + pos) == commandR_len) {     // "Overflow" buffer mode: check if data length equals expected length
-      memcpy(ptr, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);    // First copy data from the end of buffer
+      memcpy(ptr3, &rx_buffer_R[old_pos], rx_buffer_R_len - old_pos);    // First copy data from the end of buffer
       if (pos > 0) {                                                    // Check and continue with beginning of buffer
-        ptr += rx_buffer_R_len - old_pos;                               // Move to correct position in command_raw
-        memcpy(ptr, &rx_buffer_R[0], pos);                              // Copy remaining data
+        memcpy(ptr3 + rx_buffer_R_len - old_pos, &rx_buffer_R[0], pos); // Copy remaining data
       }
       usart_process_command(&commandR_raw, &commandR, 3);               // Process data
     }
@@ -1665,6 +1573,19 @@ void mixerFcn(int16_t rtu_speed, int16_t rtu_steer, int16_t *rty_speedR, int16_t
 }
 
 
+
+#ifndef MULTIPLE_TAP_LO
+#define MULTIPLE_TAP_LO 100
+#endif
+#ifndef MULTIPLE_TAP_HI
+#define MULTIPLE_TAP_HI 200
+#endif
+#ifndef MULTIPLE_TAP_TIMEOUT
+#define MULTIPLE_TAP_TIMEOUT 2000
+#endif
+#ifndef MULTIPLE_TAP_NR
+#define MULTIPLE_TAP_NR 2
+#endif
 
 /* =========================== Multiple Tap Function =========================== */
 
