@@ -84,6 +84,12 @@ static int32_t batVoltageFixdt  = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_
 int16_t odom_l = 0;
 int16_t odom_r = 0;
 
+// Real FOC ISR run counter (incremented every DMA1_Channel1_IRQHandler entry).
+// Wrapped into the feedback frame so a host tool can measure the true ISR rate.
+volatile uint32_t foc_isr_count = 0;
+volatile uint32_t foc_isr_cycles_last = 0;
+volatile uint32_t foc_isr_cycles_max = 0;
+
 static uint16_t wp_l_vorher = 0;
 static uint16_t wp_r_vorher = 0;
 
@@ -103,7 +109,9 @@ int16_t up_or_down(int16_t vorher, int16_t nachher){
 // =================================
 void DMA1_Channel1_IRQHandler(void) {
 
+  uint32_t isr_cycle_start = DWT->CYCCNT;
   DMA1->IFCR = DMA_IFCR_CTCIF1;
+  foc_isr_count++;
   // HAL_GPIO_WritePin(LED_PORT, LED_PIN, 1);
   // HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 
@@ -184,7 +192,7 @@ void DMA1_Channel1_IRQHandler(void) {
   OverrunFlag = true;
 
   /* Make sure to stop BOTH motors in case of an error */
-  enableFin = enable;
+  enableFin = enable && !rtY_Left.z_errCode && !rtY_Right.z_errCode;
  
   // ========================= LEFT MOTOR ============================ 
     // Get hall sensors values
@@ -262,7 +270,7 @@ void DMA1_Channel1_IRQHandler(void) {
 
     encoding = (uint8_t)((hall_ur<<2) + (hall_vr<<1) + hall_wr);
     wheel_pos = rtConstP.vec_hallToPos_Value[encoding];
-    odom_r = modulo(odom_r + up_or_down(wp_r_vorher, wheel_pos), 9000);
+    odom_r = modulo(odom_r - up_or_down(wp_r_vorher, wheel_pos), 9000);
     wp_r_vorher = wheel_pos;
 
     /* Apply commands */
@@ -273,6 +281,12 @@ void DMA1_Channel1_IRQHandler(void) {
 
   /* Indicate task complete */
   OverrunFlag = false;
+
+  uint32_t isr_cycles = DWT->CYCCNT - isr_cycle_start;
+  foc_isr_cycles_last = isr_cycles;
+  if (isr_cycles > foc_isr_cycles_max) {
+    foc_isr_cycles_max = isr_cycles;
+  }
  
  // ###############################################################################
 

@@ -208,7 +208,8 @@
  *
 */
 
-#define DEBUG_SERIAL_PROTOCOL        // uncomment this to send user commands to the board, change parameters and print specific signals (see comms.c for the user commands)
+// #define DEBUG_SERIAL_USART3          // right sensor board cable, disable if I2C (nunchuk or lcd) is used!
+// #define DEBUG_SERIAL_PROTOCOL        // uncomment this to send user commands to the board, change parameters and print specific signals (see comms.c for the user commands)
 // ########################### END OF DEBUG SERIAL ############################
 
   // #define SIDEBOARD_SERIAL_USART2 0
@@ -216,8 +217,13 @@
   // #define FEEDBACK_SERIAL_USART2      // left sensor board cable, disable if ADC or PPM is used!
 
   // #define SIDEBOARD_SERIAL_USART3 0
-  #define CONTROL_SERIAL_USART3  1    // right sensor board cable. Number indicates priority for dual-input. Disable if I2C (nunchuk or lcd) is used! For Arduino control check the hoverSerial.ino
-  #define FEEDBACK_SERIAL_USART3      // right sensor board cable, disable if I2C (nunchuk or lcd) is used!
+  #define CONTROL_SERIAL_USART3  0    // primary input on right sensor board cable (USART3)
+  #define FEEDBACK_SERIAL_USART3      // telemetry on right sensor board cable (USART3)
+  // Extended feedback telemetry: append 32-bit real FOC ISR count + cycle stats to the frame.
+  #define FEEDBACK_ISR_COUNTER
+  // Host auto-detection / protocol markers consumed by tools/hoverserial.py
+  #define FEEDBACK_EXTENDED_MAGIC 0x4953  // "IS"
+  #define FEEDBACK_EXTENDED_VERSION 1
   #define INVERT_R_DIRECTION           // Invert rotation of right motor
 
   // #define DUAL_INPUTS                 //  UART*(Primary) + SIDEBOARD(Auxiliary). Uncomment this to use Dual-inputs
