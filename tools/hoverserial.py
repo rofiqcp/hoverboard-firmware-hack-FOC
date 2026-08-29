@@ -24,7 +24,7 @@ except ImportError as exc:
 START = 0xABCD
 START_BYTES = struct.pack("<H", START)
 CMD = struct.Struct("<HhhH")
-FB = struct.Struct("<HhhhhhhhhHIIH")
+FB = struct.Struct("<HhhhhhhhhHII7H")
 CPU_HZ = 64_000_000
 FOC_HZ = 16_000
 FOC_BUDGET_CYCLES = CPU_HZ // FOC_HZ
@@ -56,6 +56,12 @@ class Telemetry:
     status: int
     foc_cycles: int
     foc_cycles_max: int
+    adc_dcl: int
+    adc_rla: int
+    adc_rlb: int
+    adc_dcr: int
+    adc_rrb: int
+    adc_rrc: int
 
     @property
     def enabled(self): return bool(self.status & 0x01)
@@ -67,18 +73,10 @@ class Telemetry:
     def right_fault(self): return bool(self.status & 0x08)
 
     def summary(self) -> str:
-        us = self.foc_cycles * 1_000_000 / CPU_HZ
-        load = self.foc_cycles * 100 / FOC_BUDGET_CYCLES
-        max_us = self.foc_cycles_max * 1_000_000 / CPU_HZ
-        flags = []
-        if self.enabled: flags.append("ENA")
-        if self.timeout: flags.append("TIMEOUT")
-        if self.left_fault: flags.append("LFAULT")
-        if self.right_fault: flags.append("RFAULT")
-        return (f"cmd=({self.cmd1:+5d},{self.cmd2:+5d}) rpm=(L{self.speed_l:+5d},R{self.speed_r:+5d}) "
-                f"V={self.battery_x100/100:5.2f} T={self.temp_x10/10:5.1f}C "
-                f"foc_isr_cycles={self.foc_cycles:4d} ({us:6.2f}us,{load:5.1f}%) "
-                f"max={self.foc_cycles_max:4d} ({max_us:6.2f}us) status={','.join(flags) or 'IDLE'}")
+        return (f"cmd={self.cmd1},{self.cmd2} rpm={self.speed_l},{self.speed_r} "
+                f"V={self.battery_x100/100:.2f} T={self.temp_x10/10:.1f}C "
+                f"cycle={self.foc_cycles} dcl={self.adc_dcl} rla={self.adc_rla} "
+                f"rlb={self.adc_rlb} dcr={self.adc_dcr} rrb={self.adc_rrb} rrc={self.adc_rrc}")
 
 
 def decode_feedback(packet: bytes) -> Telemetry | None:
@@ -88,10 +86,10 @@ def decode_feedback(packet: bytes) -> Telemetry | None:
     if fields[0] != START:
         return None
     expected = xor16(fields[:10] + (fields[10] & 0xFFFF, fields[10] >> 16,
-                                    fields[11] & 0xFFFF, fields[11] >> 16))
-    if fields[12] != expected:
+                                    fields[11] & 0xFFFF, fields[11] >> 16) + fields[12:18])
+    if fields[18] != expected:
         return None
-    return Telemetry(*fields[1:12])
+    return Telemetry(*fields[1:18])
 
 
 class HoverSerial:
@@ -166,7 +164,7 @@ class HoverSerial:
             self.latest = telemetry
             now = time.monotonic()
             if now - self.last_print >= 0.10:
-                print("[TEL]", telemetry.summary())
+                print(telemetry.summary())
                 self.last_print = now
 
     def _reader_loop(self):
@@ -210,7 +208,8 @@ def interactive(link: HoverSerial, steer: int, speed: int, rate_hz: float):
 
     tx = threading.Thread(target=tx_loop, daemon=True)
     tx.start()
-    print("Commands: drive <steer> <speed> | stop | get [name] | set <name> <value> | watch <name> | save | init <name> | help [name] | quit")
+    print("mode: 1=VLT 2=SPD 3=TRQ 4=SVPWM(no sensor)")
+    print("cmd: drive <steer> <speed> | stop | mode <1..4> | 1/2/3/4 | get/set/watch/save/init/help | quit")
     try:
         while not link.stop_event.is_set():
             line = input("hover> ").strip()
@@ -227,6 +226,14 @@ def interactive(link: HoverSerial, steer: int, speed: int, rate_hz: float):
                 with lock:
                     state[:] = [0, 0]
                 link.stop()
+            elif ((op == "mode" and len(parts) == 2 and parts[1] in {"1", "2", "3", "4"}) or
+                  (op in {"1", "2", "3", "4"} and len(parts) == 1)):
+                # Force zero command before changing control mode.
+                mode = parts[1] if op == "mode" else op
+                with lock:
+                    state[:] = [0, 0]
+                link.stop()
+                link.debug(f"SET CTRL_MOD {mode}")
             elif op in {"get", "set", "watch", "save", "init", "help"}:
                 link.debug(line.upper())
             elif op in {"quit", "exit", "q"}:

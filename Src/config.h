@@ -44,10 +44,18 @@
 #define VLT_MODE                 1
 #define SPD_MODE                 2
 #define TRQ_MODE                 3
+#define SVPWM_MODE               4
 #define MOTOR_LEFT_ENA
 #define MOTOR_RIGHT_ENA
 #define CTRL_TYP_SEL             FOC_CTRL
 #define CTRL_MOD_REQ             SPD_MODE
+
+/* Sensorless open-loop SVPWM (mode 4). Command keeps the same -1000..+1000 scale.
+ * With N_MOT_MAX=1000 and 15 pole pairs, command 1000 corresponds to ~250 Hz electrical.
+ * Modulation uses a small low-speed boost and then a linear V/f-style ramp. */
+#define SVPWM_POLE_PAIRS         15u
+#define SVPWM_MIN_MOD_PERMILLE   120u
+#define SVPWM_MAX_MOD_PERMILLE   850u
 #define DIAG_ENA                 1
 #define I_MOT_MAX                15
 #define I_DC_MAX                 17
