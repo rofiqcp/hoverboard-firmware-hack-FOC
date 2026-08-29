@@ -23,7 +23,6 @@
 
 #include "stm32f1xx_hal.h"
 
-#if defined(DEBUG_SERIAL_PROTOCOL)
 
 enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,INT,FLOAT};
 #define typename(x) _Generic((x), \
@@ -39,7 +38,6 @@ enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,INT,FLOAT};
 #define PARAM_SIZE(param) sizeof(param) / sizeof(parameter_entry)
 #define COMMAND_SIZE(command) sizeof(command) / sizeof(command_entry)
 
-#define SIZEP(x) ((char*)(&(x) + 1) - (char*)&(x))
 #define ADD_PARAM(var) typename(var),&var
 
 
@@ -51,7 +49,6 @@ int32_t getParamValInt(uint8_t index);
 int32_t getParamValExt(uint8_t index);
 
 int8_t initParamVal(uint8_t index);
-int8_t incrParamVal(uint8_t index);
 
 int8_t saveAllParamVal();
 int16_t getParamInitInt(uint8_t index);
@@ -109,5 +106,4 @@ struct parameter_entry_struct {
   const char *help;
 };
 
-#endif  // DEBUG_SERIAL_PROTOCOL
 #endif  // COMMS_H

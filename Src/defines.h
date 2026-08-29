@@ -115,6 +115,10 @@
 #define BUZZER_PIN GPIO_PIN_4
 #define BUZZER_PORT GPIOA
 
+// UNUSED/REDUNDANT
+//#define SWITCH_PIN GPIO_PIN_1
+//#define SWITCH_PORT GPIOA
+
 #define OFF_PIN GPIO_PIN_5
 #define OFF_PORT GPIOA
 
@@ -123,6 +127,9 @@
 
 #define CHARGER_PIN GPIO_PIN_12
 #define CHARGER_PORT GPIOA
+
+
+
 
 #define DELAY_TIM_FREQUENCY_US 1000000
 
@@ -150,9 +157,6 @@
 #define ARRAY_LEN(x) (uint32_t)(sizeof(x) / sizeof(*(x)))
 #define MAP(x, in_min, in_max, out_min, out_max) (((((x) - (in_min)) * ((out_max) - (out_min))) / ((in_max) - (in_min))) + (out_min))
 
-#if defined(PRINTF_FLOAT_SUPPORT) && (defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3)) && defined(__GNUC__)
-    asm(".global _printf_float");     // this is the magic trick for printf to support float. Warning: It will increase code considerably! Better to avoid!
-#endif
 
 
 typedef struct {
@@ -163,37 +167,11 @@ typedef struct {
   uint16_t rrB;
   uint16_t rrC;
   uint16_t batt1;
-  uint16_t l_tx2;
+  uint16_t adc2_spare4;
   uint16_t temp;
-  uint16_t l_rx2;
+  uint16_t adc2_spare5;
 } adc_buf_t;
 
-// Define I2C, Nunchuk, PPM, PWM functions
-void I2C_Init(void);
-void Nunchuk_Init(void);
-void Nunchuk_Read(void);
-uint8_t Nunchuk_Ping(void);
-void PPM_Init(void);
-void PPM_ISR_Callback(void);
-void PWM_Init(void);
-void PWM_ISR_CH1_Callback(void);
-void PWM_ISR_CH2_Callback(void);
-
-// Sideboard definitions
-#define LED1_SET            (0x01)
-#define LED2_SET            (0x02)
-#define LED3_SET            (0x04)
-#define LED4_SET            (0x08)
-#define LED5_SET            (0x10)
-#define SENSOR1_SET         (0x01)
-#define SENSOR2_SET         (0x02)
-#define SENSOR_MPU          (0x04)
-
-// RC iBUS switch definitions. Flysky FS-i6S has [SWA, SWB, SWC, SWD] = [2, 3, 3, 2] positions switch
-#define SWA_SET             (0x0100)   //  0000 0001 0000 0000
-#define SWB_SET             (0x0600)   //  0000 0110 0000 0000
-#define SWC_SET             (0x1800)   //  0001 1000 0000 0000
-#define SWD_SET             (0x2000)   //  0010 0000 0000 0000
 
 
 #endif // DEFINES_H

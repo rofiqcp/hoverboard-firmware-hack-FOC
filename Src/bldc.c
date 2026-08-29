@@ -70,6 +70,15 @@ static uint8_t enableFin    = 0;
 
 static const uint16_t pwm_res  = 64000000 / 2 / PWM_FREQ; // = 2000
 
+volatile uint32_t foc_isr_cycles = 0;
+volatile uint32_t foc_isr_cycles_max = 0;
+
+static inline void focIsrMonitorEnd(uint32_t startCycles) {
+  const uint32_t elapsed = DWT->CYCCNT - startCycles;
+  foc_isr_cycles = elapsed;
+  if (elapsed > foc_isr_cycles_max) foc_isr_cycles_max = elapsed;
+}
+
 static uint16_t offsetcount = 0;
 static int16_t offsetrlA    = 2000;
 static int16_t offsetrlB    = 2000;
@@ -83,12 +92,6 @@ static int32_t batVoltageFixdt  = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_
 
 int16_t odom_l = 0;
 int16_t odom_r = 0;
-
-// Real FOC ISR run counter (incremented every DMA1_Channel1_IRQHandler entry).
-// Wrapped into the feedback frame so a host tool can measure the true ISR rate.
-volatile uint32_t foc_isr_count = 0;
-volatile uint32_t foc_isr_cycles_last = 0;
-volatile uint32_t foc_isr_cycles_max = 0;
 
 static uint16_t wp_l_vorher = 0;
 static uint16_t wp_r_vorher = 0;
@@ -108,10 +111,9 @@ int16_t up_or_down(int16_t vorher, int16_t nachher){
 // DMA interrupt frequency =~ 16 kHz
 // =================================
 void DMA1_Channel1_IRQHandler(void) {
+  const uint32_t focIsrStartCycles = DWT->CYCCNT;
 
-  uint32_t isr_cycle_start = DWT->CYCCNT;
   DMA1->IFCR = DMA_IFCR_CTCIF1;
-  foc_isr_count++;
   // HAL_GPIO_WritePin(LED_PORT, LED_PIN, 1);
   // HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 
@@ -123,6 +125,7 @@ void DMA1_Channel1_IRQHandler(void) {
     offsetrrC = (adc_buffer.rrC + offsetrrC) / 2;
     offsetdcl = (adc_buffer.dcl + offsetdcl) / 2;
     offsetdcr = (adc_buffer.dcr + offsetdcr) / 2;
+    focIsrMonitorEnd(focIsrStartCycles);
     return;
   }
 
@@ -187,6 +190,7 @@ void DMA1_Channel1_IRQHandler(void) {
 
   /* Check for overrun */
   if (OverrunFlag) {
+    focIsrMonitorEnd(focIsrStartCycles);
     return;
   }
   OverrunFlag = true;
@@ -281,12 +285,7 @@ void DMA1_Channel1_IRQHandler(void) {
 
   /* Indicate task complete */
   OverrunFlag = false;
-
-  uint32_t isr_cycles = DWT->CYCCNT - isr_cycle_start;
-  foc_isr_cycles_last = isr_cycles;
-  if (isr_cycles > foc_isr_cycles_max) {
-    foc_isr_cycles_max = isr_cycles;
-  }
+  focIsrMonitorEnd(focIsrStartCycles);
  
  // ###############################################################################
 

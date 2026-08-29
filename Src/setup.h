@@ -29,12 +29,7 @@ void MX_GPIO_Init(void);
 void MX_TIM_Init(void);
 void MX_ADC1_Init(void);
 void MX_ADC2_Init(void);
-void UART2_Init(void);
 void UART3_Init(void);
-
-
-extern TIM_HandleTypeDef htim4_encoder;
-void TIM4_Encoder_Init(void);
 
 #endif
 

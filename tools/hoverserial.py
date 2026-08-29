@@ -1,179 +1,277 @@
 #!/usr/bin/env python3
-"""USART3 hoverboard test: drive left/right/both, report RPM and real FOC ISR rate.
+"""USART3 host tool for the cleaned hoverboard firmware.
 
-Replaces tools/hoverserial.ino (Arduino sketch converted to Python).
-
-Firmware (VARIANT_USART) is configured for USART3 only:
-  CONTROL_SERIAL_USART3  -> host sends start/steer/speed frames here
-  FEEDBACK_SERIAL_USART3 -> board streams telemetry here, including a 32-bit
-                            counter (foc_isr_count) incremented every FOC ISR
-                            (DMA1_Channel1_IRQHandler, ~PWM_FREQ = 16000 Hz).
-
-Feedback frame (13 x uint16 = 26 bytes), little-endian, XOR-16 checksum over
-the first 12 words:
-  start, cmd1, cmd2, rpmR, rpmL, odomR, odomL, battery, temp, led,
-  isr_lo, isr_hi, checksum
-ISR rate = (isr_now - isr_prev) / dt   [interrupts per second]
+One port carries:
+- binary drive commands (host -> STM32)
+- binary telemetry (STM32 -> host)
+- ASCII debug protocol (GET/SET/WATCH/INIT/SAVE/HELP)
 """
+from __future__ import annotations
+
 import argparse
 import struct
 import sys
+import threading
 import time
+from dataclasses import dataclass
 
-import serial
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError as exc:
+    raise SystemExit("pyserial is required: python -m pip install pyserial") from exc
 
 START = 0xABCD
-CMD = struct.Struct("<HhhH")        # start, steer, speed, xor
-FB = struct.Struct("<H" + "h" * 8 + "H" * 6)  # 15 words: start(H) cmd1..temp(8xh) led,isrLo,isrHi,cycLast,cycMax,chk(6xH)
+START_BYTES = struct.pack("<H", START)
+CMD = struct.Struct("<HhhH")
+FB = struct.Struct("<HhhhhhhhhHIIH")
+CPU_HZ = 64_000_000
+FOC_HZ = 16_000
+FOC_BUDGET_CYCLES = CPU_HZ // FOC_HZ
 
 
-def make_command(steer, speed):
-    s = int(steer) & 0xFFFF
-    v = int(speed) & 0xFFFF
-    chk = (START ^ s ^ v) & 0xFFFF
-    return CMD.pack(START, int(steer), int(speed), chk)
+def xor16(words):
+    value = 0
+    for word in words:
+        value ^= int(word) & 0xFFFF
+    return value & 0xFFFF
 
 
-def signed16(x):
-    return x - 65536 if x >= 32768 else x
+def make_command(steer: int, speed: int) -> bytes:
+    steer = max(-1000, min(1000, int(steer)))
+    speed = max(-1000, min(1000, int(speed)))
+    return CMD.pack(START, steer, speed, xor16((START, steer, speed)))
 
 
-def decode(buf):
-    """Return (remaining_bytes, item_or_None) parsing one valid frame."""
-    while len(buf) >= FB.size:
-        i = buf.find(struct.pack("<H", START))
-        if i < 0:
-            return b"", None
-        if len(buf) - i < FB.size:
-            return buf[i:], None
-        raw = buf[i:i + FB.size]
-        vals = list(FB.unpack(raw))
-        chk = 0
-        for w in vals[:-1]:
-            chk ^= w & 0xFFFF
-        if chk == (vals[-1] & 0xFFFF):
-            item = {
-                "cmd1": signed16(vals[1]),
-                "cmd2": signed16(vals[2]),
-                "rpm_r": signed16(vals[3]),
-                "rpm_l": signed16(vals[4]),
-                "odom_r": signed16(vals[5]),
-                "odom_l": signed16(vals[6]),
-                "battery": signed16(vals[7]),
-                "temp": signed16(vals[8]),
-                "led": vals[9],
-                "isr": (vals[10] | (vals[11] << 16)) & 0xFFFFFFFF,
-                "cyc_last": vals[12],
-                "cyc_max": vals[13],
-            }
-            return buf[i + FB.size:], item
-        buf = buf[i + 2:]
-    return buf, None
+@dataclass
+class Telemetry:
+    cmd1: int
+    cmd2: int
+    speed_r: int
+    speed_l: int
+    wheel_r: int
+    wheel_l: int
+    battery_x100: int
+    temp_x10: int
+    status: int
+    foc_cycles: int
+    foc_cycles_max: int
+
+    @property
+    def enabled(self): return bool(self.status & 0x01)
+    @property
+    def timeout(self): return bool(self.status & 0x02)
+    @property
+    def left_fault(self): return bool(self.status & 0x04)
+    @property
+    def right_fault(self): return bool(self.status & 0x08)
+
+    def summary(self) -> str:
+        us = self.foc_cycles * 1_000_000 / CPU_HZ
+        load = self.foc_cycles * 100 / FOC_BUDGET_CYCLES
+        max_us = self.foc_cycles_max * 1_000_000 / CPU_HZ
+        flags = []
+        if self.enabled: flags.append("ENA")
+        if self.timeout: flags.append("TIMEOUT")
+        if self.left_fault: flags.append("LFAULT")
+        if self.right_fault: flags.append("RFAULT")
+        return (f"cmd=({self.cmd1:+5d},{self.cmd2:+5d}) rpm=(L{self.speed_l:+5d},R{self.speed_r:+5d}) "
+                f"V={self.battery_x100/100:5.2f} T={self.temp_x10/10:5.1f}C "
+                f"foc_isr_cycles={self.foc_cycles:4d} ({us:6.2f}us,{load:5.1f}%) "
+                f"max={self.foc_cycles_max:4d} ({max_us:6.2f}us) status={','.join(flags) or 'IDLE'}")
 
 
-def run_phase(ser, name, steer, speed, seconds, samples, last_isr):
-    print(f"\n[{name}] steer={steer} speed={speed} duration={seconds}s")
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        ser.write(make_command(steer, speed))
-        deadline = time.monotonic() + 0.06
-        got = False
-        while time.monotonic() < deadline:
-            data = ser.read(FB.size * 2)
-            if not data:
-                continue
-            samples[0] += data
-            samples[0], item = decode(samples[0])
-            if item:
-                got = True
-                now = time.monotonic()
-                isr_hz = 0.0
-                if last_isr[0] is not None:
-                    dt = now - last_isr[0]
-                    if dt > 0:
-                        di = (item["isr"] - last_isr[1]) & 0xFFFFFFFF
-                        isr_hz = di / dt
-                last_isr[0] = now
-                last_isr[1] = item["isr"]
-                print(
-                    "  RPM L={rpm_l:6d} R={rpm_r:6d} | ISR={isr:10d} ({isr_hz:8.1f}/s) | "
-                    "odom L={odom_l:5d} R={odom_r:5d} | cyc last={cyc_last:5d} max={cyc_max:5d}".format(isr_hz=isr_hz, **item)
-                )
-                break
-        if not got:
-            time.sleep(0.01)
+def decode_feedback(packet: bytes) -> Telemetry | None:
+    if len(packet) != FB.size:
+        return None
+    fields = FB.unpack(packet)
+    if fields[0] != START:
+        return None
+    expected = xor16(fields[:10] + (fields[10] & 0xFFFF, fields[10] >> 16,
+                                    fields[11] & 0xFFFF, fields[11] >> 16))
+    if fields[12] != expected:
+        return None
+    return Telemetry(*fields[1:12])
 
 
-def measure_isr_rate(ser, seconds, samples):
-    """Measure true ISR rate by sampling many frames continuously (no gaps)."""
-    pairs = []
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        data = ser.read(FB.size * 4)
+class HoverSerial:
+    def __init__(self, port: str, baud: int):
+        self.ser = serial.Serial(port, baud, timeout=0.05, write_timeout=0.5)
+        self.stop_event = threading.Event()
+        self.buffer = bytearray()
+        self.write_lock = threading.Lock()
+        self.latest: Telemetry | None = None
+        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self.last_print = 0.0
+
+    def start(self):
+        self.ser.reset_input_buffer()
+        self.reader.start()
+
+    def close(self):
+        self.stop()
+        self.stop_event.set()
+        self.reader.join(timeout=0.5)
+        self.ser.close()
+
+    def send_drive(self, steer: int, speed: int):
+        with self.write_lock:
+            self.ser.write(make_command(steer, speed))
+
+    def stop(self):
+        if self.ser.is_open:
+            for _ in range(3):
+                try:
+                    self.send_drive(0, 0)
+                    time.sleep(0.02)
+                except serial.SerialException:
+                    break
+
+    def debug(self, command: str):
+        command = command.strip()
+        if command:
+            with self.write_lock:
+                self.ser.write((command + "\n").encode("ascii", "strict"))
+
+    def _print_ascii(self, data: bytes):
         if not data:
-            continue
-        samples[0] += data
-        while True:
-            samples[0], item = decode(samples[0])
-            if item is None:
+            return
+        text = data.decode("ascii", "ignore")
+        for line in text.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if line:
+                print(f"[DBG] {line}")
+
+    def _consume(self):
+        while self.buffer:
+            idx = self.buffer.find(START_BYTES)
+            if idx < 0:
+                # Keep one byte in case it is the first byte of the start marker.
+                if len(self.buffer) > 1:
+                    self._print_ascii(bytes(self.buffer[:-1]))
+                    del self.buffer[:-1]
+                return
+            if idx > 0:
+                self._print_ascii(bytes(self.buffer[:idx]))
+                del self.buffer[:idx]
+            if len(self.buffer) < FB.size:
+                return
+            packet = bytes(self.buffer[:FB.size])
+            telemetry = decode_feedback(packet)
+            if telemetry is None:
+                self._print_ascii(bytes(self.buffer[:1]))
+                del self.buffer[:1]
+                continue
+            del self.buffer[:FB.size]
+            self.latest = telemetry
+            now = time.monotonic()
+            if now - self.last_print >= 0.10:
+                print("[TEL]", telemetry.summary())
+                self.last_print = now
+
+    def _reader_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.ser.read(self.ser.in_waiting or 1)
+            except serial.SerialException as exc:
+                print(f"[ERR] serial read: {exc}", file=sys.stderr)
+                self.stop_event.set()
+                return
+            if chunk:
+                self.buffer.extend(chunk)
+                self._consume()
+
+
+def print_ports():
+    ports = list(list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+        return
+    for p in ports:
+        print(f"{p.device:12s} {p.description} {p.hwid}")
+
+
+def interactive(link: HoverSerial, steer: int, speed: int, rate_hz: float):
+    lock = threading.Lock()
+    state = [steer, speed]
+    active = True
+
+    def tx_loop():
+        period = 1.0 / max(1.0, rate_hz)
+        while active and not link.stop_event.is_set():
+            with lock:
+                s, v = state
+            try:
+                link.send_drive(s, v)
+            except serial.SerialException as exc:
+                print(f"[ERR] serial write: {exc}", file=sys.stderr)
+                return
+            time.sleep(period)
+
+    tx = threading.Thread(target=tx_loop, daemon=True)
+    tx.start()
+    print("Commands: drive <steer> <speed> | stop | get [name] | set <name> <value> | watch <name> | save | init <name> | help [name] | quit")
+    try:
+        while not link.stop_event.is_set():
+            line = input("hover> ").strip()
+            if not line:
+                continue
+            parts = line.split()
+            op = parts[0].lower()
+            if op == "drive" and len(parts) == 3:
+                s = max(-1000, min(1000, int(parts[1])))
+                v = max(-1000, min(1000, int(parts[2])))
+                with lock:
+                    state[:] = [s, v]
+            elif op == "stop":
+                with lock:
+                    state[:] = [0, 0]
+                link.stop()
+            elif op in {"get", "set", "watch", "save", "init", "help"}:
+                link.debug(line.upper())
+            elif op in {"quit", "exit", "q"}:
                 break
-            pairs.append((time.monotonic(), item["isr"]))
-    if len(pairs) < 2:
-        return None, 0, len(pairs)
-    t0, i0 = pairs[0]
-    t1, i1 = pairs[-1]
-    dt = t1 - t0
-    if dt <= 0:
-        return None, 0, len(pairs)
-    rate = ((i1 - i0) & 0xFFFFFFFF) / dt
-    return rate, len(pairs), len(pairs)
+            else:
+                print("Unknown command or arguments.")
+    finally:
+        active = False
+        with lock:
+            state[:] = [0, 0]
+        link.stop()
+        tx.join(timeout=0.3)
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
-    ap.add_argument("--command", type=int, default=120,
-                    help="motor command magnitude [-300..300]")
-    ap.add_argument("--ramp", type=float, default=1.0)
-    ap.add_argument("--hold", type=float, default=3.0)
-    ap.add_argument("--no-motor", action="store_true",
-                    help="only observe feedback, do not send drive commands")
-    ap.add_argument("--measure", type=float, default=3.0,
-                    help="seconds to measure ISR rate before driving")
+    ap = argparse.ArgumentParser(description="Hoverboard USART3 control/debug/telemetry tool")
+    ap.add_argument("--port", default="/dev/ttyUSB0", help="Serial port, e.g. COM3 or /dev/ttyUSB0")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--list-ports", action="store_true")
+    ap.add_argument("--steer", type=int, default=0, help="Initial steer command [-1000,1000]")
+    ap.add_argument("--speed", type=int, default=0, help="Initial speed command [-1000,1000]")
+    ap.add_argument("--rate", type=float, default=20.0, help="Drive command rate Hz")
+    ap.add_argument("--monitor", action="store_true", help="Telemetry/debug monitor only; does not send drive frames")
     args = ap.parse_args()
-    if abs(args.command) > 300:
-        ap.error("--command must be between -300 and 300")
 
-    print("WARNING: pastikan kedua roda terangkat dan area aman (motor akan berputar).")
-    samples = [b""]
-    last_isr = [None, 0]
+    if args.list_ports:
+        print_ports()
+        if not args.port:
+            return
+    if not args.port:
+        ap.error("--port is required (or use --list-ports)")
 
-    with serial.Serial(args.port, 115200, timeout=0.02) as ser:
-        ser.reset_input_buffer()
-        # Accurate ISR-rate measurement while motors are still idle
-        rate, packets, _ = measure_isr_rate(ser, args.measure, samples)
-        if rate is not None:
-            print("\n[ISR MEASURE] rate = {:.1f} interrupts/s over {:.2f}s "
-                  "({} packets)".format(rate, args.measure, packets))
-        if args.no_motor:
-            run_phase(ser, "OBSERVE", 0, 0, 3.0, samples, last_isr)
+    link = HoverSerial(args.port, args.baud)
+    link.start()
+    print(f"Connected {args.port} @ {args.baud}; feedback={FB.size} bytes; FOC budget={FOC_BUDGET_CYCLES} cycles")
+    try:
+        if args.monitor:
+            while not link.stop_event.is_set():
+                time.sleep(0.2)
         else:
-            # Safety: hold zero command first so the firmware enables both motors
-            # (it only arms when |cmd1| and |cmd2| stay < 50 for one loop pass).
-            run_phase(ser, "ENABLE (zero cmd)", 0, 0, 2.0, samples, last_isr)
-            # steering mixer: left=(speed+steer), right=(speed-steer)
-            run_phase(ser, "LEFT", args.command, args.command, args.ramp, samples, last_isr)
-            run_phase(ser, "LEFT HOLD", args.command, args.command, args.hold, samples, last_isr)
-            run_phase(ser, "RIGHT", -args.command, args.command, args.ramp, samples, last_isr)
-            run_phase(ser, "RIGHT HOLD", -args.command, args.command, args.hold, samples, last_isr)
-            run_phase(ser, "BOTH", 0, args.command, args.hold, samples, last_isr)
-        # stop burst; keep sending valid frames to avoid serial timeout
-        for _ in range(10):
-            ser.write(make_command(0, 0))
-            time.sleep(0.02)
-
-    print("\nSTOP dikirim. Nilai ISR pada baris di atas = counter kumulatif;")
-    print("angka di kurung (x.x/s) = laju ISR aktual (harus ~16000/s).")
+            interactive(link, args.steer, args.speed, args.rate)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        link.close()
 
 
 if __name__ == "__main__":

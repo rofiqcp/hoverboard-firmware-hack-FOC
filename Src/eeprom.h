@@ -209,7 +209,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)0x18)       /* 24 Variables: 18 original + 6 steering */
+#define NB_OF_VAR             ((uint8_t)0x03)       /* USART-only profile: key, Imax, Nmax */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

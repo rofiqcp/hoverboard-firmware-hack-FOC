@@ -29,16 +29,9 @@
 #include "util.h"
 #include "comms.h"
 
-#if defined(DEBUG_SERIAL_PROTOCOL)
-#if defined(DEBUG_SERIAL_PROTOCOL) && (defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3))
 
-#ifdef CONTROL_ADC
-  #define RAW_MIN 0
-  #define RAW_MAX 4095
-#else
-  #define RAW_MIN -1000
-  #define RAW_MAX 1000
-#endif
+#define RAW_MIN -1000
+#define RAW_MAX 1000
 
 
 #define MAX_PARAM_WATCH 15
@@ -66,22 +59,8 @@ extern int16_t right_dc_curr;
 extern int16_t dc_curr;
 extern int16_t cmdL; 
 extern int16_t cmdR; 
-
-// Steering controller externs (implemented in steering.c)
-extern int16_t steer_kp;
-extern int16_t steer_ki;
-extern int16_t steer_kd;
-extern int16_t steer_homing_spd;
-extern int16_t steer_homing_curr_thr;
-extern int16_t steer_homing_timeout_ms;
-extern int16_t steer_pos_min;
-extern int16_t steer_pos_max;
-extern int16_t steer_pos_mid;
-extern uint8_t  steer_homing_done;
-extern uint8_t  steer_failure_flag;
-extern int16_t  steer_encoder_count;
-void steerCtrl_SetK(int16_t kp, int16_t ki, int16_t kd);
-void steerCtrl_SetHoming(int16_t hom_rpm, int16_t hom_curr_thr, int16_t hom_timeout);
+extern volatile uint32_t foc_isr_cycles;
+extern volatile uint32_t foc_isr_cycles_max;
 
 
 
@@ -115,35 +94,11 @@ const parameter_entry params[] = {
   // INPUT PARAMETERS
   // Type       ,Name                 ,ValueL ptr                            ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
     {VARIABLE   ,"IN1_RAW"            ,ADD_PARAM(input1[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input1 raw"},        
-    {PARAMETER  ,"IN1_TYP"            ,ADD_PARAM(input1[0].typ)              ,NULL                      ,3          ,0                 ,0      ,0      ,3      ,0               ,0    ,0     ,0                  ,"Input1 type"},        
-    {PARAMETER  ,"IN1_MIN"            ,ADD_PARAM(input1[0].min)              ,NULL                      ,4          ,RAW_MIN           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input1 min"},        
-    {PARAMETER  ,"IN1_MID"            ,ADD_PARAM(input1[0].mid)              ,NULL                      ,5          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input1 mid"},
-    {PARAMETER  ,"IN1_MAX"            ,ADD_PARAM(input1[0].max)              ,NULL                      ,6          ,RAW_MAX           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input1 max"},        
     {VARIABLE   ,"IN1_CMD"            ,ADD_PARAM(input1[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Input1 cmd"},        
     
     {VARIABLE   ,"IN2_RAW"            ,ADD_PARAM(input2[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input2 raw"},   
-    {PARAMETER  ,"IN2_TYP"            ,ADD_PARAM(input2[0].typ)              ,NULL                      ,7          ,0                 ,0      ,0      ,3      ,0               ,0    ,0     ,0                  ,"Input2 type"},        
-    {PARAMETER  ,"IN2_MIN"            ,ADD_PARAM(input2[0].min)              ,NULL                      ,8          ,RAW_MIN           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input2 min"},        
-    {PARAMETER  ,"IN2_MID"            ,ADD_PARAM(input2[0].mid)              ,NULL                      ,9          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input2 mid"},
-    {PARAMETER  ,"IN2_MAX"            ,ADD_PARAM(input2[0].max)              ,NULL                      ,10         ,RAW_MAX           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input2 max"},
     {VARIABLE   ,"IN2_CMD"            ,ADD_PARAM(input2[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Input2 cmd"},
-#if defined(PRI_INPUT1) && defined(PRI_INPUT2) && defined(AUX_INPUT1) && defined(AUX_INPUT2)  
-  // Type       ,Name                 ,ValueL ptr                            ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {VARIABLE   ,"AUX_IN1_RAW"        ,ADD_PARAM(input1[1].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input1 raw"},        
-    {PARAMETER  ,"AUX_IN1_TYP"        ,ADD_PARAM(input1[1].typ)              ,NULL                      ,11         ,0                 ,0      ,0      ,3      ,0               ,0    ,0     ,0                  ,"Aux. input1 type"},        
-    {PARAMETER  ,"AUX_IN1_MIN"        ,ADD_PARAM(input1[1].min)              ,NULL                      ,12         ,RAW_MIN           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input1 min"},        
-    {PARAMETER  ,"AUX_IN1_MID"        ,ADD_PARAM(input1[1].mid)              ,NULL                      ,13         ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input1 mid"},
-    {PARAMETER  ,"AUX_IN1_MAX"        ,ADD_PARAM(input1[1].max)              ,NULL                      ,14         ,RAW_MAX           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input1 max"},        
-    {VARIABLE   ,"AUX_IN1_CMD"        ,ADD_PARAM(input1[1].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Aux. input1 cmd"},        
-    
-    {VARIABLE   ,"AUX_IN2_RAW"        ,ADD_PARAM(input2[1].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input2 raw"},        
-    {PARAMETER  ,"AUX_IN2_TYP"        ,ADD_PARAM(input2[1].typ)              ,NULL                      ,15         ,0                 ,0      ,0      ,3      ,0               ,0    ,0     ,0                  ,"Aux. input2 type"},        
-    {PARAMETER  ,"AUX_IN2_MIN"        ,ADD_PARAM(input2[1].min)              ,NULL                      ,16         ,RAW_MIN           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input2 min"},        
-    {PARAMETER  ,"AUX_IN2_MID"        ,ADD_PARAM(input2[1].mid)              ,NULL                      ,17         ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input2 mid"},
-    {PARAMETER  ,"AUX_IN2_MAX"        ,ADD_PARAM(input2[1].max)              ,NULL                      ,18         ,RAW_MAX           ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Aux. input2 max"},
-    {VARIABLE   ,"AUX_IN2_CMD"        ,ADD_PARAM(input2[1].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Aux. input2 cmd"},
-#endif  
-  // FEEDBACK
+// FEEDBACK
   // Type       ,Name                 ,Datatype, ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
     {VARIABLE   ,"DC_CURR"            ,ADD_PARAM(dc_curr)                    ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Total DC Link current A *100"},
     {VARIABLE   ,"RDC_CURR"           ,ADD_PARAM(right_dc_curr)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Right DC Link current A *100"},
@@ -156,31 +111,15 @@ const parameter_entry params[] = {
     {VARIABLE   ,"RATE"               ,0       , NULL                        ,NULL                      ,0          ,RATE              ,0      ,0      ,0      ,0               ,0    ,4     ,NULL               ,"Rate *10"},
     {VARIABLE   ,"SPD_COEF"           ,0       , NULL                        ,NULL                      ,0          ,SPEED_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Speed Coefficient *10"},
     {VARIABLE   ,"STR_COEF"           ,0       , NULL                        ,NULL                      ,0          ,STEER_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Steer Coefficient *10"},
-    {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},
-    {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},
-
-  // LEFT STEERING POSITION CONTROL (old lpos_* patch — entries at 19-21 superseded by STEER_*)
-  // STEERING POSITION CONTROLLER PARAMETERS
-  // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {PARAMETER  ,"STEER_KP"          ,ADD_PARAM(steer_kp)                  ,NULL                      ,19         ,STEER_KP_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Kp *1000 (50=0.050)"},
-    {PARAMETER  ,"STEER_KI"          ,ADD_PARAM(steer_ki)                  ,NULL                      ,20         ,STEER_KI_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Ki *1000 (5=0.005)"},
-    {PARAMETER  ,"STEER_KD"          ,ADD_PARAM(steer_kd)                  ,NULL                      ,21         ,STEER_KD_INIT     ,0      ,0      ,1000   ,0               ,0    ,0     ,steerCtrl_SetK    ,"Steer Kd *1000 (0=0.000)"},
-    {PARAMETER  ,"STEER_HOM_SPD"     ,ADD_PARAM(steer_homing_spd)          ,NULL                      ,22         ,STEER_HOM_SPD_INIT,0     ,20     ,500     ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing speed RPM"},
-    {PARAMETER  ,"STEER_HOM_CURR"    ,ADD_PARAM(steer_homing_curr_thr)     ,NULL                      ,23         ,STEER_HOM_CURR_INIT,0    ,50     ,300     ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing current thresh A*100"},
-    {PARAMETER  ,"STEER_HOM_TO"      ,ADD_PARAM(steer_homing_timeout_ms)    ,NULL                      ,24         ,STEER_HOM_TO_INIT ,0      ,2000   ,60000   ,0               ,0    ,0     ,steerCtrl_SetHoming,"Homing timeout ms"},
-  // STEERING STATUS VARIABLES
-  // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {VARIABLE   ,"STR_POS"           ,ADD_PARAM(steer_encoder_count)        ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer encoder count"},
-    {VARIABLE   ,"STR_MIN"           ,ADD_PARAM(steer_pos_min)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer learned min count"},
-    {VARIABLE   ,"STR_MAX"           ,ADD_PARAM(steer_pos_max)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer learned max count"},
-    {VARIABLE   ,"STR_MID"           ,ADD_PARAM(steer_pos_mid)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Steer computed midpoint"},
-    {VARIABLE   ,"STR_HOMED"         ,ADD_PARAM(steer_homing_done)         ,NULL                      ,0          ,0                 ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Steer homed 0/1"},
-    {VARIABLE   ,"STR_FAIL"          ,ADD_PARAM(steer_failure_flag)        ,NULL                      ,0          ,0                 ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Steer failure flag 0/1"},
+    {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},       
+    {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},       
+    {VARIABLE   ,"FOC_ISR_CYC"        ,ADD_PARAM(foc_isr_cycles)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Last FOC ISR CPU cycles"},
+    {VARIABLE   ,"FOC_ISR_MAX"        ,ADD_PARAM(foc_isr_cycles_max)         ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Maximum FOC ISR CPU cycles since boot"},
 
 };
 
 
-const char *errors[9] = {
+const char *errors[10] = {
   "Command not found", // Err1
   "Parameter not found", // Err2
   "This command cannot be used with a Variable", // Err3
@@ -389,21 +328,6 @@ int8_t printAllParamDef(){
 
 void printError(uint8_t errornum ){
   printf("! Err%i:\"%s\"\r\n",errornum,errors[errornum-1]);
-}
-
-// Function to increment a value
-// Get Parameter in External format, check max value, increment, set Parameter
-// Not used in the protocol yet 
-int8_t incrParamVal(uint8_t index) {
-  // This should be used only if min and max values are known
-  if (params[index].min == params[index].max) return 0;
-  
-  uint32_t value = getParamValExt(index);
-  if (value < params[index].max){
-    return setParamValExt(index,value + 1);
-  }else{
-    return setParamValExt(index,(int32_t) params[index].min);
-  } 
 }
 
 // Get internal Parameter value and save it to EEprom for all paraemeter with an address assigned 
@@ -678,7 +602,4 @@ void process_debug()
     command.semaphore = 0;
   }
 }
-
-#endif
-#endif  // DEBUG_SERIAL_PROTOCOL
 

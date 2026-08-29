@@ -60,7 +60,6 @@ extern "C" {
 /*#define HAL_ETH_MODULE_ENABLED   */
 /*#define HAL_FLASH_MODULE_ENABLED   */
 #define HAL_GPIO_MODULE_ENABLED
-#define HAL_I2C_MODULE_ENABLED
 /*#define HAL_I2S_MODULE_ENABLED   */
 /*#define HAL_IRDA_MODULE_ENABLED   */
 /*#define HAL_IWDG_MODULE_ENABLED   */
@@ -266,9 +265,6 @@ extern "C" {
 #include "stm32f1xx_hal_nor.h"
 #endif /* HAL_NOR_MODULE_ENABLED */
 
-#ifdef HAL_I2C_MODULE_ENABLED
-#include "stm32f1xx_hal_i2c.h"
-#endif /* HAL_I2C_MODULE_ENABLED */
 
 #ifdef HAL_I2S_MODULE_ENABLED
 #include "stm32f1xx_hal_i2s.h"
