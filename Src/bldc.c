@@ -27,6 +27,7 @@
 #include "setup.h"
 #include "config.h"
 #include "util.h"
+#include "bldc.h"
 
 // Matlab includes and defines - from auto-code generation
 // ###############################################################################
@@ -74,6 +75,15 @@ static const uint16_t pwm_res  = 64000000 / 2 / PWM_FREQ; // = 2000
 volatile uint32_t foc_isr_cycles = 0;
 volatile uint32_t foc_isr_cycles_max = 0;
 
+/* Telemetry dq snapshots in the exact Q4 current-count convention used by the
+ * generated FOC (16 * A2BIT_CONV units per ampere). Modes 1..3 mirror rtY.
+ * Modes 4..6 use a measurement-only Clarke/Park path so every control method
+ * exposes the same comparison channels without changing its control law. */
+volatile int16_t foc_iqL_q4 = 0;
+volatile int16_t foc_iqR_q4 = 0;
+volatile int16_t foc_idL_q4 = 0;
+volatile int16_t foc_idR_q4 = 0;
+
 static inline void focIsrMonitorEnd(uint32_t startCycles) {
   const uint32_t elapsed = DWT->CYCCNT - startCycles;
   foc_isr_cycles = elapsed;
@@ -106,6 +116,152 @@ static uint16_t svpwm_phase_r = 0;
 
 static inline int16_t svpwmSinQ15(uint16_t phase) {
   return svpwm_sin_q15[(uint8_t)(phase >> 8)];
+}
+
+static inline int16_t clampS16FromS32(int32_t x) {
+  if (x > 32767) return 32767;
+  if (x < -32768) return -32768;
+  return (int16_t)x;
+}
+
+/* Measurement-only Clarke/Park used when the generated controller does not
+ * publish dq (SVPWM/COM/SIN). Clarke equations and Q4 scaling match the generated
+ * FOC. theta is a Q16 electrical revolution: 0..65535 => 0..360 deg. */
+typedef struct {
+  int32_t iq_state;
+  int32_t id_state;
+} DqFilterState;
+
+typedef struct {
+  uint8_t initialized;
+  int8_t sector;
+  int8_t direction;
+  uint16_t ticks;
+  uint16_t period;
+  int16_t rpm;
+} HallSpeedState;
+
+static DqFilterState dq_filter_l = {0, 0};
+static DqFilterState dq_filter_r = {0, 0};
+static HallSpeedState hall_speed_l = {0, 0, 0, 0, 0, 0};
+static HallSpeedState hall_speed_r = {0, 0, 0, 0, 0, 0};
+static uint8_t dq_last_runtime_mode = 0xffu;
+
+static inline void dqMeasurementReset(void) {
+  dq_filter_l.iq_state = dq_filter_l.id_state = 0;
+  dq_filter_r.iq_state = dq_filter_r.id_state = 0;
+  hall_speed_l.initialized = hall_speed_r.initialized = 0;
+  hall_speed_l.ticks = hall_speed_r.ticks = 0;
+  hall_speed_l.period = hall_speed_r.period = 0;
+  hall_speed_l.direction = hall_speed_r.direction = 0;
+  hall_speed_l.rpm = hall_speed_r.rpm = 0;
+}
+
+static inline int16_t dqLowPassQ4(int16_t input, uint16_t coef, int32_t *state) {
+  int32_t error = (int32_t)input - (*state >> 16);
+  if (error > 32767) error = 32767;
+  if (error < -32768) error = -32768;
+  *state += (int32_t)coef * error;
+  return clampS16FromS32(*state >> 16);
+}
+
+static inline uint16_t electricalDegreesToPhase(int16_t degrees) {
+  int32_t d = degrees % 360;
+  if (d < 0) d += 360;
+  return (uint16_t)(((uint32_t)d * 65536u) / 360u);
+}
+
+static inline void measureCurrentDQ(int16_t current1, int16_t current2,
+                                    uint8_t phasePairBC, uint16_t theta,
+                                    uint8_t signedByCommand, int16_t command,
+                                    uint16_t filterCoef, DqFilterState *filter,
+                                    volatile int16_t *iq_q4,
+                                    volatile int16_t *id_q4) {
+  int32_t i1 = (int32_t)current1 << 4;
+  int32_t i2 = (int32_t)current2 << 4;
+  int32_t alpha;
+  int32_t beta;
+
+  if (!phasePairBC) {
+    const int32_t p1 = 18919 * i1;
+    const int32_t p2 = 18919 * i2;
+    alpha = i1;
+    beta = (((p1 < 0 ? 32767 : 0) + p1) >> 15) +
+           (((p2 < 0 ? 16383 : 0) + p2) >> 14);
+  } else {
+    const int32_t diff = i1 - i2;
+    const int32_t pbc = 18919 * diff;
+    alpha = -i1 - i2;
+    beta = ((pbc < 0 ? 32767 : 0) + pbc) >> 15;
+  }
+
+  alpha = clampS16FromS32(alpha);
+  beta = clampS16FromS32(beta);
+
+  const int32_t sin_q15 = svpwmSinQ15(theta);
+  const int32_t cos_q15 = svpwmSinQ15((uint16_t)(theta + 16384u));
+
+  /* Same Park sign convention as generated FOC:
+   *   iq = beta*cos(theta) - alpha*sin(theta)
+   *   id = alpha*cos(theta) + beta*sin(theta) */
+  int32_t iq = (beta * cos_q15 - alpha * sin_q15) >> 15;
+  int32_t id = (alpha * cos_q15 + beta * sin_q15) >> 15;
+  if (signedByCommand && command < 0) iq = -iq;
+
+  const int16_t iqRaw = clampS16FromS32(iq);
+  const int16_t idRaw = clampS16FromS32(id);
+  *iq_q4 = dqLowPassQ4(iqRaw, filterCoef, &filter->iq_state);
+  *id_q4 = dqLowPassQ4(idRaw, filterCoef, &filter->id_state);
+}
+
+static inline int16_t hallSpeedUpdate(uint8_t encoding, uint8_t polePairs, HallSpeedState *state) {
+  const int8_t sector = rtConstP.vec_hallToPos_Value[encoding & 7u];
+  if (sector < 0 || sector > 5 || polePairs == 0u) {
+    state->rpm = 0;
+    return 0;
+  }
+
+  if (!state->initialized) {
+    state->initialized = 1u;
+    state->sector = sector;
+    state->ticks = 0u;
+    state->period = 0u;
+    state->direction = 0;
+    state->rpm = 0;
+    return 0;
+  }
+
+  if (state->ticks < 65535u) ++state->ticks;
+  if (sector != state->sector) {
+    const uint8_t diff = (uint8_t)((sector - state->sector + 6) % 6);
+    if (diff == 1u) state->direction = 1;
+    else if (diff == 5u) state->direction = -1;
+
+    if (state->ticks > 0u && state->direction != 0) {
+      state->period = state->ticks;
+      const uint32_t rpmMag = ((uint32_t)PWM_FREQ * 10u) /
+                              ((uint32_t)state->period * (uint32_t)polePairs);
+      state->rpm = (int16_t)(state->direction > 0 ? rpmMag : -(int32_t)rpmMag);
+    }
+    state->sector = sector;
+    state->ticks = 0u;
+  } else if (state->period > 0u && (uint32_t)state->ticks > (uint32_t)state->period * 2u) {
+    state->rpm = 0;
+  }
+  return state->rpm;
+}
+
+static inline uint8_t runtimeControlType(uint8_t mode) {
+  if (mode == COMMUTATION_MODE) return COM_CTRL;
+  if (mode == SINE_MODE) return SIN_CTRL;
+  return FOC_CTRL;
+}
+
+static inline uint8_t runtimeGeneratedMode(uint8_t mode) {
+  if (mode >= VLT_MODE && mode <= TRQ_MODE) return mode;
+  /* COM and SIN reuse the generated voltage-control path. SPD/TRQ are FOC-only. */
+  if (mode == COMMUTATION_MODE || mode == SINE_MODE) return VLT_MODE;
+  return OPEN_MODE;
 }
 
 static inline void svpwmOpenLoopStep(int16_t command, uint16_t *phase, int *u, int *v, int *w) {
@@ -149,13 +305,43 @@ static inline void svpwmOpenLoopStep(int16_t command, uint16_t *phase, int *u, i
   *w = (int)((c * amplitudeTicks) / 32767);
 }
 
-static uint16_t offsetcount = 0;
+static volatile uint16_t offsetcount = 0;
 static int16_t offsetrlA    = 2000;
 static int16_t offsetrlB    = 2000;
 static int16_t offsetrrB    = 2000;
 static int16_t offsetrrC    = 2000;
 static int16_t offsetdcl    = 2000;
 static int16_t offsetdcr    = 2000;
+
+uint8_t currentCalibrationActive(void) {
+  return offsetcount < ADC_CALIBRATION_SAMPLES;
+}
+
+uint16_t currentCalibrationProgressPermille(void) {
+  uint32_t count = offsetcount;
+  if (count > ADC_CALIBRATION_SAMPLES) count = ADC_CALIBRATION_SAMPLES;
+  return (uint16_t)((count * 1000u) / ADC_CALIBRATION_SAMPLES);
+}
+
+void currentCalibrationStart(void) {
+  const uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  enable = 0;
+  enableFin = 0;
+  LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
+  RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+  offsetrlA = (int16_t)adc_buffer.rlA;
+  offsetrlB = (int16_t)adc_buffer.rlB;
+  offsetrrB = (int16_t)adc_buffer.rrB;
+  offsetrrC = (int16_t)adc_buffer.rrC;
+  offsetdcl = (int16_t)adc_buffer.dcl;
+  offsetdcr = (int16_t)adc_buffer.dcr;
+  offsetcount = 0u;
+  foc_iqL_q4 = foc_iqR_q4 = 0;
+  foc_idL_q4 = foc_idR_q4 = 0;
+  dqMeasurementReset();
+  if (!primask) __enable_irq();
+}
 
 int16_t        batVoltage       = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE;
 static int32_t batVoltageFixdt  = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE << 16;  // Fixed-point filter output initialized at 400 V*100/cell = 4 V/cell converted to fixed-point
@@ -171,7 +357,7 @@ int16_t modulo(int16_t m, int16_t rest_classes){
 }
 
 int16_t up_or_down(int16_t vorher, int16_t nachher){
-  uint16_t up_down[6] = {0,-1,-2,0,2,1};
+  static const int8_t up_down[6] = {0, -1, -2, 0, 2, 1};
   //uint16_t mod_diff =  (((vorher - nachher) % 6) + 6) % 6;
   
   return up_down[modulo(vorher-nachher, 6)];
@@ -187,7 +373,7 @@ void DMA1_Channel1_IRQHandler(void) {
   // HAL_GPIO_WritePin(LED_PORT, LED_PIN, 1);
   // HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 
-  if(offsetcount < 2000) {  // calibrate ADC offsets
+  if (offsetcount < ADC_CALIBRATION_SAMPLES) {  // automatic boot or manual ADC offset calibration
     offsetcount++;
     offsetrlA = (adc_buffer.rlA + offsetrlA) / 2;
     offsetrlB = (adc_buffer.rlB + offsetrlB) / 2;
@@ -195,6 +381,7 @@ void DMA1_Channel1_IRQHandler(void) {
     offsetrrC = (adc_buffer.rrC + offsetrrC) / 2;
     offsetdcl = (adc_buffer.dcl + offsetdcl) / 2;
     offsetdcr = (adc_buffer.dcr + offsetdcr) / 2;
+    buzzerTimer++;  // keep main-loop telemetry/progress alive during manual calibration
     focIsrMonitorEnd(focIsrStartCycles);
     return;
   }
@@ -214,10 +401,20 @@ void DMA1_Channel1_IRQHandler(void) {
   curR_phaC = (int16_t)(offsetrrC - adc_buffer.rrC);
   curR_DC   = (int16_t)(offsetdcr - adc_buffer.dcr);
 
-  const uint8_t svpwmMode = (ctrlModReq == SVPWM_MODE);
+  const uint8_t runtimeMode = ctrlModReq;
+  const uint8_t svpwmMode = (runtimeMode == SVPWM_MODE);
+  const uint8_t generatedType = runtimeControlType(runtimeMode);
+  const uint8_t generatedMode = runtimeGeneratedMode(runtimeMode);
+
+  rtP_Left.z_ctrlTypSel = generatedType;
+  rtP_Right.z_ctrlTypSel = generatedType;
+  if (runtimeMode != dq_last_runtime_mode) {
+    dqMeasurementReset();
+    dq_last_runtime_mode = runtimeMode;
+  }
 
   // Hardware-level current chopping. The generated controller provides its own
-  // phase-current limiting in modes 1..3; mode 4 bypasses that controller, so
+  // phase-current limiting in generated modes; mode 4 bypasses that controller, so
   // reconstruct the third phase and enforce I_MOT_MAX here as well.
   const int32_t curL_phaC = -(int32_t)curL_phaA - (int32_t)curL_phaB;
   const int32_t curR_phaA = -(int32_t)curR_phaB - (int32_t)curR_phaC;
@@ -258,7 +455,7 @@ void DMA1_Channel1_IRQHandler(void) {
   }
 
   // FOC needs a current-sampling PWM window. Open-loop SVPWM stays below 85% modulation.
-  pwm_margin = (!svpwmMode && rtP_Left.z_ctrlTypSel == FOC_CTRL) ? 110 : 0;
+  pwm_margin = (!svpwmMode && generatedType == FOC_CTRL) ? 110 : 0;
 
   // ############################### MOTOR CONTROL ###############################
 
@@ -284,17 +481,27 @@ void DMA1_Channel1_IRQHandler(void) {
   rtU_Left.i_DCLink = curL_DC;
 
   if (svpwmMode) {
+    const uint8_t hall_ul = !(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN);
+    const uint8_t hall_vl = !(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN);
+    const uint8_t hall_wl = !(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
+    const uint8_t encoding_l = (uint8_t)((hall_ul << 2) + (hall_vl << 1) + hall_wl);
     rtU_Left.z_ctrlModReq = OPEN_MODE;
     rtU_Left.r_inpTgt = 0;
     rtY_Left.z_errCode = 0;
-    rtY_Left.n_mot = 0;       // no sensor => no measured RPM is claimed
+    /* Hall is read only for telemetry RPM; it does not participate in SVPWM control. */
+    rtY_Left.n_mot = hallSpeedUpdate(encoding_l, rtP_Left.n_polePairs, &hall_speed_l);
+    rtY_Left.iq = 0;
+    rtY_Left.id = 0;
+    measureCurrentDQ(curL_phaA, curL_phaB, 0u, (uint16_t)(0u - svpwm_phase_l),
+                     1u, (int16_t)pwml, rtP_Left.cf_currFilt, &dq_filter_l,
+                     &foc_iqL_q4, &foc_idL_q4);
     svpwmOpenLoopStep((int16_t)pwml, &svpwm_phase_l, &ul, &vl, &wl);
   } else {
     const uint8_t hall_ul = !(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN);
     const uint8_t hall_vl = !(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN);
     const uint8_t hall_wl = !(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
 
-    rtU_Left.z_ctrlModReq = ctrlModReq;
+    rtU_Left.z_ctrlModReq = generatedMode;
     rtU_Left.r_inpTgt = pwml;
     rtU_Left.b_hallA = hall_ul;
     rtU_Left.b_hallB = hall_vl;
@@ -303,12 +510,20 @@ void DMA1_Channel1_IRQHandler(void) {
     #ifdef MOTOR_LEFT_ENA
     BLDC_controller_step(rtM_Left);
     #endif
+    const uint8_t encoding_l = (uint8_t)((hall_ul << 2) + (hall_vl << 1) + hall_wl);
+    if (generatedType == FOC_CTRL) {
+      foc_iqL_q4 = rtY_Left.iq;
+      foc_idL_q4 = rtY_Left.id;
+    } else {
+      const uint16_t theta_l = electricalDegreesToPhase(rtY_Left.a_elecAngle);
+      measureCurrentDQ(curL_phaA, curL_phaB, 0u, theta_l, 0u, 0,
+                       rtP_Left.cf_currFilt, &dq_filter_l, &foc_iqL_q4, &foc_idL_q4);
+    }
 
     ul = rtY_Left.DC_phaA;
     vl = rtY_Left.DC_phaB;
     wl = rtY_Left.DC_phaC;
 
-    const uint8_t encoding_l = (uint8_t)((hall_ul << 2) + (hall_vl << 1) + hall_wl);
     const int wheel_pos_l = rtConstP.vec_hallToPos_Value[encoding_l];
     odom_l = modulo(odom_l + up_or_down(wp_l_vorher, wheel_pos_l), 9000);
     wp_l_vorher = wheel_pos_l;
@@ -327,17 +542,26 @@ void DMA1_Channel1_IRQHandler(void) {
   rtU_Right.i_DCLink = curR_DC;
 
   if (svpwmMode) {
+    const uint8_t hall_ur = !(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN);
+    const uint8_t hall_vr = !(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN);
+    const uint8_t hall_wr = !(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
+    const uint8_t encoding_r = (uint8_t)((hall_ur << 2) + (hall_vr << 1) + hall_wr);
     rtU_Right.z_ctrlModReq = OPEN_MODE;
     rtU_Right.r_inpTgt = 0;
     rtY_Right.z_errCode = 0;
-    rtY_Right.n_mot = 0;      // no sensor => no measured RPM is claimed
+    rtY_Right.n_mot = hallSpeedUpdate(encoding_r, rtP_Right.n_polePairs, &hall_speed_r);
+    rtY_Right.iq = 0;
+    rtY_Right.id = 0;
+    measureCurrentDQ(curR_phaB, curR_phaC, 1u, (uint16_t)(0u - svpwm_phase_r),
+                     1u, (int16_t)pwmr, rtP_Right.cf_currFilt, &dq_filter_r,
+                     &foc_iqR_q4, &foc_idR_q4);
     svpwmOpenLoopStep((int16_t)pwmr, &svpwm_phase_r, &ur, &vr, &wr);
   } else {
     const uint8_t hall_ur = !(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN);
     const uint8_t hall_vr = !(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN);
     const uint8_t hall_wr = !(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
 
-    rtU_Right.z_ctrlModReq = ctrlModReq;
+    rtU_Right.z_ctrlModReq = generatedMode;
     rtU_Right.r_inpTgt = pwmr;
     rtU_Right.b_hallA = hall_ur;
     rtU_Right.b_hallB = hall_vr;
@@ -346,12 +570,20 @@ void DMA1_Channel1_IRQHandler(void) {
     #ifdef MOTOR_RIGHT_ENA
     BLDC_controller_step(rtM_Right);
     #endif
+    const uint8_t encoding_r = (uint8_t)((hall_ur << 2) + (hall_vr << 1) + hall_wr);
+    if (generatedType == FOC_CTRL) {
+      foc_iqR_q4 = rtY_Right.iq;
+      foc_idR_q4 = rtY_Right.id;
+    } else {
+      const uint16_t theta_r = electricalDegreesToPhase(rtY_Right.a_elecAngle);
+      measureCurrentDQ(curR_phaB, curR_phaC, 1u, theta_r, 0u, 0,
+                       rtP_Right.cf_currFilt, &dq_filter_r, &foc_iqR_q4, &foc_idR_q4);
+    }
 
     ur = rtY_Right.DC_phaA;
     vr = rtY_Right.DC_phaB;
     wr = rtY_Right.DC_phaC;
 
-    const uint8_t encoding_r = (uint8_t)((hall_ur << 2) + (hall_vr << 1) + hall_wr);
     const int wheel_pos_r = rtConstP.vec_hallToPos_Value[encoding_r];
     odom_r = modulo(odom_r - up_or_down(wp_r_vorher, wheel_pos_r), 9000);
     wp_r_vorher = wheel_pos_r;

@@ -1,284 +1,213 @@
 #!/usr/bin/env python3
-"""USART3 host tool for the cleaned hoverboard firmware.
-
-One port carries:
-- binary drive commands (host -> STM32)
-- binary telemetry (STM32 -> host)
-- ASCII debug protocol (GET/SET/WATCH/INIT/SAVE/HELP)
-"""
+"""Interactive Arduino-monitor-like terminal for hoverboard USART3 control."""
 from __future__ import annotations
 
 import argparse
-import struct
-import sys
+import shlex
 import threading
 import time
-from dataclasses import dataclass
+from pathlib import Path
 
 try:
-    import serial
-    from serial.tools import list_ports
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.patch_stdout import patch_stdout
 except ImportError as exc:
-    raise SystemExit("pyserial is required: python -m pip install pyserial") from exc
+    raise SystemExit("Install: python3 -m pip install -r tools/requirements.txt") from exc
 
-START = 0xABCD
-START_BYTES = struct.pack("<H", START)
-CMD = struct.Struct("<HhhH")
-FB = struct.Struct("<HhhhhhhhhHII7H")
-CPU_HZ = 64_000_000
-FOC_HZ = 16_000
-FOC_BUDGET_CYCLES = CPU_HZ // FOC_HZ
+from hoverlink import (
+    FB, MODE_NAMES, TELEMETRY_HZ, CsvLogger, HoverLink, Telemetry,
+    available_ports, clamp_cmd,
+)
 
 
-def xor16(words):
-    value = 0
-    for word in words:
-        value ^= int(word) & 0xFFFF
-    return value & 0xFFFF
+def parse_lr(tokens: list[str]) -> tuple[int, int]:
+    if len(tokens) == 1 and "," in tokens[0]:
+        a, b = tokens[0].split(",", 1)
+    elif len(tokens) == 2:
+        a, b = tokens
+    else:
+        raise ValueError("expected: L,R  or  L R")
+    return clamp_cmd(int(a)), clamp_cmd(int(b))
 
 
-def make_command(steer: int, speed: int) -> bytes:
-    steer = max(-1000, min(1000, int(steer)))
-    speed = max(-1000, min(1000, int(speed)))
-    return CMD.pack(START, steer, speed, xor16((START, steer, speed)))
-
-
-@dataclass
-class Telemetry:
-    cmd1: int
-    cmd2: int
-    speed_r: int
-    speed_l: int
-    wheel_r: int
-    wheel_l: int
-    battery_x100: int
-    temp_x10: int
-    status: int
-    foc_cycles: int
-    foc_cycles_max: int
-    adc_dcl: int
-    adc_rla: int
-    adc_rlb: int
-    adc_dcr: int
-    adc_rrb: int
-    adc_rrc: int
-
-    @property
-    def enabled(self): return bool(self.status & 0x01)
-    @property
-    def timeout(self): return bool(self.status & 0x02)
-    @property
-    def left_fault(self): return bool(self.status & 0x04)
-    @property
-    def right_fault(self): return bool(self.status & 0x08)
-
-    def summary(self) -> str:
-        return (f"cmd={self.cmd1},{self.cmd2} rpm={self.speed_l},{self.speed_r} "
-                f"V={self.battery_x100/100:.2f} T={self.temp_x10/10:.1f}C "
-                f"cycle={self.foc_cycles} dcl={self.adc_dcl} rla={self.adc_rla} "
-                f"rlb={self.adc_rlb} dcr={self.adc_dcr} rrb={self.adc_rrb} rrc={self.adc_rrc}")
-
-
-def decode_feedback(packet: bytes) -> Telemetry | None:
-    if len(packet) != FB.size:
-        return None
-    fields = FB.unpack(packet)
-    if fields[0] != START:
-        return None
-    expected = xor16(fields[:10] + (fields[10] & 0xFFFF, fields[10] >> 16,
-                                    fields[11] & 0xFFFF, fields[11] >> 16) + fields[12:18])
-    if fields[18] != expected:
-        return None
-    return Telemetry(*fields[1:18])
-
-
-class HoverSerial:
-    def __init__(self, port: str, baud: int):
-        self.ser = serial.Serial(port, baud, timeout=0.05, write_timeout=0.5)
-        self.stop_event = threading.Event()
-        self.buffer = bytearray()
-        self.write_lock = threading.Lock()
+class TerminalApp:
+    def __init__(self, port: str, baud: int, display_hz: float):
+        self.link = HoverLink(port, baud)
+        self.logger = CsvLogger(Path(__file__).resolve().parent / "logs")
+        self.target_l = 0
+        self.target_r = 0
         self.latest: Telemetry | None = None
-        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
-        self.last_print = 0.0
+        self.display_period = 1.0 / max(1.0, display_hz)
+        self.last_display = 0.0
+        self.stop_pending = False
+        self.stop_zero_frames = 0
+        self._lock = threading.Lock()
+        self._run = True
+        self.link.on_telemetry = self.on_telemetry
+        self.link.on_debug = lambda line: print(f"[DBG] {line}")
+        self.link.on_error = lambda err: print(f"[SERIAL ERROR] {err}")
+        self.tx = threading.Thread(target=self.tx_loop, daemon=True)
+        self.tx.start()
 
-    def start(self):
-        self.ser.reset_input_buffer()
-        self.reader.start()
+    def tx_loop(self) -> None:
+        period = 1.0 / TELEMETRY_HZ
+        deadline = time.monotonic()
+        while self._run:
+            with self._lock: l, r = self.target_l, self.target_r
+            try: self.link.send_command(l, r)
+            except Exception as exc:
+                print(f"[TX ERROR] {exc}"); return
+            deadline += period
+            time.sleep(max(0.0, deadline - time.monotonic()))
 
-    def close(self):
-        self.stop()
-        self.stop_event.set()
-        self.reader.join(timeout=0.5)
-        self.ser.close()
+    def on_telemetry(self, t: Telemetry) -> None:
+        self.latest = t
+        if self.logger.active:
+            self.logger.write(t)  # every valid firmware frame = 50 Hz
+        now = time.monotonic()
+        if now - self.last_display >= self.display_period:
+            print(t.summary())
+            self.last_display = now
 
-    def send_drive(self, steer: int, speed: int):
-        with self.write_lock:
-            self.ser.write(make_command(steer, speed))
-
-    def stop(self):
-        if self.ser.is_open:
-            for _ in range(3):
-                try:
-                    self.send_drive(0, 0)
-                    time.sleep(0.02)
-                except serial.SerialException:
-                    break
-
-    def debug(self, command: str):
-        command = command.strip()
-        if command:
-            with self.write_lock:
-                self.ser.write((command + "\n").encode("ascii", "strict"))
-
-    def _print_ascii(self, data: bytes):
-        if not data:
-            return
-        text = data.decode("ascii", "ignore")
-        for line in text.replace("\r", "\n").split("\n"):
-            line = line.strip()
-            if line:
-                print(f"[DBG] {line}")
-
-    def _consume(self):
-        while self.buffer:
-            idx = self.buffer.find(START_BYTES)
-            if idx < 0:
-                # Keep one byte in case it is the first byte of the start marker.
-                if len(self.buffer) > 1:
-                    self._print_ascii(bytes(self.buffer[:-1]))
-                    del self.buffer[:-1]
-                return
-            if idx > 0:
-                self._print_ascii(bytes(self.buffer[:idx]))
-                del self.buffer[:idx]
-            if len(self.buffer) < FB.size:
-                return
-            packet = bytes(self.buffer[:FB.size])
-            telemetry = decode_feedback(packet)
-            if telemetry is None:
-                self._print_ascii(bytes(self.buffer[:1]))
-                del self.buffer[:1]
-                continue
-            del self.buffer[:FB.size]
-            self.latest = telemetry
-            now = time.monotonic()
-            if now - self.last_print >= 0.10:
-                print(telemetry.summary())
-                self.last_print = now
-
-    def _reader_loop(self):
-        while not self.stop_event.is_set():
-            try:
-                chunk = self.ser.read(self.ser.in_waiting or 1)
-            except serial.SerialException as exc:
-                print(f"[ERR] serial read: {exc}", file=sys.stderr)
-                self.stop_event.set()
-                return
-            if chunk:
-                self.buffer.extend(chunk)
-                self._consume()
-
-
-def print_ports():
-    ports = list(list_ports.comports())
-    if not ports:
-        print("No serial ports found.")
-        return
-    for p in ports:
-        print(f"{p.device:12s} {p.description} {p.hwid}")
-
-
-def interactive(link: HoverSerial, steer: int, speed: int, rate_hz: float):
-    lock = threading.Lock()
-    state = [steer, speed]
-    active = True
-
-    def tx_loop():
-        period = 1.0 / max(1.0, rate_hz)
-        while active and not link.stop_event.is_set():
-            with lock:
-                s, v = state
-            try:
-                link.send_drive(s, v)
-            except serial.SerialException as exc:
-                print(f"[ERR] serial write: {exc}", file=sys.stderr)
-                return
-            time.sleep(period)
-
-    tx = threading.Thread(target=tx_loop, daemon=True)
-    tx.start()
-    print("mode: 1=VLT 2=SPD 3=TRQ 4=SVPWM(no sensor)")
-    print("cmd: drive <steer> <speed> | stop | mode <1..4> | 1/2/3/4 | get/set/watch/save/init/help | quit")
-    try:
-        while not link.stop_event.is_set():
-            line = input("hover> ").strip()
-            if not line:
-                continue
-            parts = line.split()
-            op = parts[0].lower()
-            if op == "drive" and len(parts) == 3:
-                s = max(-1000, min(1000, int(parts[1])))
-                v = max(-1000, min(1000, int(parts[2])))
-                with lock:
-                    state[:] = [s, v]
-            elif op == "stop":
-                with lock:
-                    state[:] = [0, 0]
-                link.stop()
-            elif ((op == "mode" and len(parts) == 2 and parts[1] in {"1", "2", "3", "4"}) or
-                  (op in {"1", "2", "3", "4"} and len(parts) == 1)):
-                # Force zero command before changing control mode.
-                mode = parts[1] if op == "mode" else op
-                with lock:
-                    state[:] = [0, 0]
-                link.stop()
-                link.debug(f"SET CTRL_MOD {mode}")
-            elif op in {"get", "set", "watch", "save", "init", "help"}:
-                link.debug(line.upper())
-            elif op in {"quit", "exit", "q"}:
-                break
+        if self.stop_pending:
+            if t.stopped:
+                self.stop_zero_frames += 1
             else:
-                print("Unknown command or arguments.")
-    finally:
-        active = False
-        with lock:
-            state[:] = [0, 0]
-        link.stop()
-        tx.join(timeout=0.3)
+                self.stop_zero_frames = 0
+            if self.stop_zero_frames >= 3:
+                self.stop_pending = False
+                path, rows, missed = self.logger.stop()
+                print("[STOP] cmdL=0 cmdR=0 confirmed after rate limiter")
+                if path:
+                    print(f"[CSV] saved {rows} rows @50Hz -> {path} (missed_seq={missed})")
+
+    def set_target(self, l: int, r: int) -> None:
+        with self._lock:
+            self.target_l, self.target_r = clamp_cmd(l), clamp_cmd(r)
+
+    def fully_stopped(self) -> bool:
+        with self._lock: target_zero = self.target_l == 0 and self.target_r == 0
+        return bool(target_zero and self.latest and self.latest.stopped and not self.stop_pending)
+
+    def cmd_mode(self, mode: int) -> None:
+        if mode not in MODE_NAMES: raise ValueError("mode must be 1..6")
+        if not self.fully_stopped():
+            print("[MODE] rejected: STOP and wait until cmd=0,0 first"); return
+        self.link.send_debug(f"SET CTRL_MOD {mode}")
+        print(f"[MODE] requested {mode}={MODE_NAMES[mode]}")
+
+    def cmd_start(self, l: int, r: int) -> None:
+        if not self.latest:
+            print("[START] no telemetry yet"); return
+        if self.latest.calibrating:
+            print("[START] rejected: ADC calibration still active"); return
+        if not self.fully_stopped():
+            print("[START] rejected: controller is not at full STOP"); return
+        path = self.logger.start(self.latest.mode)
+        self.set_target(l, r)
+        print(f"[CSV] recording every telemetry frame (50 Hz) -> {path}")
+        print(f"[START] cmdL={l} cmdR={r}")
+
+    def cmd_drive(self, l: int, r: int) -> None:
+        if self.stop_pending:
+            print("[DRIVE] wait for STOP ramp-down to finish"); return
+        self.set_target(l, r)
+        print(f"[DRIVE] target cmdL={l} cmdR={r}")
+
+    def cmd_stop(self) -> None:
+        self.set_target(0, 0)
+        self.stop_pending = True
+        self.stop_zero_frames = 0
+        print("[STOP] target=0,0; firmware rate limiter remains active ...")
+
+    def cmd_calibrate(self) -> None:
+        if not self.fully_stopped():
+            print("[CAL] rejected: STOP and wait until cmd=0,0 first"); return
+        if self.logger.active:
+            print("[CAL] rejected: finish/save the current CSV run first"); return
+        self.link.send_debug("CALIBRATE")
+        print("[CAL] requested: six current ADC offsets, 2000 samples (~125 ms @16 kHz)")
+
+    def help(self) -> None:
+        print("""
+Commands
+  mode N             change mode only at full STOP
+                     1=FOC VLT  2=FOC SPD  3=FOC TRQ
+                     4=SVPWM sensorless  5=6-step commutation  6=Sine PWM
+  start L,R          start motor target + begin 50-Hz CSV recording
+  drive L,R          change independent Left/Right target while running
+  stop               target 0,0 through rate limiter; auto-save CSV at true stop
+  calibrate          manual current-ADC calibration (STOP only)
+  status             show latest fixed-width telemetry
+  GET/SET/WATCH ...  raw firmware debug command over the same USART3
+  quit               smooth stop, save CSV, close port
+Examples
+  mode 1
+  start 50,50
+  drive 100,80
+  stop
+""".strip())
+
+    def run(self) -> None:
+        print(f"Connected {self.link.port} @ {self.link.baud}; feedback={FB.size} bytes; telemetry={TELEMETRY_HZ} Hz")
+        print("Left/Right independent control over USART3")
+        print("modes: " + " | ".join(f"{k}={v}" for k, v in MODE_NAMES.items()))
+        print("type 'help' for commands")
+        session = PromptSession("hover> ")
+        with patch_stdout(raw=True):
+            while self._run:
+                try:
+                    line = session.prompt().strip()
+                except (EOFError, KeyboardInterrupt):
+                    line = "quit"
+                if not line: continue
+                try:
+                    tok = shlex.split(line)
+                    cmd = tok[0].lower()
+                    args = tok[1:]
+                    if cmd == "help": self.help()
+                    elif cmd == "mode": self.cmd_mode(int(args[0]))
+                    elif cmd == "start": self.cmd_start(*parse_lr(args))
+                    elif cmd == "drive": self.cmd_drive(*parse_lr(args))
+                    elif cmd == "stop": self.cmd_stop()
+                    elif cmd in ("cal", "calib", "calibrate"): self.cmd_calibrate()
+                    elif cmd == "status": print(self.latest.summary() if self.latest else "no telemetry")
+                    elif cmd in ("quit", "exit"):
+                        self.cmd_stop()
+                        deadline = time.monotonic() + 8.0
+                        while self.stop_pending and time.monotonic() < deadline: time.sleep(0.02)
+                        break
+                    elif cmd.upper() in ("GET", "SET", "WATCH", "SAVE", "INIT", "HELP"):
+                        self.link.send_debug(line)
+                    else:
+                        print("unknown command; type 'help'")
+                except (ValueError, IndexError) as exc:
+                    print(f"[INPUT] {exc}")
+        self.close()
+
+    def close(self) -> None:
+        self._run = False
+        self.set_target(0, 0)
+        if self.logger.active:
+            path, rows, missed = self.logger.stop()
+            print(f"[CSV] closed {rows} rows -> {path} (missed_seq={missed})")
+        try: self.link.send_command(0, 0)
+        except Exception: pass
+        self.link.close()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Hoverboard USART3 control/debug/telemetry tool")
-    ap.add_argument("--port", default="/dev/ttyUSB0", help="Serial port, e.g. COM3 or /dev/ttyUSB0")
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", help="USART3 USB-UART port; auto-selects first port if omitted")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--list-ports", action="store_true")
-    ap.add_argument("--steer", type=int, default=0, help="Initial steer command [-1000,1000]")
-    ap.add_argument("--speed", type=int, default=0, help="Initial speed command [-1000,1000]")
-    ap.add_argument("--rate", type=float, default=20.0, help="Drive command rate Hz")
-    ap.add_argument("--monitor", action="store_true", help="Telemetry/debug monitor only; does not send drive frames")
-    args = ap.parse_args()
-
-    if args.list_ports:
-        print_ports()
-        if not args.port:
-            return
-    if not args.port:
-        ap.error("--port is required (or use --list-ports)")
-
-    link = HoverSerial(args.port, args.baud)
-    link.start()
-    print(f"Connected {args.port} @ {args.baud}; feedback={FB.size} bytes; FOC budget={FOC_BUDGET_CYCLES} cycles")
-    try:
-        if args.monitor:
-            while not link.stop_event.is_set():
-                time.sleep(0.2)
-        else:
-            interactive(link, args.steer, args.speed, args.rate)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        link.close()
+    ap.add_argument("--display-hz", type=float, default=10.0, help="terminal redraw/print rate; CSV remains 50 Hz")
+    ns = ap.parse_args()
+    port = ns.port
+    if not port:
+        ports = available_ports()
+        if not ports: raise SystemExit("No serial port found. Use --port /dev/ttyUSB0")
+        port = "/dev/ttyUSB0" if "/dev/ttyUSB0" in ports else ports[0]
+    TerminalApp(port, ns.baud, ns.display_hz).run()
 
 
 if __name__ == "__main__":

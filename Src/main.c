@@ -8,6 +8,7 @@
 #include "BLDC_controller.h"
 #include "rtwtypes.h"
 #include "comms.h"
+#include "bldc.h"
 
 void SystemClock_Config(void);
 
@@ -27,15 +28,12 @@ extern int16_t speedAvg;
 extern int16_t speedAvgAbs;
 extern uint8_t timeoutFlgSerial;
 extern uint8_t ctrlModReq;
+extern uint8_t ctrlModReqRaw;
 extern volatile int pwml;
 extern volatile int pwmr;
 extern uint8_t enable;
 extern int16_t batVoltage;
-extern int16_t odom_r;
-extern int16_t odom_l;
 extern volatile uint32_t buzzerTimer;
-extern volatile uint32_t foc_isr_cycles;
-extern volatile uint32_t foc_isr_cycles_max;
 
 volatile uint32_t main_loop_counter = 0;
 int16_t batVoltageCalib = 0;
@@ -48,45 +46,80 @@ int16_t cmdR = 0;
 
 typedef struct __attribute__((packed)) {
   uint16_t start;
-  int16_t cmd1;
-  int16_t cmd2;
-  int16_t speedR_meas;
-  int16_t speedL_meas;
-  int16_t wheelR_cnt;
-  int16_t wheelL_cnt;
-  int16_t batVoltage;
-  int16_t boardTemp;
-  uint16_t status;
-  uint32_t foc_isr_cycles;
-  uint32_t foc_isr_cycles_max;
+  int16_t cmdL;
+  int16_t cmdR;
+  int16_t rpmL;
+  int16_t rpmR;
+  int16_t iqL_cA;
+  int16_t iqR_cA;
+  int16_t idL_cA;
+  int16_t idR_cA;
+  int16_t idcL_cA;
+  int16_t idcR_cA;
+  int16_t batVoltage_x100;
+  int16_t boardTemp_x10;
+  uint16_t hallL;
+  uint16_t hallR;
   uint16_t adc_dcl;
   uint16_t adc_rla;
   uint16_t adc_rlb;
   uint16_t adc_dcr;
   uint16_t adc_rrb;
   uint16_t adc_rrc;
+  uint16_t status;
+  uint16_t mode;
+  uint16_t calibration_permille;
+  uint32_t telemetry_seq;
+  uint32_t foc_isr_cycles;
   uint16_t checksum;
 } SerialFeedback;
 
 static SerialFeedback feedback;
-static int16_t speed = 0;
-static int16_t steer = 0;
-static int16_t steerRateFixdt = 0;
-static int16_t speedRateFixdt = 0;
-static int32_t steerFixdt = 0;
-static int32_t speedFixdt = 0;
+static int16_t cmdLRateFixdt = 0;
+static int16_t cmdRRateFixdt = 0;
+static int32_t cmdLFixdt = 0;
+static int32_t cmdRFixdt = 0;
 static uint32_t buzzerTimerPrev = 0;
 static uint32_t inactivityTimeoutCounter = 0;
+static uint32_t telemetrySeq = 0;
 
 static uint16_t feedbackChecksum(const SerialFeedback *f) {
-  uint16_t c = f->start ^ (uint16_t)f->cmd1 ^ (uint16_t)f->cmd2;
-  c ^= (uint16_t)f->speedR_meas ^ (uint16_t)f->speedL_meas;
-  c ^= (uint16_t)f->wheelR_cnt ^ (uint16_t)f->wheelL_cnt;
-  c ^= (uint16_t)f->batVoltage ^ (uint16_t)f->boardTemp ^ f->status;
-  c ^= (uint16_t)(f->foc_isr_cycles & 0xffffu) ^ (uint16_t)(f->foc_isr_cycles >> 16);
-  c ^= (uint16_t)(f->foc_isr_cycles_max & 0xffffu) ^ (uint16_t)(f->foc_isr_cycles_max >> 16);
+  uint16_t c = f->start;
+  c ^= (uint16_t)f->cmdL ^ (uint16_t)f->cmdR;
+  c ^= (uint16_t)f->rpmL ^ (uint16_t)f->rpmR;
+  c ^= (uint16_t)f->iqL_cA ^ (uint16_t)f->iqR_cA;
+  c ^= (uint16_t)f->idL_cA ^ (uint16_t)f->idR_cA;
+  c ^= (uint16_t)f->idcL_cA ^ (uint16_t)f->idcR_cA;
+  c ^= (uint16_t)f->batVoltage_x100 ^ (uint16_t)f->boardTemp_x10;
+  c ^= f->hallL ^ f->hallR;
   c ^= f->adc_dcl ^ f->adc_rla ^ f->adc_rlb ^ f->adc_dcr ^ f->adc_rrb ^ f->adc_rrc;
+  c ^= f->status ^ f->mode ^ f->calibration_permille;
+  c ^= (uint16_t)(f->telemetry_seq & 0xffffu) ^ (uint16_t)(f->telemetry_seq >> 16);
+  c ^= (uint16_t)(f->foc_isr_cycles & 0xffffu) ^ (uint16_t)(f->foc_isr_cycles >> 16);
   return c;
+}
+
+static int16_t focCurrentQ4ToCentiAmp(int32_t currentQ4) {
+  /* BLDC_controller.c shifts phase-current inputs by 4 before Clarke/Park:
+   *     rtb = rtU->i_phaXX << 4
+   * and rtY.iq / rtY.id are exported without shifting back. Therefore dq is
+   * Q4 current-count, i.e. 16 * A2BIT_CONV units per ampere. */
+  const int32_t denom = (int32_t)A2BIT_CONV * 16;
+  return (int16_t)(((int32_t)currentQ4 * 100) / denom);
+}
+
+static uint16_t readHallLeft(void) {
+  const uint16_t u = (LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN) ? 0u : 1u;
+  const uint16_t v = (LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN) ? 0u : 1u;
+  const uint16_t w = (LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN) ? 0u : 1u;
+  return (uint16_t)((u << 2) | (v << 1) | w);
+}
+
+static uint16_t readHallRight(void) {
+  const uint16_t u = (RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN) ? 0u : 1u;
+  const uint16_t v = (RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN) ? 0u : 1u;
+  const uint16_t w = (RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN) ? 0u : 1u;
+  return (uint16_t)((u << 2) | (v << 1) | w);
 }
 
 static void cycleCounterInit(void) {
@@ -135,31 +168,44 @@ int main(void) {
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) HAL_Delay(10);
 
   while (1) {
-    if ((buzzerTimer - buzzerTimerPrev) <= (16u * DELAY_IN_MAIN_LOOP)) continue;
+    if ((buzzerTimer - buzzerTimerPrev) < (16u * DELAY_IN_MAIN_LOOP)) continue;
 
     readCommand();
     calcAvgSpeed();
 
-    if (!timeoutFlgSerial && enable == 0 && !controllerFaultActive() &&
+    if (!timeoutFlgSerial && enable == 0 && !currentCalibrationActive() && !controllerFaultActive() &&
         input1[0].cmd > -50 && input1[0].cmd < 50 && input2[0].cmd > -50 && input2[0].cmd < 50) {
       beepShort(6);
       beepShort(4);
       HAL_Delay(100);
-      steerFixdt = 0;
-      speedFixdt = 0;
+      cmdLFixdt = 0;
+      cmdRFixdt = 0;
       enable = 1;
       printf("-- Motors enabled --\r\n");
     }
 
-    rateLimiter16(input1[0].cmd, RATE, &steerRateFixdt);
-    rateLimiter16(input2[0].cmd, RATE, &speedRateFixdt);
-    filtLowPass32(steerRateFixdt >> 4, FILTER, &steerFixdt);
-    filtLowPass32(speedRateFixdt >> 4, FILTER, &speedFixdt);
-    steer = (int16_t)(steerFixdt >> 16);
-    speed = (int16_t)(speedFixdt >> 16);
-    mixerFcn(speed << 4, steer << 4, &cmdR, &cmdL);
-    pwmr = -cmdR;
+    /* Left and right motor commands are independent. STOP also follows the
+     * same rate limiter so the motors decelerate instead of dropping torque
+     * abruptly. Snap only the final <=1 command-count residual to exact zero
+     * after the rate-limiter target has already reached zero. */
+    rateLimiter16(input1[0].cmd, RATE, &cmdLRateFixdt);
+    rateLimiter16(input2[0].cmd, RATE, &cmdRRateFixdt);
+    filtLowPass32(cmdLRateFixdt >> 4, FILTER, &cmdLFixdt);
+    filtLowPass32(cmdRRateFixdt >> 4, FILTER, &cmdRFixdt);
+    cmdL = (int16_t)(cmdLFixdt >> 16);
+    cmdR = (int16_t)(cmdRFixdt >> 16);
+
+    if (input1[0].cmd == 0 && cmdLRateFixdt == 0 && abs(cmdL) <= 1) {
+      cmdLFixdt = 0;
+      cmdL = 0;
+    }
+    if (input2[0].cmd == 0 && cmdRRateFixdt == 0 && abs(cmdR) <= 1) {
+      cmdRFixdt = 0;
+      cmdR = 0;
+    }
     pwml = cmdL;
+    pwmr = -cmdR;  // positive cmdR means forward wheel direction, matching positive cmdL
+
 
     filtLowPass32(adc_buffer.temp, TEMP_FILT_COEF, &boardTempAdcFixdt);
     boardTempAdcFilt = (int16_t)(boardTempAdcFixdt >> 16);
@@ -167,36 +213,61 @@ int main(void) {
                        (boardTempAdcFilt - TEMP_CAL_LOW_ADC) /
                        (TEMP_CAL_HIGH_ADC - TEMP_CAL_LOW_ADC) + TEMP_CAL_LOW_DEG_C;
     batVoltageCalib = batVoltage * BAT_CALIB_REAL_VOLTAGE / BAT_CALIB_ADC;
-    left_dc_curr = -(rtU_Left.i_DCLink * 100) / A2BIT_CONV;
-    right_dc_curr = -(rtU_Right.i_DCLink * 100) / A2BIT_CONV;
+    if (currentCalibrationActive()) {
+      left_dc_curr = 0;
+      right_dc_curr = 0;
+    } else {
+      left_dc_curr = -(rtU_Left.i_DCLink * 100) / A2BIT_CONV;
+      right_dc_curr = -(rtU_Right.i_DCLink * 100) / A2BIT_CONV;
+    }
     dc_curr = left_dc_curr + right_dc_curr;
 
     if ((main_loop_counter % 25u) == 0u) process_debug();
 
-    if ((main_loop_counter % 2u) == 0u && huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
+    /* Deterministic 50-Hz telemetry slot. telemetry_seq advances on every slot
+     * so the host can detect a rare skipped packet if USART3 DMA is busy. */
+    if ((main_loop_counter % (MAIN_LOOP_HZ / TELEMETRY_HZ)) == 0u) {
+      const uint32_t scheduledTelemetrySeq = ++telemetrySeq;
+      if (huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
       feedback.start = SERIAL_START_FRAME;
-      feedback.cmd1 = input1[0].cmd;
-      feedback.cmd2 = input2[0].cmd;
-      feedback.speedR_meas = (int16_t)rtY_Right.n_mot;
-      feedback.speedL_meas = (int16_t)rtY_Left.n_mot;
-      feedback.wheelR_cnt = odom_r;
-      feedback.wheelL_cnt = odom_l;
-      feedback.batVoltage = batVoltageCalib;
-      feedback.boardTemp = board_temp_deg_c;
-      feedback.status = (enable ? SERIAL_STATUS_ENABLED : 0u) |
-                        (timeoutFlgSerial ? SERIAL_STATUS_TIMEOUT : 0u) |
-                        ((ctrlModReq != SVPWM_MODE && rtY_Left.z_errCode) ? SERIAL_STATUS_LEFT_FAULT : 0u) |
-                        ((ctrlModReq != SVPWM_MODE && rtY_Right.z_errCode) ? SERIAL_STATUS_RIGHT_FAULT : 0u);
-      feedback.foc_isr_cycles = foc_isr_cycles;
-      feedback.foc_isr_cycles_max = foc_isr_cycles_max;
+      /* Report the rate-limited command actually applied to each motor. */
+      feedback.cmdL = cmdL;
+      feedback.cmdR = cmdR;
+      feedback.rpmL = (int16_t)rtY_Left.n_mot;
+      /* Right motor is physically mirrored and internally driven with pwmr=-cmdR.
+       * Normalize signed wheel-speed and torque-current to the same host convention
+       * as cmdR: positive means forward for both wheels. */
+      feedback.rpmR = (int16_t)(-rtY_Right.n_mot);
+      feedback.iqL_cA = focCurrentQ4ToCentiAmp(foc_iqL_q4);
+      feedback.iqR_cA = focCurrentQ4ToCentiAmp(-((int32_t)foc_iqR_q4));
+      /* id is flux-axis current. Mirroring wheel direction does not invert the
+       * physical d-axis sign, so idR is intentionally not negated. */
+      feedback.idL_cA = focCurrentQ4ToCentiAmp(foc_idL_q4);
+      feedback.idR_cA = focCurrentQ4ToCentiAmp(foc_idR_q4);
+      feedback.idcL_cA = left_dc_curr;
+      feedback.idcR_cA = right_dc_curr;
+      feedback.batVoltage_x100 = batVoltageCalib;
+      feedback.boardTemp_x10 = board_temp_deg_c;
+      feedback.hallL = readHallLeft();
+      feedback.hallR = readHallRight();
       feedback.adc_dcl = adc_buffer.dcl;
       feedback.adc_rla = adc_buffer.rlA;
       feedback.adc_rlb = adc_buffer.rlB;
       feedback.adc_dcr = adc_buffer.dcr;
       feedback.adc_rrb = adc_buffer.rrB;
       feedback.adc_rrc = adc_buffer.rrC;
+      feedback.status = (enable ? SERIAL_STATUS_ENABLED : 0u) |
+                        (timeoutFlgSerial ? SERIAL_STATUS_TIMEOUT : 0u) |
+                        ((ctrlModReq != SVPWM_MODE && rtY_Left.z_errCode) ? SERIAL_STATUS_LEFT_FAULT : 0u) |
+                        ((ctrlModReq != SVPWM_MODE && rtY_Right.z_errCode) ? SERIAL_STATUS_RIGHT_FAULT : 0u) |
+                        (currentCalibrationActive() ? SERIAL_STATUS_CALIBRATING : 0u);
+      feedback.mode = ctrlModReqRaw;
+      feedback.calibration_permille = currentCalibrationProgressPermille();
+      feedback.telemetry_seq = scheduledTelemetrySeq;
+      feedback.foc_isr_cycles = foc_isr_cycles;
       feedback.checksum = feedbackChecksum(&feedback);
       HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback, sizeof(feedback));
+      }
     }
 
     poweroffPressCheck();

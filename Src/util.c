@@ -66,7 +66,8 @@ int _write(int file, char *data, int len) {
 void BLDC_Init(void) {
   rtP_Left.b_angleMeasEna = 0;
   rtP_Left.z_selPhaCurMeasABC = 0;
-  rtP_Left.z_ctrlTypSel = CTRL_TYP_SEL;
+  /* Runtime modes select COM/SIN/FOC inside the motor ISR. */
+  rtP_Left.z_ctrlTypSel = FOC_CTRL;
   rtP_Left.b_diagEna = DIAG_ENA;
   rtP_Left.i_max = (I_MOT_MAX * A2BIT_CONV) << 4;
   rtP_Left.n_max = N_MOT_MAX << 4;
@@ -153,7 +154,7 @@ void calcAvgSpeed(void) {
 static void serialAcceptCommand(const uint8_t *frame) {
   SerialCommand candidate;
   memcpy(&candidate, frame, sizeof(candidate));
-  const uint16_t checksum = (uint16_t)(candidate.start ^ (uint16_t)candidate.steer ^ (uint16_t)candidate.speed);
+  const uint16_t checksum = (uint16_t)(candidate.start ^ (uint16_t)candidate.cmdL ^ (uint16_t)candidate.cmdR);
   if (candidate.start == SERIAL_START_FRAME && candidate.checksum == checksum) {
     serialCommand = candidate;
     serialTimeoutCount = 0;
@@ -226,8 +227,8 @@ void usart3_rx_check(void) {
 }
 
 void readCommand(void) {
-  input1[0].raw = CLAMP(serialCommand.steer, inputMin, inputMax);
-  input2[0].raw = CLAMP(serialCommand.speed, inputMin, inputMax);
+  input1[0].raw = CLAMP(serialCommand.cmdL, inputMin, inputMax);
+  input2[0].raw = CLAMP(serialCommand.cmdR, inputMin, inputMax);
   input1[0].cmd = input1[0].raw;
   input2[0].cmd = input2[0].raw;
 
@@ -284,11 +285,3 @@ void rateLimiter16(int16_t u, int16_t rate, int16_t *y) {
   *y = (int16_t)(*y + delta);
 }
 
-void mixerFcn(int16_t rtu_speed, int16_t rtu_steer, int16_t *rty_speedR, int16_t *rty_speedL) {
-  const int16_t prodSpeed = (int16_t)((rtu_speed * (int16_t)SPEED_COEFFICIENT) >> 14);
-  const int16_t prodSteer = (int16_t)((rtu_steer * (int16_t)STEER_COEFFICIENT) >> 14);
-  int32_t tmp = CLAMP((int32_t)prodSpeed - prodSteer, -32768, 32767);
-  *rty_speedR = CLAMP((int16_t)(tmp >> 4), inputMin, inputMax);
-  tmp = CLAMP((int32_t)prodSpeed + prodSteer, -32768, 32767);
-  *rty_speedL = CLAMP((int16_t)(tmp >> 4), inputMin, inputMax);
-}

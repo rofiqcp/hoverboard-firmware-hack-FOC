@@ -45,10 +45,17 @@
 #define SPD_MODE                 2
 #define TRQ_MODE                 3
 #define SVPWM_MODE               4
+#define COMMUTATION_MODE         5
+#define SINE_MODE                6
 #define MOTOR_LEFT_ENA
 #define MOTOR_RIGHT_ENA
-#define CTRL_TYP_SEL             FOC_CTRL
 #define CTRL_MOD_REQ             SPD_MODE
+#define ADC_CALIBRATION_SAMPLES  2000u
+#define TELEMETRY_HZ             50u
+#define MAIN_LOOP_HZ              (1000u / DELAY_IN_MAIN_LOOP)
+#if (MAIN_LOOP_HZ % TELEMETRY_HZ) != 0
+#error "TELEMETRY_HZ must divide MAIN_LOOP_HZ exactly"
+#endif
 
 /* Sensorless open-loop SVPWM (mode 4). Command keeps the same -1000..+1000 scale.
  * With N_MOT_MAX=1000 and 15 pole pairs, command 1000 corresponds to ~250 Hz electrical.
@@ -70,10 +77,8 @@
 #define BEEPS_BACKWARD           0
 #define RATE                     480
 #define FILTER                   6553
-#define SPEED_COEFFICIENT        16384
-#define STEER_COEFFICIENT        8192
 
-/* Signed, centered serial commands: -1000 .. +1000. */
+/* Independent signed motor commands over USART3: cmdL, cmdR = -1000 .. +1000. */
 #define PRI_INPUT1               2, -1000, 0, 1000, 0
 #define PRI_INPUT2               2, -1000, 0, 1000, 0
 #define INPUTS_NR                1
@@ -95,5 +100,6 @@
 #define SERIAL_STATUS_TIMEOUT    (1u << 1)
 #define SERIAL_STATUS_LEFT_FAULT (1u << 2)
 #define SERIAL_STATUS_RIGHT_FAULT (1u << 3)
+#define SERIAL_STATUS_CALIBRATING (1u << 4)
 
 #endif

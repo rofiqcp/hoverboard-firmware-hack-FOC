@@ -28,6 +28,7 @@
 #include "BLDC_controller.h"
 #include "util.h"
 #include "comms.h"
+#include "bldc.h"
 
 
 #define RAW_MIN -1000
@@ -64,6 +65,16 @@ extern volatile uint32_t foc_isr_cycles_max;
 
 
 
+static int8_t calibrateCurrentOffsets(void) {
+  if (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0) {
+    printf("! CALIBRATE requires STOP and completed ramp-down (cmdL=0 cmdR=0)\r\n");
+    return 0;
+  }
+  currentCalibrationStart();
+  printf("# CALIBRATE started samples:%u\r\n", (unsigned)ADC_CALIBRATION_SAMPLES);
+  return 1;
+}
+
 enum commandTypes {READ,WRITE};
 // Function0 - Function with 0 parameter
 // Function1 - Function with 1 parameter (e.g. GET PARAM)
@@ -76,14 +87,14 @@ const command_entry commands[] = {
     {WRITE  ,"SET"     ,NULL              ,NULL            ,setParamValExt ,"Set Parameter"},
     {WRITE  ,"INIT"    ,NULL              ,initParamVal    ,NULL           ,"Init Parameter from EEPROM or CONFIG.H"},
     {WRITE  ,"SAVE"    ,saveAllParamVal   ,NULL            ,NULL           ,"Save Parameters to EEPROM"},
+    {WRITE  ,"CALIBRATE",calibrateCurrentOffsets,NULL       ,NULL           ,"Recalibrate six current ADC offsets while stopped"},
 };
 
 enum paramTypes {PARAMETER,VARIABLE};
 const parameter_entry params[] = {
   // CONTROL PARAMETERS
   // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {PARAMETER  ,"CTRL_MOD"           ,ADD_PARAM(ctrlModReqRaw)              ,NULL                      ,0          ,CTRL_MOD_REQ      ,0      ,1      ,4      ,0               ,0    ,0     ,NULL               ,"Ctrl mode 1:VLT 2:SPD 3:TRQ 4:SVPWM sensorless"},
-    {PARAMETER  ,"CTRL_TYP"           ,ADD_PARAM(rtP_Left.z_ctrlTypSel)      ,&rtP_Right.z_ctrlTypSel   ,0          ,CTRL_TYP_SEL      ,0      ,0      ,2      ,0               ,0    ,0     ,NULL               ,"Ctrl type 0:COM 1:SIN 2:FOC"},
+    {PARAMETER  ,"CTRL_MOD"           ,ADD_PARAM(ctrlModReqRaw)              ,NULL                      ,0          ,CTRL_MOD_REQ      ,0      ,1      ,6      ,0               ,0    ,0     ,NULL               ,"Runtime mode 1:FOC-VLT 2:FOC-SPD 3:FOC-TRQ 4:SVPWM sensorless 5:COM 6:SIN"},
     {PARAMETER  ,"I_MOT_MAX"          ,ADD_PARAM(rtP_Left.i_max)             ,&rtP_Right.i_max          ,1          ,I_MOT_MAX         ,1      ,1      ,40     ,A2BIT_CONV      ,0    ,4     ,NULL               ,"Max phase current A"},
     {PARAMETER  ,"N_MOT_MAX"          ,ADD_PARAM(rtP_Left.n_max)             ,&rtP_Right.n_max          ,2          ,N_MOT_MAX         ,1      ,10     ,2000   ,0               ,0    ,4     ,NULL               ,"Max motor RPM"},
     {PARAMETER  ,"FI_WEAK_ENA"        ,ADD_PARAM(rtP_Left.b_fieldWeakEna)    ,&rtP_Right.b_fieldWeakEna ,0          ,FIELD_WEAK_ENA    ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Enable field weak"},
@@ -93,11 +104,10 @@ const parameter_entry params[] = {
     {PARAMETER  ,"PHA_ADV_MAX"        ,ADD_PARAM(rtP_Left.a_phaAdvMax)       ,&rtP_Right.a_phaAdvMax    ,0          ,PHASE_ADV_MAX     ,1      ,0      ,55     ,0               ,0    ,4     ,NULL               ,"Max Phase Adv angle Deg(SIN)"},     
   // INPUT PARAMETERS
   // Type       ,Name                 ,ValueL ptr                            ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {VARIABLE   ,"IN1_RAW"            ,ADD_PARAM(input1[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input1 raw"},        
-    {VARIABLE   ,"IN1_CMD"            ,ADD_PARAM(input1[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Input1 cmd"},        
-    
-    {VARIABLE   ,"IN2_RAW"            ,ADD_PARAM(input2[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Input2 raw"},   
-    {VARIABLE   ,"IN2_CMD"            ,ADD_PARAM(input2[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Input2 cmd"},
+    {VARIABLE   ,"CMDL_RAW"           ,ADD_PARAM(input1[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Left motor raw command"},
+    {VARIABLE   ,"CMDL_IN"            ,ADD_PARAM(input1[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Left motor requested command"},
+    {VARIABLE   ,"CMDR_RAW"           ,ADD_PARAM(input2[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Right motor raw command"},
+    {VARIABLE   ,"CMDR_IN"            ,ADD_PARAM(input2[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Right motor requested command"},
 // FEEDBACK
   // Type       ,Name                 ,Datatype, ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
     {VARIABLE   ,"DC_CURR"            ,ADD_PARAM(dc_curr)                    ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Total DC Link current A *100"},
@@ -109,8 +119,6 @@ const parameter_entry params[] = {
     {VARIABLE   ,"SPDL"               ,ADD_PARAM(rtY_Left.n_mot)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Left Motor Measured RPM"},
     {VARIABLE   ,"SPDR"               ,ADD_PARAM(rtY_Right.n_mot)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Right Motor Measured RPM"},
     {VARIABLE   ,"RATE"               ,0       , NULL                        ,NULL                      ,0          ,RATE              ,0      ,0      ,0      ,0               ,0    ,4     ,NULL               ,"Rate *10"},
-    {VARIABLE   ,"SPD_COEF"           ,0       , NULL                        ,NULL                      ,0          ,SPEED_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Speed Coefficient *10"},
-    {VARIABLE   ,"STR_COEF"           ,0       , NULL                        ,NULL                      ,0          ,STEER_COEFFICIENT ,0      ,0      ,0      ,0               ,10   ,14    ,NULL               ,"Steer Coefficient *10"},
     {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},       
     {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},       
     {VARIABLE   ,"FOC_ISR_CYC"        ,ADD_PARAM(foc_isr_cycles)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Last FOC ISR CPU cycles"},
@@ -138,6 +146,13 @@ int8_t watchParamList[MAX_PARAM_WATCH] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 // Set Param with Value from external format
 int8_t setParamValExt(uint8_t index, int32_t value) {   
   int8_t ret = 0;
+  /* Control mode may change only after the requested commands are zero AND
+   * the rate-limited commands have fully ramped to zero. */
+  if (strcmp(params[index].name, "CTRL_MOD") == 0 &&
+      (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0)) {
+    printf("! CTRL_MOD requires STOP and completed ramp-down (cmdL=0 cmdR=0)\r\n");
+    return 0;
+  }
   // check min and max before conversion to internal values
   if (IN_RANGE(value,params[index].min,params[index].max)){
     ret = setParamValInt(index,extToInt(index,value));
@@ -155,28 +170,28 @@ int8_t setParamValInt(uint8_t index, int32_t newValue) {
     // if value is different, beep, cast and assign new value
     switch (params[index].datatype){
       case UINT8_T:
-        if (params[index].valueL != NULL) *(uint8_t*)params[index].valueL = newValue;
-        if (params[index].valueR != NULL) *(uint8_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile uint8_t*)params[index].valueL = newValue;
+        if (params[index].valueR != NULL) *(volatile uint8_t*)params[index].valueR = newValue;
         break;
       case UINT16_T:
-        if (params[index].valueL != NULL) *(uint16_t*)params[index].valueL = newValue; 
-        if (params[index].valueR != NULL) *(uint16_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile uint16_t*)params[index].valueL = newValue; 
+        if (params[index].valueR != NULL) *(volatile uint16_t*)params[index].valueR = newValue;
         break;
       case UINT32_T:
-        if (params[index].valueL != NULL) *(uint32_t*)params[index].valueL = newValue; 
-        if (params[index].valueR != NULL) *(uint32_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile uint32_t*)params[index].valueL = newValue; 
+        if (params[index].valueR != NULL) *(volatile uint32_t*)params[index].valueR = newValue;
         break;
       case INT8_T:
-        if (params[index].valueL != NULL) *(int8_t*)params[index].valueL = newValue; 
-        if (params[index].valueR != NULL) *(int8_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile int8_t*)params[index].valueL = newValue; 
+        if (params[index].valueR != NULL) *(volatile int8_t*)params[index].valueR = newValue;
         break;
       case INT16_T:
-        if (params[index].valueL != NULL) *(int16_t*)params[index].valueL = newValue; 
-        if (params[index].valueR != NULL) *(int16_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile int16_t*)params[index].valueL = newValue; 
+        if (params[index].valueR != NULL) *(volatile int16_t*)params[index].valueR = newValue;
         break;
       case INT32_T:
-        if (params[index].valueL != NULL) *(int32_t*)params[index].valueL = newValue; 
-        if (params[index].valueR != NULL) *(int32_t*)params[index].valueR = newValue;
+        if (params[index].valueL != NULL) *(volatile int32_t*)params[index].valueL = newValue; 
+        if (params[index].valueR != NULL) *(volatile int32_t*)params[index].valueR = newValue;
         break;
     }
 
@@ -208,28 +223,28 @@ int32_t getParamValInt(uint8_t index) {
     // Cast to parameter datatype
     switch (params[index].datatype){
       case UINT8_T:
-        if (params[index].valueL != NULL) value += *(uint8_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(uint8_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile uint8_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile uint8_t*)params[index].valueR;
         break;
       case UINT16_T:
-        if (params[index].valueL != NULL) value += *(uint16_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(uint16_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile uint16_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile uint16_t*)params[index].valueR;
         break;
       case UINT32_T:
-        if (params[index].valueL != NULL) value += *(uint32_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(uint32_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile uint32_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile uint32_t*)params[index].valueR;
         break;
       case INT8_T:
-        if (params[index].valueL != NULL) value += *(int8_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(int8_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile int8_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile int8_t*)params[index].valueR;
         break;
       case INT16_T:
-        if (params[index].valueL != NULL) value += *(int16_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(int16_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile int16_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile int16_t*)params[index].valueR;
         break;
       case INT32_T:
-        if (params[index].valueL != NULL) value += *(int32_t*)params[index].valueL;
-        if (params[index].valueR != NULL) value += *(int32_t*)params[index].valueR;
+        if (params[index].valueL != NULL) value += *(volatile int32_t*)params[index].valueL;
+        if (params[index].valueR != NULL) value += *(volatile int32_t*)params[index].valueR;
         break;
       default:
         value = 0;
