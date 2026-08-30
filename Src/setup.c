@@ -41,6 +41,9 @@ pb10 usart3 dma1 channel2/3
 
 TIM_HandleTypeDef htim_right;
 TIM_HandleTypeDef htim_left;
+#ifdef HW_PROFILE_ENC_HALL
+TIM_HandleTypeDef htim_encoder_left;
+#endif
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 UART_HandleTypeDef huart3;
@@ -176,14 +179,21 @@ void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 
+#ifdef HW_PROFILE_ENC_HALL
+  /* PB6/PB7 are TIM4 CH1/CH2 encoder AB in enc_hall. PB5 Hall-U is not
+   * used for Left angle control in this profile. */
+  GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+#else
   GPIO_InitStruct.Pin = LEFT_HALL_U_PIN;
   HAL_GPIO_Init(LEFT_HALL_U_PORT, &GPIO_InitStruct);
-
   GPIO_InitStruct.Pin = LEFT_HALL_V_PIN;
   HAL_GPIO_Init(LEFT_HALL_V_PORT, &GPIO_InitStruct);
-
   GPIO_InitStruct.Pin = LEFT_HALL_W_PIN;
   HAL_GPIO_Init(LEFT_HALL_W_PORT, &GPIO_InitStruct);
+#endif
 
   GPIO_InitStruct.Pin = RIGHT_HALL_U_PIN;
   HAL_GPIO_Init(RIGHT_HALL_U_PORT, &GPIO_InitStruct);
@@ -387,6 +397,28 @@ void MX_TIM_Init(void) {
   HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_3);
 
   htim_left.Instance->RCR = 1;
+
+#ifdef HW_PROFILE_ENC_HALL
+  __HAL_RCC_TIM4_CLK_ENABLE();
+  TIM_Encoder_InitTypeDef sEncoder = {0};
+  htim_encoder_left.Instance = TIM4;
+  htim_encoder_left.Init.Prescaler = 0;
+  htim_encoder_left.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim_encoder_left.Init.Period = 0xFFFFu;
+  htim_encoder_left.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim_encoder_left.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sEncoder.EncoderMode = TIM_ENCODERMODE_TI12;
+  sEncoder.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sEncoder.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sEncoder.IC1Prescaler = TIM_ICPSC_DIV1;
+  sEncoder.IC1Filter = 4;
+  sEncoder.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sEncoder.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sEncoder.IC2Prescaler = TIM_ICPSC_DIV1;
+  sEncoder.IC2Filter = 4;
+  HAL_TIM_Encoder_Init(&htim_encoder_left, &sEncoder);
+  HAL_TIM_Encoder_Start(&htim_encoder_left, TIM_CHANNEL_ALL);
+#endif
 
   __HAL_TIM_ENABLE(&htim_right);
 }

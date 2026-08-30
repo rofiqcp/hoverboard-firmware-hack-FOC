@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+import re
 from collections import deque
 from pathlib import Path
 
@@ -63,17 +64,21 @@ class MotorPanel(QtWidgets.QGroupBox):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hoverboard FOC — USART3 6-Mode Control & Telemetry")
+        self.setWindowTitle("Hoverboard FOC — USART3 Advanced Control & Tuning")
         self.link: HoverLink | None = None
         self.bridge = SignalBridge()
         self.bridge.telemetry.connect(self.on_telemetry)
-        self.bridge.debug.connect(self.append_console)
+        self.bridge.debug.connect(self.on_debug_line)
         self.bridge.error.connect(self.on_serial_error)
 
         self.logger = CsvLogger(Path(__file__).resolve().parent / "logs")
         self.target_l = 0; self.target_r = 0
         self.latest: Telemetry | None = None
         self.stop_pending = False; self.stop_zero_frames = 0
+        self.eeprom_save_pending = False
+        self.param_widgets = {}
+        self.param_defs = {}
+        self._param_debounce = {}
         self.last_arrivals = deque(maxlen=100)
 
         max_points = TELEMETRY_HZ * 20
@@ -135,6 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget(); root.addWidget(self.tabs, 1)
         self.tabs.addTab(self.build_dashboard_tab(), "Dashboard")
         self.tabs.addTab(self.build_plot_tab(), "Graphs")
+        self.tabs.addTab(self.build_tuning_tab(), "RAM / EEPROM Tuning")
         self.tabs.addTab(self.build_console_tab(), "Raw / Console")
         self.statusBar().showMessage("Disconnected")
 
@@ -150,9 +156,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mode_value = ValueLabel(); self.dq_ref_value = ValueLabel(); self.voltage_value = ValueLabel()
         self.temp_value = ValueLabel(); self.cycle_value = ValueLabel(); self.status_value = ValueLabel()
         self.rate_value = ValueLabel(); self.seq_value = ValueLabel(); self.csv_value = ValueLabel("idle")
+        self.profile_value = ValueLabel(); self.enc_pos_value = ValueLabel(); self.enc_rpm_value = ValueLabel()
+        self.enc_angle_value = ValueLabel(); self.enc_sync_value = ValueLabel(); self.pos_ref_value = ValueLabel()
         sf.addRow("Mode", self.mode_value); sf.addRow("dq reference", self.dq_ref_value)
-        sf.addRow("Battery", self.voltage_value); sf.addRow("Temperature", self.temp_value)
+        sf.addRow("HW profile", self.profile_value); sf.addRow("Battery", self.voltage_value); sf.addRow("Temperature", self.temp_value)
         sf.addRow("ISR cycles", self.cycle_value); sf.addRow("Status", self.status_value)
+        sf.addRow("Encoder pos", self.enc_pos_value); sf.addRow("Encoder RPM", self.enc_rpm_value)
+        sf.addRow("Electrical angle", self.enc_angle_value); sf.addRow("Encoder sync", self.enc_sync_value)
+        sf.addRow("Position speed ref", self.pos_ref_value)
         sf.addRow("Telemetry RX", self.rate_value); sf.addRow("Sequence", self.seq_value); sf.addRow("CSV", self.csv_value)
 
         raw = QtWidgets.QGroupBox("Raw ADC"); rf = QtWidgets.QFormLayout(raw)
@@ -162,8 +173,9 @@ class MainWindow(QtWidgets.QMainWindow):
         calibration = QtWidgets.QGroupBox("Current ADC Calibration"); cf = QtWidgets.QVBoxLayout(calibration)
         self.cal_progress = QtWidgets.QProgressBar(); self.cal_progress.setRange(0, 1000); self.cal_progress.setFormat("%p%")
         self.cal_info = QtWidgets.QLabel(
-            "Automatic every boot: 2000 samples (~125 ms at 16 kHz). "
-            "Manual CALIBRATE is allowed only after cmdL/cmdR have ramped fully to zero."
+            "Automatic every boot and identical for manual calibration: bridge OFF settle 100 ms, "
+            "arithmetic mean of 2000 ADC samples (~125 ms at 16 kHz), then full generated-controller state reset. "
+            "Manual CALIBRATE requires cmdL/cmdR=0 and |rpm|<=5."
         ); self.cal_info.setWordWrap(True)
         cf.addWidget(self.cal_progress); cf.addWidget(self.cal_info); cf.addStretch(1)
 
@@ -199,6 +211,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.isr_curve = self.isr_plot.plot(name="ISR cycles", pen=pens[0])
         self.isr_budget = pg.InfiniteLine(pos=FOC_BUDGET_CYCLES, angle=0, movable=False, label="16 kHz budget")
         self.isr_plot.addItem(self.isr_budget); tabs.addTab(self.isr_plot, "ISR")
+        return page
+
+    def build_tuning_tab(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget(); outer = QtWidgets.QVBoxLayout(page)
+        info = QtWidgets.QLabel(
+            "On CONNECT the GUI reads all MCU RAM parameters with GET. Editing a value writes only RAM immediately. "
+            "SAVE EEPROM first performs a smooth STOP, then commits all persistent parameters."
+        ); info.setWordWrap(True); outer.addWidget(info)
+        buttons = QtWidgets.QHBoxLayout()
+        self.reload_params_btn = QtWidgets.QPushButton("Reload MCU RAM"); self.reload_params_btn.clicked.connect(self.reload_parameters)
+        self.save_eeprom_btn = QtWidgets.QPushButton("SAVE EEPROM (smooth STOP)"); self.save_eeprom_btn.clicked.connect(self.request_eeprom_save)
+        buttons.addWidget(self.reload_params_btn); buttons.addWidget(self.save_eeprom_btn); buttons.addStretch(1); outer.addLayout(buttons)
+
+        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True); body = QtWidgets.QWidget(); self.tuning_layout = QtWidgets.QVBoxLayout(body)
+        scroll.setWidget(body); outer.addWidget(scroll, 1)
+        groups = [
+            ("Motor Limits", ["I_MOT_MAX","N_MOT_MAX","CMD_RATE","CMD_FILTER"]),
+            ("FOC q/d — Left / Right", ["IQ_KP_L","IQ_KP_R","IQ_KI_L","IQ_KI_R","ID_KP_L","ID_KP_R","ID_KI_L","ID_KI_R","CUR_FILT_L","CUR_FILT_R","KB_LIM_L","KB_LIM_R","IQ_ILIM_L","IQ_ILIM_R"]),
+            ("Outer Speed PID", ["SPD_KP_L","SPD_KI_L","SPD_KD_L","SPD_KP_R","SPD_KI_R","SPD_KD_R","SPD_I_LIM","SPD_OUT_LIM","SPD_D_FILT"]),
+            ("Position → Speed → Torque (enc_hall Left)", ["POS_KP","POS_KI","POS_KD","POS_I_LIM","POS_SPD_LIM","POS_DEADBAND","POS_MIN","POS_MAX","POS_TARGET"]),
+            ("Encoder AB / Electrical Alignment", ["ENC_CPR","ENC_POLES","ENC_DIR","ENC_E_TRIM","ENC_SYNC_CMD","ENC_SWEEP_MS","ENC_SETTLE_MS","ENC_RET_RPM","ENC_RET_TOL"]),
+            ("Field Weakening / Phase Advance", ["FI_WEAK_ENA","FI_WEAK_HI","FI_WEAK_LO","FI_WEAK_MAX","PHA_ADV_MAX"]),
+            ("Generated Speed/Commutation Internals", ["GEN_SPD_KP_L","GEN_SPD_KP_R","GEN_SPD_KI_L","GEN_SPD_KI_R","GEN_SPD_ILIM_L","GEN_SPD_ILIM_R","COMM_LO_L","COMM_LO_R","COMM_HI_L","COMM_HI_R"]),
+        ]
+        self.tuning_names = {name for _, names in groups for name in names}
+        for title, names in groups:
+            box = QtWidgets.QGroupBox(title); grid = QtWidgets.QGridLayout(box)
+            headers = ["Parameter", "RAM value", "EEPROM/init", "Min", "Max", "Description"]
+            for c,h in enumerate(headers):
+                lab=QtWidgets.QLabel(f"<b>{h}</b>"); grid.addWidget(lab,0,c)
+            for r,name in enumerate(names,1):
+                nlab=QtWidgets.QLabel(name); spin=QtWidgets.QSpinBox(); spin.setRange(-2147483647,2147483647); spin.setKeyboardTracking(False)
+                init=ValueLabel("--"); mn=ValueLabel("--"); mx=ValueLabel("--"); desc=QtWidgets.QLabel(""); desc.setWordWrap(True)
+                spin.setEnabled(False)
+                spin.valueChanged.connect(lambda val, n=name: self.parameter_changed(n,val))
+                grid.addWidget(nlab,r,0); grid.addWidget(spin,r,1); grid.addWidget(init,r,2); grid.addWidget(mn,r,3); grid.addWidget(mx,r,4); grid.addWidget(desc,r,5)
+                self.param_widgets[name]=(spin,init,mn,mx,desc)
+            grid.setColumnStretch(5,1); self.tuning_layout.addWidget(box)
+        self.tuning_layout.addStretch(1)
         return page
 
     def build_console_tab(self) -> QtWidgets.QWidget:
@@ -250,6 +301,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.statusBar().showMessage(f"Connected {port} @ {self.link.baud}")
             self.append_console(f"Connected {port} @ {self.link.baud}; firmware telemetry {TELEMETRY_HZ} Hz")
+            QtCore.QTimer.singleShot(250, self.reload_parameters)
         except Exception as exc:
             self.link = None; QtWidgets.QMessageBox.critical(self, "Serial error", str(exc))
         self.update_controls()
@@ -269,7 +321,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------- Control ----------
     def is_fully_stopped(self) -> bool:
-        return bool(self.target_l == 0 and self.target_r == 0 and self.latest and self.latest.stopped and not self.stop_pending)
+        return bool(self.target_l == 0 and self.target_r == 0 and self.latest and self.latest.stopped and abs(self.latest.rpm_l) <= 5 and abs(self.latest.rpm_r) <= 5 and not self.stop_pending)
 
     def transmit_target(self) -> None:
         if not self.link: return
@@ -320,6 +372,54 @@ class MainWindow(QtWidgets.QMainWindow):
         if ans == QtWidgets.QMessageBox.Yes:
             self.link.send_debug("CALIBRATE"); self.append_console("[CAL] manual ADC offset calibration requested")
 
+    def reload_parameters(self) -> None:
+        if self.link:
+            self.append_console("[RAM] reading all MCU parameters ...")
+            self.link.send_debug("GET")
+
+    def parameter_changed(self, name: str, value: int) -> None:
+        if not self.link or name not in self.param_defs: return
+        # QSpinBox emits while being updated from GET; block flag in definition suppresses it.
+        if self.param_defs[name].get("loading"): return
+        timer = self._param_debounce.get(name)
+        if timer is None:
+            timer = QtCore.QTimer(self); timer.setSingleShot(True)
+            timer.timeout.connect(lambda n=name: self.commit_parameter(n))
+            self._param_debounce[name] = timer
+        timer.start(180)
+
+    def commit_parameter(self, name: str) -> None:
+        if not self.link or name not in self.param_widgets: return
+        spin = self.param_widgets[name][0]
+        self.link.send_debug(f"SET {name} {spin.value()}")
+        self.append_console(f"[RAM] {name} <- {spin.value()} (not EEPROM yet)")
+
+    def request_eeprom_save(self) -> None:
+        if not self.link: return
+        self.eeprom_save_pending = True
+        if self.is_fully_stopped():
+            self.link.send_debug("SAVE"); self.eeprom_save_pending=False
+            self.append_console("[EEPROM] SAVE requested while stopped")
+        else:
+            self.target_l=self.target_r=0; self.stop_pending=True; self.stop_zero_frames=0
+            self.append_console("[EEPROM] smooth STOP requested; SAVE will be sent after cmd=0,0")
+        self.update_controls()
+
+    @QtCore.pyqtSlot(str)
+    def on_debug_line(self, text: str) -> None:
+        self.append_console(text)
+        # Firmware format: # name:"IQ_KP_L" value:1229 init:1229 min:0 max:32767 ... "help"
+        m = re.search(r'name:"([^"]+)"\s+value:([-+]?\d+)\s+init:([-+]?\d+)\s+min:([-+]?\d+)\s+max:([-+]?\d+)(?:.*?"([^"]*)")?', text)
+        if not m: return
+        name=m.group(1)
+        if name not in self.param_widgets: return
+        value,initv,mn,mx=map(int,m.group(2,3,4,5)); desc=m.group(6) or ""
+        self.param_defs.setdefault(name,{})["loading"]=True
+        spin,init_lab,min_lab,max_lab,desc_lab=self.param_widgets[name]
+        spin.blockSignals(True); spin.setRange(mn,mx); spin.setValue(value); spin.blockSignals(False); spin.setEnabled(self.link is not None)
+        init_lab.setText(str(initv)); min_lab.setText(str(mn)); max_lab.setText(str(mx)); desc_lab.setText(desc)
+        self.param_defs[name].update(value=value,init=initv,min=mn,max=mx,loading=False)
+
     def finish_csv(self) -> None:
         if not self.logger.active: return
         path, rows, missed = self.logger.stop()
@@ -335,8 +435,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.left_panel.update_motor(t, False); self.right_panel.update_motor(t, True)
         self.mode_value.setText(f"{t.mode} — {t.mode_name}"); self.dq_ref_value.setText(t.dq_reference)
         self.voltage_value.setText(f"{t.battery_v:.2f} V"); self.temp_value.setText(f"{t.temperature_c:.1f} °C")
-        self.cycle_value.setText(f"{t.foc_cycles} cyc | {t.foc_us:.2f} µs | {t.foc_load_pct:.1f}%")
+        self.cycle_value.setText(f"{t.foc_cycles} cyc | {t.foc_us:.2f} µs | {t.foc_load_pct:.1f}% | max {t.foc_cycles_max} ({t.foc_max_us:.2f} µs)")
         self.status_value.setText(t.status_text); self.seq_value.setText(str(t.telemetry_seq))
+        self.profile_value.setText(t.hw_profile_name); self.enc_pos_value.setText(f"{t.encoder_position:+d} count")
+        self.enc_rpm_value.setText(f"{t.encoder_rpm:+d} rpm"); self.enc_angle_value.setText(f"{t.encoder_elec_angle_x10/10.0:.1f}°")
+        self.enc_sync_value.setText(f"{t.encoder_sync_state} — {t.encoder_sync_text}"); self.pos_ref_value.setText(f"{t.position_speed_ref:+d} rpm (target {t.position_target:+d})")
         if len(self.last_arrivals) >= 2:
             dt = self.last_arrivals[-1] - self.last_arrivals[0]
             hz = (len(self.last_arrivals) - 1) / dt if dt > 0 else 0.0
@@ -357,7 +460,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.stop_zero_frames >= 3:
                 self.stop_pending = False
                 self.append_console("[STOP] cmdL=0 cmdR=0 confirmed after rate limiter")
-                self.finish_csv(); self.update_controls()
+                self.finish_csv()
+                self.update_controls()
+        if self.eeprom_save_pending and self.link and t.stopped and abs(t.rpm_l) <= 5 and abs(t.rpm_r) <= 5 and not self.stop_pending:
+            self.link.send_debug("SAVE"); self.eeprom_save_pending=False
+            self.append_console("[EEPROM] cmd=0 and |rpm|<=5 -> SAVE requested")
         self.update_controls()
 
     def refresh_plots(self) -> None:
@@ -388,6 +495,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setEnabled(connected)
         self.cal_btn.setEnabled(connected and stopped and not calibrating and not self.logger.active)
         self.raw_send_btn.setEnabled(connected); self.raw_cmd.setEnabled(connected)
+        self.reload_params_btn.setEnabled(connected); self.save_eeprom_btn.setEnabled(connected and not calibrating)
+        for name,widgets in self.param_widgets.items(): widgets[0].setEnabled(connected and name in self.param_defs)
         self.port_combo.setEnabled(not connected); self.baud_combo.setEnabled(not connected); self.refresh_btn.setEnabled(not connected)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:

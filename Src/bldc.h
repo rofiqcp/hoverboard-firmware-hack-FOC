@@ -13,5 +13,7 @@ extern volatile int16_t foc_idR_q4;
 void currentCalibrationStart(void);
 uint8_t currentCalibrationActive(void);
 uint16_t currentCalibrationProgressPermille(void);
+uint8_t currentCalibrationResetPending(void);
+void currentCalibrationFinalizeReset(void);
 
 #endif

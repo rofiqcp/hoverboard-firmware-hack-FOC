@@ -29,6 +29,7 @@
 #include "util.h"
 #include "comms.h"
 #include "bldc.h"
+#include "advanced_control.h"
 
 
 #define RAW_MIN -1000
@@ -36,6 +37,7 @@
 
 
 #define MAX_PARAM_WATCH 15
+static uint8_t paramSilent = 0u;
 
 extern ExtY rtY_Left;                   /* External outputs */
 extern ExtU rtU_Left;                   /* External inputs */
@@ -58,16 +60,17 @@ extern int16_t board_temp_deg_c;
 extern int16_t left_dc_curr;
 extern int16_t right_dc_curr;
 extern int16_t dc_curr;
-extern int16_t cmdL; 
-extern int16_t cmdR; 
+extern int16_t cmdL;
+extern int16_t cmdR;
 extern volatile uint32_t foc_isr_cycles;
 extern volatile uint32_t foc_isr_cycles_max;
 
 
 
 static int8_t calibrateCurrentOffsets(void) {
-  if (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0) {
-    printf("! CALIBRATE requires STOP and completed ramp-down (cmdL=0 cmdR=0)\r\n");
+  if (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0 ||
+      abs(rtY_Left.n_mot) > 5 || abs(rtY_Right.n_mot) > 5) {
+    printf("! CALIBRATE requires STOP, ramp-down complete and |rpm|<=5\r\n");
     return 0;
   }
   currentCalibrationStart();
@@ -90,54 +93,110 @@ const command_entry commands[] = {
     {WRITE  ,"CALIBRATE",calibrateCurrentOffsets,NULL       ,NULL           ,"Recalibrate six current ADC offsets while stopped"},
 };
 
-enum paramTypes {PARAMETER,VARIABLE};
-const parameter_entry params[] = {
-  // CONTROL PARAMETERS
-  // Type       ,Name                 ,Datatype ,ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {PARAMETER  ,"CTRL_MOD"           ,ADD_PARAM(ctrlModReqRaw)              ,NULL                      ,0          ,CTRL_MOD_REQ      ,0      ,1      ,6      ,0               ,0    ,0     ,NULL               ,"Runtime mode 1:FOC-VLT 2:FOC-SPD 3:FOC-TRQ 4:SVPWM sensorless 5:COM 6:SIN"},
-    {PARAMETER  ,"I_MOT_MAX"          ,ADD_PARAM(rtP_Left.i_max)             ,&rtP_Right.i_max          ,1          ,I_MOT_MAX         ,1      ,1      ,40     ,A2BIT_CONV      ,0    ,4     ,NULL               ,"Max phase current A"},
-    {PARAMETER  ,"N_MOT_MAX"          ,ADD_PARAM(rtP_Left.n_max)             ,&rtP_Right.n_max          ,2          ,N_MOT_MAX         ,1      ,10     ,2000   ,0               ,0    ,4     ,NULL               ,"Max motor RPM"},
-    {PARAMETER  ,"FI_WEAK_ENA"        ,ADD_PARAM(rtP_Left.b_fieldWeakEna)    ,&rtP_Right.b_fieldWeakEna ,0          ,FIELD_WEAK_ENA    ,0      ,0      ,1      ,0               ,0    ,0     ,NULL               ,"Enable field weak"},
-  	{PARAMETER  ,"FI_WEAK_HI"         ,ADD_PARAM(rtP_Left.r_fieldWeakHi)     ,&rtP_Right.r_fieldWeakHi  ,0          ,FIELD_WEAK_HI     ,1      ,0      ,1500   ,0               ,0    ,4     ,Input_Lim_Init     ,"Field weak high RPM"},
-	  {PARAMETER  ,"FI_WEAK_LO"         ,ADD_PARAM(rtP_Left.r_fieldWeakLo)     ,&rtP_Right.r_fieldWeakLo  ,0          ,FIELD_WEAK_LO     ,1      ,0      ,1000   ,0               ,0    ,4     ,Input_Lim_Init     ,"Field weak low RPM"},
-    {PARAMETER  ,"FI_WEAK_MAX"        ,ADD_PARAM(rtP_Left.id_fieldWeakMax)   ,&rtP_Right.id_fieldWeakMax,0          ,FIELD_WEAK_MAX    ,1      ,0      ,20     ,A2BIT_CONV      ,0    ,4     ,NULL               ,"Field weak max current A(FOC)"},
-    {PARAMETER  ,"PHA_ADV_MAX"        ,ADD_PARAM(rtP_Left.a_phaAdvMax)       ,&rtP_Right.a_phaAdvMax    ,0          ,PHASE_ADV_MAX     ,1      ,0      ,55     ,0               ,0    ,4     ,NULL               ,"Max Phase Adv angle Deg(SIN)"},     
-  // INPUT PARAMETERS
-  // Type       ,Name                 ,ValueL ptr                            ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {VARIABLE   ,"CMDL_RAW"           ,ADD_PARAM(input1[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Left motor raw command"},
-    {VARIABLE   ,"CMDL_IN"            ,ADD_PARAM(input1[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Left motor requested command"},
-    {VARIABLE   ,"CMDR_RAW"           ,ADD_PARAM(input2[0].raw)              ,NULL                      ,0          ,0                 ,0      ,RAW_MIN,RAW_MAX,0               ,0    ,0     ,0                  ,"Right motor raw command"},
-    {VARIABLE   ,"CMDR_IN"            ,ADD_PARAM(input2[0].cmd)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,0                  ,"Right motor requested command"},
-// FEEDBACK
-  // Type       ,Name                 ,Datatype, ValueL ptr                  ,ValueR                    ,EEPRM Addr ,Init              Int/Ext ,Min    ,Max    ,Div             ,Mul  ,Fix   ,Callback Function  ,Help text
-    {VARIABLE   ,"DC_CURR"            ,ADD_PARAM(dc_curr)                    ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Total DC Link current A *100"},
-    {VARIABLE   ,"RDC_CURR"           ,ADD_PARAM(right_dc_curr)              ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Right DC Link current A *100"},
-    {VARIABLE   ,"LDC_CURR"           ,ADD_PARAM(left_dc_curr)               ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Left DC Link current A *100"},
-    {VARIABLE   ,"CMDL"               ,ADD_PARAM(cmdL)                       ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Left Motor Command"},
-    {VARIABLE   ,"CMDR"               ,ADD_PARAM(cmdR)                       ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Right Motor Command"},
-    {VARIABLE   ,"SPD_AVG"            ,ADD_PARAM(speedAvg)                   ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Motor Measured Avg RPM"},
-    {VARIABLE   ,"SPDL"               ,ADD_PARAM(rtY_Left.n_mot)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Left Motor Measured RPM"},
-    {VARIABLE   ,"SPDR"               ,ADD_PARAM(rtY_Right.n_mot)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Right Motor Measured RPM"},
-    {VARIABLE   ,"RATE"               ,0       , NULL                        ,NULL                      ,0          ,RATE              ,0      ,0      ,0      ,0               ,0    ,4     ,NULL               ,"Rate *10"},
-    {VARIABLE   ,"BATV"               ,ADD_PARAM(batVoltageCalib)            ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Battery voltage *100"},       
-    {VARIABLE   ,"TEMP"               ,ADD_PARAM(board_temp_deg_c)           ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Calibrated Temperature °C *10"},       
-    {VARIABLE   ,"FOC_ISR_CYC"        ,ADD_PARAM(foc_isr_cycles)             ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Last FOC ISR CPU cycles"},
-    {VARIABLE   ,"FOC_ISR_MAX"        ,ADD_PARAM(foc_isr_cycles_max)         ,NULL                      ,0          ,0                 ,0      ,0      ,0      ,0               ,0    ,0     ,NULL               ,"Maximum FOC ISR CPU cycles since boot"},
-
+static const char *const errors[] = {
+  "Command not found",                         /* Err1  */
+  "Parameter not found",                       /* Err2  */
+  "This command cannot be used with a Variable",/* Err3 */
+  "Value not in range",                        /* Err4  */
+  "Value expected",                            /* Err5  */
+  "Start of line expected",                    /* Err6  */
+  "End of line expected",                      /* Err7  */
+  "Parameter expected",                        /* Err8  */
+  "Uncaught error",                            /* Err9  */
+  "Watch list is full"                         /* Err10 */
 };
 
+enum paramTypes {PARAMETER,VARIABLE};
+const parameter_entry params[] = {
+  /* Runtime mode and motor limits */
+  {PARAMETER,"CTRL_MOD",ADD_PARAM(ctrlModReqRaw),NULL,0,CTRL_MOD_REQ,0,1,CTRL_MODE_MAX,0,0,0,NULL,"Mode 1 VLT, 2 Speed PID, 3 TRQ, 4 sensorless SVPWM, 5 commutation, 6 sine, 7 position(enc_hall)"},
+  {PARAMETER,"I_MOT_MAX",ADD_PARAM(rtP_Left.i_max),&rtP_Right.i_max,1,I_MOT_MAX,1,1,40,A2BIT_CONV,0,4,NULL,"Maximum phase current [A]"},
+  {PARAMETER,"N_MOT_MAX",ADD_PARAM(rtP_Left.n_max),&rtP_Right.n_max,2,N_MOT_MAX,1,10,2000,0,0,4,NULL,"Maximum motor speed [rpm]"},
 
-const char *errors[10] = {
-  "Command not found", // Err1
-  "Parameter not found", // Err2
-  "This command cannot be used with a Variable", // Err3
-  "Value not in range", // Err4
-  "Value expected", // Err5
-  "Start of line expected", // Err6
-  "End of line expected", // Err7
-  "Parameter expected", // Err8
-  "Uncaught error", // Err9
-  "Watch list is full" // Err10
+  /* Inner FOC current PI: generated fixed-point coefficients, independently tunable. */
+  {PARAMETER,"IQ_KP_L",ADD_PARAM(rtP_Left.cf_iqKp),NULL,3,1229,0,0,32767,0,0,0,NULL,"Left FOC q-axis proportional coefficient raw fixed-point"},
+  {PARAMETER,"IQ_KP_R",ADD_PARAM(rtP_Right.cf_iqKp),NULL,4,1229,0,0,32767,0,0,0,NULL,"Right FOC q-axis proportional coefficient raw fixed-point"},
+  {PARAMETER,"IQ_KI_L",ADD_PARAM(rtP_Left.cf_iqKi),NULL,5,1229,0,0,32767,0,0,0,NULL,"Left FOC q-axis integral coefficient raw fixed-point"},
+  {PARAMETER,"IQ_KI_R",ADD_PARAM(rtP_Right.cf_iqKi),NULL,6,1229,0,0,32767,0,0,0,NULL,"Right FOC q-axis integral coefficient raw fixed-point"},
+  {PARAMETER,"ID_KP_L",ADD_PARAM(rtP_Left.cf_idKp),NULL,7,819,0,0,32767,0,0,0,NULL,"Left FOC d-axis proportional coefficient raw fixed-point"},
+  {PARAMETER,"ID_KP_R",ADD_PARAM(rtP_Right.cf_idKp),NULL,8,819,0,0,32767,0,0,0,NULL,"Right FOC d-axis proportional coefficient raw fixed-point"},
+  {PARAMETER,"ID_KI_L",ADD_PARAM(rtP_Left.cf_idKi),NULL,9,737,0,0,32767,0,0,0,NULL,"Left FOC d-axis integral coefficient raw fixed-point"},
+  {PARAMETER,"ID_KI_R",ADD_PARAM(rtP_Right.cf_idKi),NULL,10,737,0,0,32767,0,0,0,NULL,"Right FOC d-axis integral coefficient raw fixed-point"},
+  {PARAMETER,"CUR_FILT_L",ADD_PARAM(rtP_Left.cf_currFilt),NULL,11,7864,0,1,32767,0,0,0,NULL,"Left dq current low-pass coefficient"},
+  {PARAMETER,"CUR_FILT_R",ADD_PARAM(rtP_Right.cf_currFilt),NULL,12,7864,0,1,32767,0,0,0,NULL,"Right dq current low-pass coefficient"},
+  {PARAMETER,"KB_LIM_L",ADD_PARAM(rtP_Left.cf_KbLimProt),NULL,13,768,0,0,32767,0,0,0,NULL,"Left FOC anti-windup back-calculation coefficient"},
+  {PARAMETER,"KB_LIM_R",ADD_PARAM(rtP_Right.cf_KbLimProt),NULL,14,768,0,0,32767,0,0,0,NULL,"Right FOC anti-windup back-calculation coefficient"},
+  {PARAMETER,"IQ_ILIM_L",ADD_PARAM(rtP_Left.cf_iqKiLimProt),NULL,15,737,0,0,32767,0,0,0,NULL,"Left q-axis integrator limiting coefficient"},
+  {PARAMETER,"IQ_ILIM_R",ADD_PARAM(rtP_Right.cf_iqKiLimProt),NULL,16,737,0,0,32767,0,0,0,NULL,"Right q-axis integrator limiting coefficient"},
+
+  /* Outer speed PID: x1000 engineering coefficients. */
+  {PARAMETER,"SPD_KP_L",ADD_PARAM(spd_kp_l_x1000),NULL,17,200,0,0,10000,0,0,0,advancedControlReset,"Left speed Kp x1000 [command/rpm]"},
+  {PARAMETER,"SPD_KI_L",ADD_PARAM(spd_ki_l_x1000),NULL,18,50,0,0,10000,0,0,0,advancedControlReset,"Left speed Ki x1000"},
+  {PARAMETER,"SPD_KD_L",ADD_PARAM(spd_kd_l_x1000),NULL,19,0,0,0,10000,0,0,0,advancedControlReset,"Left speed Kd x1000"},
+  {PARAMETER,"SPD_KP_R",ADD_PARAM(spd_kp_r_x1000),NULL,20,200,0,0,10000,0,0,0,advancedControlReset,"Right speed Kp x1000"},
+  {PARAMETER,"SPD_KI_R",ADD_PARAM(spd_ki_r_x1000),NULL,21,50,0,0,10000,0,0,0,advancedControlReset,"Right speed Ki x1000"},
+  {PARAMETER,"SPD_KD_R",ADD_PARAM(spd_kd_r_x1000),NULL,22,0,0,0,10000,0,0,0,advancedControlReset,"Right speed Kd x1000"},
+  {PARAMETER,"SPD_I_LIM",ADD_PARAM(spd_i_limit),NULL,23,800,0,0,1000,0,0,0,advancedControlReset,"Speed PID integral output limit"},
+  {PARAMETER,"SPD_OUT_LIM",ADD_PARAM(spd_out_limit),NULL,24,1000,0,1,1000,0,0,0,advancedControlReset,"Speed PID torque-command limit"},
+
+  /* Position -> speed -> torque cascade, Left encoder profile. */
+  {PARAMETER,"POS_KP",ADD_PARAM(pos_kp_x1000),NULL,25,20,0,0,10000,0,0,0,advancedControlReset,"Position Kp x1000 [rpm/count]"},
+  {PARAMETER,"POS_KI",ADD_PARAM(pos_ki_x1000),NULL,26,0,0,0,10000,0,0,0,advancedControlReset,"Position Ki x1000"},
+  {PARAMETER,"POS_KD",ADD_PARAM(pos_kd_x1000),NULL,27,0,0,0,10000,0,0,0,advancedControlReset,"Position Kd x1000"},
+  {PARAMETER,"POS_I_LIM",ADD_PARAM(pos_i_limit_rpm),NULL,28,150,0,0,1000,0,0,0,advancedControlReset,"Position integral contribution limit [rpm]"},
+  {PARAMETER,"POS_SPD_LIM",ADD_PARAM(pos_speed_limit_rpm),NULL,29,250,0,1,1500,0,0,0,advancedControlReset,"Position outer-loop speed limit [rpm]"},
+  {PARAMETER,"POS_DEADBAND",ADD_PARAM(pos_deadband_counts),NULL,30,4,0,0,1000,0,0,0,NULL,"Position deadband [encoder counts]"},
+  {PARAMETER,"POS_MIN",ADD_PARAM(pos_min_counts),NULL,31,-12000,0,-30000,30000,0,0,0,NULL,"Minimum allowed Left position [counts]"},
+  {PARAMETER,"POS_MAX",ADD_PARAM(pos_max_counts),NULL,32,12000,0,-30000,30000,0,0,0,NULL,"Maximum allowed Left position [counts]"},
+  {PARAMETER,"POS_TARGET",ADD_PARAM(pos_target_counts),NULL,33,0,0,-30000,30000,0,0,0,NULL,"Left position target [counts]"},
+
+  {PARAMETER,"CMD_RATE",ADD_PARAM(cmd_rate_runtime),NULL,34,RATE,0,1,30000,0,0,0,NULL,"Host command rate limiter fixed-point step"},
+  {PARAMETER,"CMD_FILTER",ADD_PARAM(cmd_filter_runtime),NULL,35,FILTER,0,1,32767,0,0,0,NULL,"Host command low-pass coefficient"},
+
+  /* Encoder AB / alignment parameters. */
+  {PARAMETER,"ENC_CPR",ADD_PARAM(enc_cpr),NULL,36,4096,0,64,30000,0,0,0,NULL,"Left quadrature counts/revolution (AB x4)"},
+  {PARAMETER,"ENC_POLES",ADD_PARAM(enc_pole_pairs),NULL,37,SVPWM_POLE_PAIRS,0,1,40,0,0,0,NULL,"Left motor pole pairs for encoder electrical angle"},
+  {PARAMETER,"ENC_DIR",ADD_PARAM(enc_direction),NULL,38,1,0,-1,1,0,0,0,NULL,"Encoder direction: +1 or -1"},
+  {PARAMETER,"ENC_E_TRIM",ADD_PARAM(enc_elec_trim_deg_x10),NULL,39,0,0,-1800,1800,0,0,0,NULL,"Electrical alignment trim [deg x10]"},
+  {PARAMETER,"ENC_SYNC_CMD",ADD_PARAM(enc_sync_cmd),NULL,40,80,0,10,250,0,0,0,NULL,"Boot open-loop sync command"},
+  {PARAMETER,"ENC_SWEEP_MS",ADD_PARAM(enc_sync_sweep_ms),NULL,41,1200,0,100,5000,0,0,0,NULL,"Boot encoder sweep duration [ms]"},
+  {PARAMETER,"ENC_SETTLE_MS",ADD_PARAM(enc_sync_settle_ms),NULL,42,350,0,50,3000,0,0,0,NULL,"Electrical-zero hold settling time [ms]"},
+  {PARAMETER,"ENC_RET_RPM",ADD_PARAM(enc_return_rpm),NULL,43,80,0,10,500,0,0,0,NULL,"Return-to-start maximum rpm after alignment"},
+  {PARAMETER,"ENC_RET_TOL",ADD_PARAM(enc_return_tolerance_counts),NULL,44,8,0,1,1000,0,0,0,NULL,"Return-to-start tolerance [counts]"},
+
+  {PARAMETER,"SPD_D_FILT",ADD_PARAM(spd_d_filter_x1000),NULL,45,850,0,0,1000,0,0,0,advancedControlReset,"Speed/position derivative low-pass coefficient x1000"},
+  {PARAMETER,"FI_WEAK_ENA",ADD_PARAM(rtP_Left.b_fieldWeakEna),&rtP_Right.b_fieldWeakEna,46,FIELD_WEAK_ENA,0,0,1,0,0,0,NULL,"Enable field weakening"},
+  {PARAMETER,"FI_WEAK_HI",ADD_PARAM(rtP_Left.r_fieldWeakHi),&rtP_Right.r_fieldWeakHi,47,FIELD_WEAK_HI,1,0,2000,0,0,4,Input_Lim_Init,"Field weakening high rpm"},
+  {PARAMETER,"FI_WEAK_LO",ADD_PARAM(rtP_Left.r_fieldWeakLo),&rtP_Right.r_fieldWeakLo,48,FIELD_WEAK_LO,1,0,2000,0,0,4,Input_Lim_Init,"Field weakening low rpm"},
+  {PARAMETER,"FI_WEAK_MAX",ADD_PARAM(rtP_Left.id_fieldWeakMax),&rtP_Right.id_fieldWeakMax,49,4000,0,0,30000,0,0,0,NULL,"Maximum field-weakening d current raw generated units"},
+  {PARAMETER,"PHA_ADV_MAX",ADD_PARAM(rtP_Left.a_phaAdvMax),&rtP_Right.a_phaAdvMax,50,25,1,0,60,0,0,4,NULL,"Maximum phase advance [degree]"},
+  {PARAMETER,"GEN_SPD_KP_L",ADD_PARAM(rtP_Left.cf_nKp),NULL,51,4833,0,0,32767,0,0,0,NULL,"Generated controller speed Kp raw fixed-point"},
+  {PARAMETER,"GEN_SPD_KP_R",ADD_PARAM(rtP_Right.cf_nKp),NULL,52,4833,0,0,32767,0,0,0,NULL,"Generated controller speed Kp raw fixed-point"},
+  {PARAMETER,"GEN_SPD_KI_L",ADD_PARAM(rtP_Left.cf_nKi),NULL,53,251,0,0,32767,0,0,0,NULL,"Generated controller speed Ki raw fixed-point"},
+  {PARAMETER,"GEN_SPD_KI_R",ADD_PARAM(rtP_Right.cf_nKi),NULL,54,251,0,0,32767,0,0,0,NULL,"Generated controller speed Ki raw fixed-point"},
+  {PARAMETER,"GEN_SPD_ILIM_L",ADD_PARAM(rtP_Left.cf_nKiLimProt),NULL,55,246,0,0,32767,0,0,0,NULL,"Generated controller speed integrator limiting coefficient"},
+  {PARAMETER,"GEN_SPD_ILIM_R",ADD_PARAM(rtP_Right.cf_nKiLimProt),NULL,56,246,0,0,32767,0,0,0,NULL,"Generated controller speed integrator limiting coefficient"},
+  {PARAMETER,"COMM_LO_L",ADD_PARAM(rtP_Left.n_commAcvLo),NULL,57,15,1,0,1000,0,0,4,NULL,"Left commutation activation speed [rpm]"},
+  {PARAMETER,"COMM_LO_R",ADD_PARAM(rtP_Right.n_commAcvLo),NULL,58,15,1,0,1000,0,0,4,NULL,"Right commutation activation speed [rpm]"},
+  {PARAMETER,"COMM_HI_L",ADD_PARAM(rtP_Left.n_commDeacvHi),NULL,59,30,1,0,1500,0,0,4,NULL,"Left commutation deactivation speed [rpm]"},
+  {PARAMETER,"COMM_HI_R",ADD_PARAM(rtP_Right.n_commDeacvHi),NULL,60,30,1,0,1500,0,0,4,NULL,"Right commutation deactivation speed [rpm]"},
+
+  /* Inputs / runtime feedback */
+  {VARIABLE,"CMDL_RAW",ADD_PARAM(input1[0].raw),NULL,0,0,0,RAW_MIN,RAW_MAX,0,0,0,NULL,"Left raw command"},
+  {VARIABLE,"CMDL_IN",ADD_PARAM(input1[0].cmd),NULL,0,0,0,0,0,0,0,0,NULL,"Left requested command"},
+  {VARIABLE,"CMDR_RAW",ADD_PARAM(input2[0].raw),NULL,0,0,0,RAW_MIN,RAW_MAX,0,0,0,NULL,"Right raw command"},
+  {VARIABLE,"CMDR_IN",ADD_PARAM(input2[0].cmd),NULL,0,0,0,0,0,0,0,0,NULL,"Right requested command"},
+  {VARIABLE,"CMDL",ADD_PARAM(cmdL),NULL,0,0,0,0,0,0,0,0,NULL,"Left applied command"},
+  {VARIABLE,"CMDR",ADD_PARAM(cmdR),NULL,0,0,0,0,0,0,0,0,NULL,"Right applied command"},
+  {VARIABLE,"SPDL",ADD_PARAM(rtY_Left.n_mot),NULL,0,0,0,0,0,0,0,0,NULL,"Left measured rpm"},
+  {VARIABLE,"SPDR",ADD_PARAM(rtY_Right.n_mot),NULL,0,0,0,0,0,0,0,0,NULL,"Right internal measured rpm"},
+  {VARIABLE,"ENC_POS",ADD_PARAM(enc_position_counts),NULL,0,0,0,0,0,0,0,0,NULL,"Left encoder position counts"},
+  {VARIABLE,"ENC_RPM",ADD_PARAM(enc_speed_rpm),NULL,0,0,0,0,0,0,0,0,NULL,"Left encoder speed rpm"},
+  {VARIABLE,"POS_SPD_REF",ADD_PARAM(enc_position_speed_target_rpm),NULL,0,0,0,0,0,0,0,0,NULL,"Position outer-loop speed target rpm"},
+  {VARIABLE,"ENC_E_ANGLE",ADD_PARAM(enc_elec_angle_deg_x10),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder electrical angle deg x10"},
+  {VARIABLE,"ENC_SYNC",ADD_PARAM(enc_sync_state),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder sync state"},
+  {VARIABLE,"FOC_ISR_CYC",ADD_PARAM(foc_isr_cycles),NULL,0,0,0,0,0,0,0,0,NULL,"Last FOC ISR cycles"},
+  {VARIABLE,"FOC_ISR_MAX",ADD_PARAM(foc_isr_cycles_max),NULL,0,0,0,0,0,0,0,0,NULL,"Maximum FOC ISR cycles"},
 };
 
 debug_command command;
@@ -195,8 +254,8 @@ int8_t setParamValInt(uint8_t index, int32_t newValue) {
         break;
     }
 
-    // Beep if value was modified
-    beepShort(5);
+    // Beep only for interactive runtime edits, never while boot-loading EEPROM.
+    if (!paramSilent) beepShort(5);
   }
 
   // Run callback function if assigned
@@ -326,12 +385,13 @@ int8_t printAllParamHelp(){
 
 // Print definition(name,value,initial value, min, max) for parameter
 int8_t printParamDef(uint8_t index){
-  printf("# name:\"%s\" value:%li init:%li min:%li max:%li\r\n",
-         params[index].name,     // Parameter Name
-         getParamValExt(index),  // Parameter Value translated to external format
-         getParamInitExt(index), // Parameter Init Value translated to external format
-         params[index].min,      // Parameter Min Value with External format 
-         params[index].max);     // Parameter Max Value with External format
+  printf("# name:\"%s\" value:%li init:%li min:%li max:%li help:\"%s\"\r\n",
+         params[index].name,
+         getParamValExt(index),
+         getParamInitExt(index),
+         params[index].min,
+         params[index].max,
+         params[index].help ? params[index].help : "");
   return 1;
 }
 
@@ -341,22 +401,59 @@ int8_t printAllParamDef(){
   return 1;
 }
 
-void printError(uint8_t errornum ){
-  printf("! Err%i:\"%s\"\r\n",errornum,errors[errornum-1]);
+void printError(uint8_t errornum) {
+  const uint32_t errorCount = (uint32_t)(sizeof(errors) / sizeof(errors[0]));
+  if ((errornum == 0u) || ((uint32_t)errornum > errorCount)) {
+    printf("! Err%u:\"Unknown error\"\r\n", (unsigned)errornum);
+    return;
+  }
+  printf("! Err%u:\"%s\"\r\n", (unsigned)errornum, errors[errornum - 1u]);
 }
 
 // Get internal Parameter value and save it to EEprom for all paraemeter with an address assigned 
 int8_t saveAllParamVal() {
+  if (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0 ||
+      abs(rtY_Left.n_mot) > 5 || abs(rtY_Right.n_mot) > 5) {
+    printf("! SAVE requires STOP and |rpm|<=5; values remain in RAM\r\n");
+    return 0;
+  }
   HAL_FLASH_Unlock();
-  EE_WriteVariable(VirtAddVarTab[0] , (uint16_t)FLASH_WRITE_KEY);
-  for(int i=0;i<PARAM_SIZE(params);i++){ 
-    // Only Parameters with eeprom address can be saved
-    if (params[i].addr){
-      EE_WriteVariable(VirtAddVarTab[params[i].addr] , (uint16_t)getParamValInt(i));    
+  /* Transaction marker invalid first. If power fails during write, next boot
+   * falls back to compiled defaults instead of accepting a partial parameter set. */
+  EE_WriteVariable(VirtAddVarTab[0], 0u);
+  for (int i = 0; i < PARAM_SIZE(params); ++i) {
+    if (params[i].addr > 0u && params[i].addr < NB_OF_VAR)
+      EE_WriteVariable(VirtAddVarTab[params[i].addr], (uint16_t)getParamValInt(i));
+  }
+  EE_WriteVariable(VirtAddVarTab[0], (uint16_t)FLASH_WRITE_KEY);
+  HAL_FLASH_Lock();
+  printf("# EEPROM SAVED\r\n");
+  return 1;
+}
+
+void loadAllParamVal(void) {
+  uint16_t key = 0u;
+  paramSilent = 1u;
+  HAL_FLASH_Unlock();
+  const uint16_t keyStatus = EE_ReadVariable(VirtAddVarTab[0], &key);
+  HAL_FLASH_Lock();
+  if (keyStatus != 0u || key != FLASH_WRITE_KEY) {
+    paramSilent = 0u;
+    printf("# EEPROM not valid; using compiled defaults\r\n");
+    return;
+  }
+  for (int i = 0; i < PARAM_SIZE(params); ++i) {
+    if (params[i].addr > 0u && params[i].addr < NB_OF_VAR) {
+      uint16_t v = 0u;
+      HAL_FLASH_Unlock();
+      const uint16_t st = EE_ReadVariable(VirtAddVarTab[params[i].addr], &v);
+      HAL_FLASH_Lock();
+      if (st == 0u) setParamValInt((uint8_t)i, (int16_t)v);
     }
   }
-  HAL_FLASH_Lock();
-  return 1;
+  advancedControlReset();
+  paramSilent = 0u;
+  printf("# EEPROM loaded to RAM\r\n");
 }
 
 // Translate from Internal to External format

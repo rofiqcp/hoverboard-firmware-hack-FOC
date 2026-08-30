@@ -87,10 +87,10 @@ class TerminalApp:
 
     def fully_stopped(self) -> bool:
         with self._lock: target_zero = self.target_l == 0 and self.target_r == 0
-        return bool(target_zero and self.latest and self.latest.stopped and not self.stop_pending)
+        return bool(target_zero and self.latest and self.latest.stopped and abs(self.latest.rpm_l) <= 5 and abs(self.latest.rpm_r) <= 5 and not self.stop_pending)
 
     def cmd_mode(self, mode: int) -> None:
-        if mode not in MODE_NAMES: raise ValueError("mode must be 1..6")
+        if mode not in MODE_NAMES: raise ValueError("mode must be 1..7")
         if not self.fully_stopped():
             print("[MODE] rejected: STOP and wait until cmd=0,0 first"); return
         self.link.send_debug(f"SET CTRL_MOD {mode}")
@@ -126,7 +126,7 @@ class TerminalApp:
         if self.logger.active:
             print("[CAL] rejected: finish/save the current CSV run first"); return
         self.link.send_debug("CALIBRATE")
-        print("[CAL] requested: six current ADC offsets, 2000 samples (~125 ms @16 kHz)")
+        print("[CAL] requested: six current ADC offsets: 100 ms bridge-off settle + 2000-sample mean (~125 ms) + controller cold-state reset")
 
     def help(self) -> None:
         print("""
@@ -206,7 +206,7 @@ def main() -> None:
     if not port:
         ports = available_ports()
         if not ports: raise SystemExit("No serial port found. Use --port /dev/ttyUSB0")
-        port = "/dev/ttyUSB0" if "/dev/ttyUSB0" in ports else ports[0]
+        port = "/dev/ttyUSB1" if "/dev/ttyUSB1" in ports else ports[0]
     TerminalApp(port, ns.baud, ns.display_hz).run()
 
 

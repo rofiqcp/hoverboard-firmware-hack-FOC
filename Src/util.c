@@ -10,6 +10,7 @@
 #include "BLDC_controller.h"
 #include "rtwtypes.h"
 #include "comms.h"
+#include "advanced_control.h"
 
 extern UART_HandleTypeDef huart3;
 extern uint8_t buzzerCount;
@@ -40,7 +41,7 @@ uint8_t timeoutFlgSerial = 1;
 uint8_t ctrlModReqRaw = CTRL_MOD_REQ;
 uint8_t ctrlModReq = OPEN_MODE;
 
-uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002};
+uint16_t VirtAddVarTab[NB_OF_VAR];
 
 static int16_t inputMax = 1000;
 static int16_t inputMin = -1000;
@@ -64,7 +65,12 @@ int _write(int file, char *data, int len) {
 #endif
 
 void BLDC_Init(void) {
+#ifdef HW_PROFILE_ENC_HALL
+  rtP_Left.b_angleMeasEna = 1;
+  rtP_Left.n_polePairs = (uint8_t)enc_pole_pairs;
+#else
   rtP_Left.b_angleMeasEna = 0;
+#endif
   rtP_Left.z_selPhaCurMeasABC = 0;
   /* Runtime modes select COM/SIN/FOC inside the motor ISR. */
   rtP_Left.z_ctrlTypSel = FOC_CTRL;
@@ -78,6 +84,7 @@ void BLDC_Init(void) {
   rtP_Left.r_fieldWeakLo = FIELD_WEAK_LO << 4;
 
   rtP_Right = rtP_Left;
+  rtP_Right.b_angleMeasEna = 0;
   rtP_Right.z_selPhaCurMeasABC = 1;
 
   rtM_Left->defaultParam = &rtP_Left;
@@ -113,14 +120,9 @@ void Input_Init(void) {
   HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
   UART_DisableRxErrors(&huart3);
 
-  uint16_t writeCheck = 0;
-  uint16_t value = 0;
+  for (uint16_t i = 0; i < NB_OF_VAR; ++i) VirtAddVarTab[i] = (uint16_t)(1000u + i);
   HAL_FLASH_Unlock();
   EE_Init();
-  if (EE_ReadVariable(VirtAddVarTab[0], &writeCheck) == 0 && writeCheck == FLASH_WRITE_KEY) {
-    if (EE_ReadVariable(VirtAddVarTab[1], &value) == 0) rtP_Left.i_max = rtP_Right.i_max = (int16_t)value;
-    if (EE_ReadVariable(VirtAddVarTab[2], &value) == 0) rtP_Left.n_max = rtP_Right.n_max = (int16_t)value;
-  }
   HAL_FLASH_Lock();
 }
 

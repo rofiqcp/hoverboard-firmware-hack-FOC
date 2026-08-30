@@ -9,6 +9,7 @@
 #include "rtwtypes.h"
 #include "comms.h"
 #include "bldc.h"
+#include "advanced_control.h"
 
 void SystemClock_Config(void);
 
@@ -29,8 +30,6 @@ extern int16_t speedAvgAbs;
 extern uint8_t timeoutFlgSerial;
 extern uint8_t ctrlModReq;
 extern uint8_t ctrlModReqRaw;
-extern volatile int pwml;
-extern volatile int pwmr;
 extern uint8_t enable;
 extern int16_t batVoltage;
 extern volatile uint32_t buzzerTimer;
@@ -43,6 +42,10 @@ int16_t right_dc_curr = 0;
 int16_t dc_curr = 0;
 int16_t cmdL = 0;
 int16_t cmdR = 0;
+volatile int16_t motorControlL = 0;
+volatile int16_t motorControlR = 0;
+volatile uint8_t generatedModeLeft = VLT_MODE;
+volatile uint8_t generatedModeRight = VLT_MODE;
 
 typedef struct __attribute__((packed)) {
   uint16_t start;
@@ -71,6 +74,14 @@ typedef struct __attribute__((packed)) {
   uint16_t calibration_permille;
   uint32_t telemetry_seq;
   uint32_t foc_isr_cycles;
+  int32_t encoder_position;
+  int16_t position_target;
+  int16_t position_speed_ref;
+  int16_t encoder_elec_angle_x10;
+  int16_t encoder_rpm;
+  uint16_t encoder_sync_state;
+  uint16_t hw_profile;
+  uint32_t foc_isr_cycles_max;
   uint16_t checksum;
 } SerialFeedback;
 
@@ -96,6 +107,11 @@ static uint16_t feedbackChecksum(const SerialFeedback *f) {
   c ^= f->status ^ f->mode ^ f->calibration_permille;
   c ^= (uint16_t)(f->telemetry_seq & 0xffffu) ^ (uint16_t)(f->telemetry_seq >> 16);
   c ^= (uint16_t)(f->foc_isr_cycles & 0xffffu) ^ (uint16_t)(f->foc_isr_cycles >> 16);
+  c ^= (uint16_t)(f->encoder_position & 0xffffu) ^ (uint16_t)((uint32_t)f->encoder_position >> 16);
+  c ^= (uint16_t)f->position_target ^ (uint16_t)f->position_speed_ref;
+  c ^= (uint16_t)f->encoder_elec_angle_x10 ^ (uint16_t)f->encoder_rpm;
+  c ^= f->encoder_sync_state ^ f->hw_profile;
+  c ^= (uint16_t)(f->foc_isr_cycles_max & 0xffffu) ^ (uint16_t)(f->foc_isr_cycles_max >> 16);
   return c;
 }
 
@@ -109,10 +125,18 @@ static int16_t focCurrentQ4ToCentiAmp(int32_t currentQ4) {
 }
 
 static uint16_t readHallLeft(void) {
+#ifdef HW_PROFILE_ENC_HALL
+  int32_t a = enc_elec_angle_deg_x10;
+  while (a < 0) a += 3600;
+  while (a >= 3600) a -= 3600;
+  static const uint8_t hallBySector[6] = {2u, 3u, 1u, 5u, 4u, 6u};
+  return hallBySector[(uint8_t)(a / 600)];
+#else
   const uint16_t u = (LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN) ? 0u : 1u;
   const uint16_t v = (LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN) ? 0u : 1u;
   const uint16_t w = (LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN) ? 0u : 1u;
   return (uint16_t)((u << 2) | (v << 1) | w);
+#endif
 }
 
 static uint16_t readHallRight(void) {
@@ -157,6 +181,11 @@ int main(void) {
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
   Input_Lim_Init();
   Input_Init();
+  loadAllParamVal();
+#ifdef HW_PROFILE_ENC_HALL
+  encoderLeftInit();
+  encoderSyncRequest();
+#endif
   HAL_ADC_Start(&hadc1);
   HAL_ADC_Start(&hadc2);
 
@@ -170,10 +199,19 @@ int main(void) {
   while (1) {
     if ((buzzerTimer - buzzerTimerPrev) < (16u * DELAY_IN_MAIN_LOOP)) continue;
 
+    if (currentCalibrationResetPending()) currentCalibrationFinalizeReset();
+#ifdef HW_PROFILE_ENC_HALL
+    encoderSyncService(currentCalibrationActive());
+#endif
     readCommand();
     calcAvgSpeed();
 
-    if (!timeoutFlgSerial && enable == 0 && !currentCalibrationActive() && !controllerFaultActive() &&
+#ifdef HW_PROFILE_ENC_HALL
+    const uint8_t profileReady = (uint8_t)(enc_sync_state == 5u && enc_sync_ok);
+#else
+    const uint8_t profileReady = 1u;
+#endif
+    if (!timeoutFlgSerial && profileReady && enable == 0 && !currentCalibrationActive() && !controllerFaultActive() &&
         input1[0].cmd > -50 && input1[0].cmd < 50 && input2[0].cmd > -50 && input2[0].cmd < 50) {
       beepShort(6);
       beepShort(4);
@@ -188,10 +226,10 @@ int main(void) {
      * same rate limiter so the motors decelerate instead of dropping torque
      * abruptly. Snap only the final <=1 command-count residual to exact zero
      * after the rate-limiter target has already reached zero. */
-    rateLimiter16(input1[0].cmd, RATE, &cmdLRateFixdt);
-    rateLimiter16(input2[0].cmd, RATE, &cmdRRateFixdt);
-    filtLowPass32(cmdLRateFixdt >> 4, FILTER, &cmdLFixdt);
-    filtLowPass32(cmdRRateFixdt >> 4, FILTER, &cmdRFixdt);
+    rateLimiter16(input1[0].cmd, cmd_rate_runtime, &cmdLRateFixdt);
+    rateLimiter16(input2[0].cmd, cmd_rate_runtime, &cmdRRateFixdt);
+    filtLowPass32(cmdLRateFixdt >> 4, (uint16_t)cmd_filter_runtime, &cmdLFixdt);
+    filtLowPass32(cmdRRateFixdt >> 4, (uint16_t)cmd_filter_runtime, &cmdRFixdt);
     cmdL = (int16_t)(cmdLFixdt >> 16);
     cmdR = (int16_t)(cmdRFixdt >> 16);
 
@@ -203,9 +241,25 @@ int main(void) {
       cmdRFixdt = 0;
       cmdR = 0;
     }
-    pwml = cmdL;
-    pwmr = -cmdR;  // positive cmdR means forward wheel direction, matching positive cmdL
-
+    int16_t controlL = 0, controlR = 0;
+    uint8_t genL = ctrlModReq, genR = ctrlModReq;
+#ifdef HW_PROFILE_ENC_HALL
+    const uint8_t controlMode = (enc_sync_state == 4u) ? POSITION_MODE : ctrlModReq;
+    encoderLeftUpdate();
+#else
+    const uint8_t controlMode = ctrlModReq;
+#endif
+    advancedControlUpdate(controlMode, cmdL, cmdR,
+#ifdef HW_PROFILE_ENC_HALL
+                          enc_speed_rpm, (int16_t)(-rtY_Right.n_mot),
+#else
+                          rtY_Left.n_mot, (int16_t)(-rtY_Right.n_mot),
+#endif
+                          &controlL, &controlR, &genL, &genR);
+    motorControlL = controlL;
+    motorControlR = controlR;
+    generatedModeLeft = genL;
+    generatedModeRight = genR;
 
     filtLowPass32(adc_buffer.temp, TEMP_FILT_COEF, &boardTempAdcFixdt);
     boardTempAdcFilt = (int16_t)(boardTempAdcFixdt >> 16);
@@ -234,9 +288,7 @@ int main(void) {
       feedback.cmdL = cmdL;
       feedback.cmdR = cmdR;
       feedback.rpmL = (int16_t)rtY_Left.n_mot;
-      /* Right motor is physically mirrored and internally driven with pwmr=-cmdR.
-       * Normalize signed wheel-speed and torque-current to the same host convention
-       * as cmdR: positive means forward for both wheels. */
+      /* Right motor is physically mirrored internally; host telemetry is normalized so positive means forward on both wheels. */
       feedback.rpmR = (int16_t)(-rtY_Right.n_mot);
       feedback.iqL_cA = focCurrentQ4ToCentiAmp(foc_iqL_q4);
       feedback.iqR_cA = focCurrentQ4ToCentiAmp(-((int32_t)foc_iqR_q4));
@@ -265,6 +317,14 @@ int main(void) {
       feedback.calibration_permille = currentCalibrationProgressPermille();
       feedback.telemetry_seq = scheduledTelemetrySeq;
       feedback.foc_isr_cycles = foc_isr_cycles;
+      feedback.encoder_position = enc_position_counts;
+      feedback.position_target = pos_target_counts;
+      feedback.position_speed_ref = enc_position_speed_target_rpm;
+      feedback.encoder_elec_angle_x10 = enc_elec_angle_deg_x10;
+      feedback.encoder_rpm = enc_speed_rpm;
+      feedback.encoder_sync_state = enc_sync_state;
+      feedback.hw_profile = HW_PROFILE_ID;
+      feedback.foc_isr_cycles_max = foc_isr_cycles_max;
       feedback.checksum = feedbackChecksum(&feedback);
       HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback, sizeof(feedback));
       }

@@ -20,9 +20,9 @@ except ImportError as exc:
 START = 0xABCD
 START_BYTES = struct.pack("<H", START)
 CMD = struct.Struct("<HhhH")
-# Src/main.c SerialFeedback (packed), 58 bytes:
-# H + 12h + 11H + II + H
-FB = struct.Struct("<H12h11HIIH")
+# Src/main.c SerialFeedback (packed), 78 bytes:
+# H + 12h + 11H + II + i + 4h + 2H + I + H
+FB = struct.Struct("<H12h11HIIi4h2HIH")
 
 CPU_HZ = 64_000_000
 FOC_HZ = 16_000
@@ -38,6 +38,7 @@ MODE_NAMES = {
     4: "SVPWM sensorless",
     5: "6-step commutation",
     6: "Sine PWM",
+    7: "Position cascade (enc_hall Left)",
 }
 
 DQ_REFERENCES = {
@@ -47,6 +48,7 @@ DQ_REFERENCES = {
     4: "commanded stator dq (measurement only)",
     5: "generated electrical-angle dq (measurement only)",
     6: "generated electrical-angle dq (measurement only)",
+    7: "encoder rotor dq (position→speed→torque→FOC)",
 }
 
 
@@ -103,6 +105,14 @@ class Telemetry:
     calibration_permille: int
     telemetry_seq: int
     foc_cycles: int
+    encoder_position: int
+    position_target: int
+    position_speed_ref: int
+    encoder_elec_angle_x10: int
+    encoder_rpm: int
+    encoder_sync_state: int
+    hw_profile: int
+    foc_cycles_max: int
 
     @property
     def enabled(self) -> bool: return bool(self.status & 0x01)
@@ -137,6 +147,13 @@ class Telemetry:
     @property
     def foc_load_pct(self) -> float: return self.foc_cycles * 100.0 / FOC_BUDGET_CYCLES
     @property
+    def foc_max_us(self) -> float: return self.foc_cycles_max * 1_000_000.0 / CPU_HZ
+    @property
+    def hw_profile_name(self) -> str: return {1: "two_hall", 2: "enc_hall"}.get(self.hw_profile, f"profile{self.hw_profile}")
+    @property
+    def encoder_sync_text(self) -> str:
+        return {0:"idle",1:"wait-cal",2:"sweep",3:"align-hold",4:"return",5:"ready",6:"failed"}.get(self.encoder_sync_state, str(self.encoder_sync_state))
+    @property
     def mode_name(self) -> str: return MODE_NAMES.get(self.mode, f"MODE {self.mode}")
     @property
     def dq_reference(self) -> str: return DQ_REFERENCES.get(self.mode, "unknown")
@@ -163,7 +180,7 @@ class Telemetry:
             f"adc={self.adc_dcl:4d},{self.adc_rla:4d},{self.adc_rlb:4d},"
             f"{self.adc_dcr:4d},{self.adc_rrb:4d},{self.adc_rrc:4d}  "
             f"V={self.battery_v:5.2f}  T={self.temperature_c:5.1f}C  "
-            f"cyc={self.foc_cycles:4d}"
+            f"cyc={self.foc_cycles:4d}  pos={self.encoder_position:+7d}  sync={self.encoder_sync_text}"
         )
 
 
@@ -180,7 +197,10 @@ def decode_feedback(packet: bytes) -> Telemetry | None:
         hall_l=v[13], hall_r=v[14], adc_dcl=v[15], adc_rla=v[16],
         adc_rlb=v[17], adc_dcr=v[18], adc_rrb=v[19], adc_rrc=v[20],
         status=v[21], mode=v[22], calibration_permille=v[23],
-        telemetry_seq=v[24], foc_cycles=v[25],
+        telemetry_seq=v[24], foc_cycles=v[25], encoder_position=v[26],
+        position_target=v[27], position_speed_ref=v[28], encoder_elec_angle_x10=v[29],
+        encoder_rpm=v[30], encoder_sync_state=v[31], hw_profile=v[32],
+        foc_cycles_max=v[33],
     )
 
 
@@ -193,6 +213,7 @@ class CsvLogger:
         "iqL_A", "iqR_A", "idL_A", "idR_A", "idcL_A", "idcR_A",
         "hallL", "hallR", "dcl_raw", "rla_raw", "rlb_raw", "dcr_raw", "rrb_raw", "rrc_raw",
         "battery_V", "temperature_C", "foc_isr_cycles", "foc_isr_us", "foc_isr_load_pct",
+        "encoder_position", "position_target", "position_speed_ref_rpm", "encoder_elec_angle_deg", "encoder_rpm", "encoder_sync_state", "encoder_sync_text", "hw_profile", "hw_profile_name", "foc_isr_cycles_max",
         "enabled", "timeout", "left_fault", "right_fault", "calibrating", "calibration_pct",
     ]
 
@@ -264,6 +285,11 @@ class CsvLogger:
                 "foc_isr_cycles": t.foc_cycles, "foc_isr_us": f"{t.foc_us:.4f}",
                 "foc_isr_load_pct": f"{t.foc_load_pct:.3f}", "enabled": int(t.enabled),
                 "timeout": int(t.timeout), "left_fault": int(t.left_fault),
+                "encoder_position": t.encoder_position, "position_target": t.position_target,
+                "position_speed_ref_rpm": t.position_speed_ref, "encoder_elec_angle_deg": f"{t.encoder_elec_angle_x10/10.0:.1f}",
+                "encoder_rpm": t.encoder_rpm, "encoder_sync_state": t.encoder_sync_state,
+                "encoder_sync_text": t.encoder_sync_text, "hw_profile": t.hw_profile, "hw_profile_name": t.hw_profile_name,
+                "foc_isr_cycles_max": t.foc_cycles_max,
                 "right_fault": int(t.right_fault), "calibrating": int(t.calibrating),
                 "calibration_pct": f"{t.calibration_permille / 10.0:.1f}",
             })
