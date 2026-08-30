@@ -9,11 +9,12 @@ extern volatile int16_t foc_iqL_q4;
 extern volatile int16_t foc_iqR_q4;
 extern volatile int16_t foc_idL_q4;
 extern volatile int16_t foc_idR_q4;
+extern volatile int16_t offsetrlA, offsetrlB, offsetrrB, offsetrrC, offsetdcl, offsetdcr;
 
 void currentCalibrationStart(void);
 uint8_t currentCalibrationActive(void);
 uint16_t currentCalibrationProgressPermille(void);
-uint8_t currentCalibrationResetPending(void);
-void currentCalibrationFinalizeReset(void);
+uint8_t currentCalibrationValid(void);
+uint16_t currentCalibrationFailureCount(void);
 
 #endif

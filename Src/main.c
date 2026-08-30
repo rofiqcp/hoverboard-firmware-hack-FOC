@@ -199,7 +199,6 @@ int main(void) {
   while (1) {
     if ((buzzerTimer - buzzerTimerPrev) < (16u * DELAY_IN_MAIN_LOOP)) continue;
 
-    if (currentCalibrationResetPending()) currentCalibrationFinalizeReset();
 #ifdef HW_PROFILE_ENC_HALL
     encoderSyncService(currentCalibrationActive());
 #endif
@@ -208,18 +207,20 @@ int main(void) {
 
 #ifdef HW_PROFILE_ENC_HALL
     const uint8_t profileReady = (uint8_t)(enc_sync_state == 5u && enc_sync_ok);
+    const uint8_t positionMoveRequested = (uint8_t)(ctrlModReq == POSITION_MODE &&
+        abs(pos_target_counts - enc_position_counts) > pos_deadband_counts);
 #else
     const uint8_t profileReady = 1u;
+    const uint8_t positionMoveRequested = 0u;
 #endif
-    if (!timeoutFlgSerial && profileReady && enable == 0 && !currentCalibrationActive() && !controllerFaultActive() &&
-        input1[0].cmd > -50 && input1[0].cmd < 50 && input2[0].cmd > -50 && input2[0].cmd < 50) {
-      beepShort(6);
-      beepShort(4);
-      HAL_Delay(100);
-      cmdLFixdt = 0;
-      cmdRFixdt = 0;
-      enable = 1;
-      printf("-- Motors enabled --\r\n");
+    const uint8_t hostMoveRequested = (uint8_t)(input1[0].cmd != 0 || input2[0].cmd != 0 || positionMoveRequested);
+    /* Do not auto-arm the power stage merely because a serial frame arrived.
+     * This keeps generated FOC b_motEna=0 while idle, and its current filter is
+     * reset by the generated model on the next real 0->1 enable transition. */
+    if (!timeoutFlgSerial && profileReady && currentCalibrationValid() && enable == 0u &&
+        hostMoveRequested && !controllerFaultActive()) {
+      enable = 1u;
+      printf("# MOTOR_ARM\r\n");
     }
 
     /* Left and right motor commands are independent. STOP also follows the
@@ -261,6 +262,14 @@ int main(void) {
     generatedModeLeft = genL;
     generatedModeRight = genR;
 
+    /* Smooth STOP: keep bridge enabled while the rate-limited command decays,
+     * then disarm exactly at zero. Timeout follows the same path. */
+    if (!positionMoveRequested && input1[0].cmd == 0 && input2[0].cmd == 0 &&
+        cmdL == 0 && cmdR == 0 && motorControlL == 0 && motorControlR == 0 && enable) {
+      enable = 0u;
+      printf("# MOTOR_DISARM\r\n");
+    }
+
     filtLowPass32(adc_buffer.temp, TEMP_FILT_COEF, &boardTempAdcFixdt);
     boardTempAdcFilt = (int16_t)(boardTempAdcFixdt >> 16);
     board_temp_deg_c = (TEMP_CAL_HIGH_DEG_C - TEMP_CAL_LOW_DEG_C) *
@@ -282,7 +291,8 @@ int main(void) {
      * so the host can detect a rare skipped packet if USART3 DMA is busy. */
     if ((main_loop_counter % (MAIN_LOOP_HZ / TELEMETRY_HZ)) == 0u) {
       const uint32_t scheduledTelemetrySeq = ++telemetrySeq;
-      if (huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
+      if (huart3.hdmatx != NULL && huart3.gState == HAL_UART_STATE_READY &&
+          __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
       feedback.start = SERIAL_START_FRAME;
       /* Report the rate-limited command actually applied to each motor. */
       feedback.cmdL = cmdL;
@@ -312,7 +322,8 @@ int main(void) {
                         (timeoutFlgSerial ? SERIAL_STATUS_TIMEOUT : 0u) |
                         ((ctrlModReq != SVPWM_MODE && rtY_Left.z_errCode) ? SERIAL_STATUS_LEFT_FAULT : 0u) |
                         ((ctrlModReq != SVPWM_MODE && rtY_Right.z_errCode) ? SERIAL_STATUS_RIGHT_FAULT : 0u) |
-                        (currentCalibrationActive() ? SERIAL_STATUS_CALIBRATING : 0u);
+                        (currentCalibrationActive() ? SERIAL_STATUS_CALIBRATING : 0u) |
+                        (currentCalibrationValid() ? SERIAL_STATUS_CAL_VALID : 0u);
       feedback.mode = ctrlModReqRaw;
       feedback.calibration_permille = currentCalibrationProgressPermille();
       feedback.telemetry_seq = scheduledTelemetrySeq;
@@ -326,7 +337,7 @@ int main(void) {
       feedback.hw_profile = HW_PROFILE_ID;
       feedback.foc_isr_cycles_max = foc_isr_cycles_max;
       feedback.checksum = feedbackChecksum(&feedback);
-      HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback, sizeof(feedback));
+      (void)HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback, sizeof(feedback));
       }
     }
 

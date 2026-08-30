@@ -336,65 +336,77 @@ static inline uint8_t encoderSyntheticHall(void) {
 typedef enum {
   CAL_SETTLE = 0,
   CAL_ACCUMULATE = 1,
-  CAL_WAIT_RESET = 2,
-  CAL_DONE = 3
+  CAL_DONE = 2
 } CurrentCalState;
-static volatile CurrentCalState calState = CAL_SETTLE;
-static volatile uint16_t calCount = 0;
-static volatile uint16_t calSettleCount = 0;
-static uint32_t sum_rlA = 0, sum_rlB = 0, sum_rrB = 0, sum_rrC = 0, sum_dcl = 0, sum_dcr = 0;
-static int16_t offsetrlA = 2000, offsetrlB = 2000, offsetrrB = 2000, offsetrrC = 2000;
-static int16_t offsetdcl = 2000, offsetdcr = 2000;
 
-uint8_t currentCalibrationActive(void) { return calState != CAL_DONE; }
-uint8_t currentCalibrationResetPending(void) { return calState == CAL_WAIT_RESET; }
+static volatile CurrentCalState calState = CAL_SETTLE;
+static volatile uint8_t calValid = 0u;
+static volatile uint16_t calCount = 0u;
+static volatile uint16_t calSettleCount = 0u;
+static volatile uint16_t calFailureCount = 0u;
+static uint32_t sum_rlA = 0u, sum_rlB = 0u, sum_rrB = 0u, sum_rrC = 0u, sum_dcl = 0u, sum_dcr = 0u;
+static uint16_t min_rlA = 0xffffu, min_rlB = 0xffffu, min_rrB = 0xffffu, min_rrC = 0xffffu, min_dcl = 0xffffu, min_dcr = 0xffffu;
+static uint16_t max_rlA = 0u, max_rlB = 0u, max_rrB = 0u, max_rrC = 0u, max_dcl = 0u, max_dcr = 0u;
+/* Keep the proven hoverboard midscale defaults until a complete, validated
+ * calibration is available. Never replace these with zero/partial sums. */
+volatile int16_t offsetrlA = 2000, offsetrlB = 2000, offsetrrB = 2000, offsetrrC = 2000;
+volatile int16_t offsetdcl = 2000, offsetdcr = 2000;
+
+static inline void calibrationAccumulatorReset(void) {
+  calCount = 0u;
+  sum_rlA = sum_rlB = sum_rrB = sum_rrC = sum_dcl = sum_dcr = 0u;
+  min_rlA = min_rlB = min_rrB = min_rrC = min_dcl = min_dcr = 0xffffu;
+  max_rlA = max_rlB = max_rrB = max_rrC = max_dcl = max_dcr = 0u;
+}
+
+static inline void calibrationTrack(uint16_t v, uint16_t *mn, uint16_t *mx, uint32_t *sum) {
+  if (v < *mn) *mn = v;
+  if (v > *mx) *mx = v;
+  *sum += v;
+}
+
+static inline uint8_t calibrationChannelValid(uint16_t mean, uint16_t mn, uint16_t mx) {
+  return (uint8_t)(mean >= ADC_CALIBRATION_MIN_RAW && mean <= ADC_CALIBRATION_MAX_RAW &&
+                   mx >= mn && (uint16_t)(mx - mn) <= ADC_CALIBRATION_MAX_SPAN);
+}
+
+uint8_t currentCalibrationActive(void) { return (uint8_t)(calState != CAL_DONE); }
+uint8_t currentCalibrationValid(void) { return calValid; }
+uint16_t currentCalibrationFailureCount(void) { return calFailureCount; }
 
 uint16_t currentCalibrationProgressPermille(void) {
   if (calState == CAL_DONE) return 1000u;
   if (calState == CAL_SETTLE) {
-    return (uint16_t)(((uint32_t)calSettleCount * 250u) / ADC_CALIBRATION_SETTLE_SAMPLES);
+    return (uint16_t)(((uint32_t)calSettleCount * 350u) / ADC_CALIBRATION_SETTLE_SAMPLES);
   }
-  if (calState == CAL_ACCUMULATE) {
-    return (uint16_t)(250u + ((uint32_t)calCount * 700u) / ADC_CALIBRATION_SAMPLES);
-  }
-  return 980u;
+  return (uint16_t)(350u + ((uint32_t)calCount * 650u) / ADC_CALIBRATION_SAMPLES);
 }
 
 void currentCalibrationStart(void) {
   const uint32_t primask = __get_PRIMASK();
   __disable_irq();
-  enable = 0;
+  enable = 0u;
   LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
   RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+  /* Mark invalid first. Motors cannot be re-enabled until a complete candidate
+   * passes range + noise validation. Existing offsets are retained as a safe
+   * fallback and are not overwritten by partial calibration data. */
+  calValid = 0u;
   calState = CAL_SETTLE;
   calSettleCount = 0u;
-  calCount = 0u;
-  sum_rlA = sum_rlB = sum_rrB = sum_rrC = sum_dcl = sum_dcr = 0u;
+  calibrationAccumulatorReset();
   foc_iqL_q4 = foc_iqR_q4 = 0;
   foc_idL_q4 = foc_idR_q4 = 0;
   dqMeasurementReset();
   if (!primask) __enable_irq();
 }
 
-void currentCalibrationFinalizeReset(void) {
-  if (calState != CAL_WAIT_RESET) return;
-  const uint32_t primask = __get_PRIMASK();
-  __disable_irq();
-  /* Match power-on semantics: generated initialize() does not zero every DWork
-   * field, so manual calibration must explicitly clear model state first. */
-  memset(&rtDW_Left, 0, sizeof(rtDW_Left));
-  memset(&rtU_Left, 0, sizeof(rtU_Left));
-  memset(&rtY_Left, 0, sizeof(rtY_Left));
-  memset(&rtDW_Right, 0, sizeof(rtDW_Right));
-  memset(&rtU_Right, 0, sizeof(rtU_Right));
-  memset(&rtY_Right, 0, sizeof(rtY_Right));
-  BLDC_controller_initialize(rtM_Left);
-  BLDC_controller_initialize(rtM_Right);
-  dqMeasurementReset();
-  advancedControlReset();
-  svpwm_phase_l = svpwm_phase_r = 0u;
-  calState = CAL_DONE;
-  if (!primask) __enable_irq();
+static inline void calibrationRetry(void) {
+  if (calFailureCount < 0xffffu) ++calFailureCount;
+  calValid = 0u;
+  calState = CAL_SETTLE;
+  calSettleCount = 0u;
+  calibrationAccumulatorReset();
 }
 
 int16_t        batVoltage       = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE;
@@ -433,22 +445,47 @@ void DMA1_Channel1_IRQHandler(void) {
     buzzerTimer++;
     if (calState == CAL_SETTLE) {
       if (++calSettleCount >= ADC_CALIBRATION_SETTLE_SAMPLES) {
-        calCount = 0u;
-        sum_rlA = sum_rlB = sum_rrB = sum_rrC = sum_dcl = sum_dcr = 0u;
+        calibrationAccumulatorReset();
         calState = CAL_ACCUMULATE;
       }
-    } else if (calState == CAL_ACCUMULATE) {
-      sum_rlA += adc_buffer.rlA; sum_rlB += adc_buffer.rlB;
-      sum_rrB += adc_buffer.rrB; sum_rrC += adc_buffer.rrC;
-      sum_dcl += adc_buffer.dcl; sum_dcr += adc_buffer.dcr;
+    } else {
+      calibrationTrack(adc_buffer.rlA, &min_rlA, &max_rlA, &sum_rlA);
+      calibrationTrack(adc_buffer.rlB, &min_rlB, &max_rlB, &sum_rlB);
+      calibrationTrack(adc_buffer.rrB, &min_rrB, &max_rrB, &sum_rrB);
+      calibrationTrack(adc_buffer.rrC, &min_rrC, &max_rrC, &sum_rrC);
+      calibrationTrack(adc_buffer.dcl, &min_dcl, &max_dcl, &sum_dcl);
+      calibrationTrack(adc_buffer.dcr, &min_dcr, &max_dcr, &sum_dcr);
       if (++calCount >= ADC_CALIBRATION_SAMPLES) {
-        offsetrlA = (int16_t)(sum_rlA / ADC_CALIBRATION_SAMPLES);
-        offsetrlB = (int16_t)(sum_rlB / ADC_CALIBRATION_SAMPLES);
-        offsetrrB = (int16_t)(sum_rrB / ADC_CALIBRATION_SAMPLES);
-        offsetrrC = (int16_t)(sum_rrC / ADC_CALIBRATION_SAMPLES);
-        offsetdcl = (int16_t)(sum_dcl / ADC_CALIBRATION_SAMPLES);
-        offsetdcr = (int16_t)(sum_dcr / ADC_CALIBRATION_SAMPLES);
-        calState = CAL_WAIT_RESET;
+        const uint16_t mean_rlA = (uint16_t)(sum_rlA / ADC_CALIBRATION_SAMPLES);
+        const uint16_t mean_rlB = (uint16_t)(sum_rlB / ADC_CALIBRATION_SAMPLES);
+        const uint16_t mean_rrB = (uint16_t)(sum_rrB / ADC_CALIBRATION_SAMPLES);
+        const uint16_t mean_rrC = (uint16_t)(sum_rrC / ADC_CALIBRATION_SAMPLES);
+        const uint16_t mean_dcl = (uint16_t)(sum_dcl / ADC_CALIBRATION_SAMPLES);
+        const uint16_t mean_dcr = (uint16_t)(sum_dcr / ADC_CALIBRATION_SAMPLES);
+        const uint8_t valid =
+            calibrationChannelValid(mean_rlA, min_rlA, max_rlA) &&
+            calibrationChannelValid(mean_rlB, min_rlB, max_rlB) &&
+            calibrationChannelValid(mean_rrB, min_rrB, max_rrB) &&
+            calibrationChannelValid(mean_rrC, min_rrC, max_rrC) &&
+            calibrationChannelValid(mean_dcl, min_dcl, max_dcl) &&
+            calibrationChannelValid(mean_dcr, min_dcr, max_dcr);
+        if (valid) {
+          /* Atomic swap only after the complete candidate has passed. */
+          offsetrlA = (int16_t)mean_rlA;
+          offsetrlB = (int16_t)mean_rlB;
+          offsetrrB = (int16_t)mean_rrB;
+          offsetrrC = (int16_t)mean_rrC;
+          offsetdcl = (int16_t)mean_dcl;
+          offsetdcr = (int16_t)mean_dcr;
+          calValid = 1u;
+          calState = CAL_DONE;
+          enable = 0u;
+          foc_iqL_q4 = foc_iqR_q4 = 0;
+          foc_idL_q4 = foc_idR_q4 = 0;
+          dqMeasurementReset();
+        } else {
+          calibrationRetry();
+        }
       }
     }
     focIsrMonitorEnd(focIsrStartCycles);
@@ -469,6 +506,21 @@ void DMA1_Channel1_IRQHandler(void) {
   curR_phaB = (int16_t)(offsetrrB - adc_buffer.rrB);
   curR_phaC = (int16_t)(offsetrrC - adc_buffer.rrC);
   curR_DC   = (int16_t)(offsetdcr - adc_buffer.dcr);
+
+  /* Fail closed if a supposedly idle, disabled bridge suddenly reports a huge
+   * zero-current error. This catches lost/corrupted offsets before FOC can see
+   * ~2000-count currents and saturate iq/id at +/-32767. */
+  if (!enable && !encoderSyncActive() &&
+      (ABS(curL_phaA) > ADC_IDLE_RECAL_CURRENT_COUNTS ||
+       ABS(curL_phaB) > ADC_IDLE_RECAL_CURRENT_COUNTS ||
+       ABS(curR_phaB) > ADC_IDLE_RECAL_CURRENT_COUNTS ||
+       ABS(curR_phaC) > ADC_IDLE_RECAL_CURRENT_COUNTS)) {
+    calibrationRetry();
+    LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
+    RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+    focIsrMonitorEnd(focIsrStartCycles);
+    return;
+  }
 
   const uint8_t syncSvpwm = encoderSyncActive();
   const uint8_t runtimeMode = syncSvpwm ? SVPWM_MODE : ctrlModReq;
@@ -610,13 +662,23 @@ void DMA1_Channel1_IRQHandler(void) {
 #ifdef HW_PROFILE_ENC_HALL
     rtY_Left.n_mot = enc_speed_rpm;
 #endif
-    if (generatedType == FOC_CTRL) {
-      foc_iqL_q4 = rtY_Left.iq;
-      foc_idL_q4 = rtY_Left.id;
-    } else {
+    {
       const uint16_t theta_l = electricalDegreesToPhase(rtY_Left.a_elecAngle);
-      measureCurrentDQ(curL_phaA, curL_phaB, 0u, theta_l, 0u, 0,
-                       rtP_Left.cf_currFilt, &dq_filter_l, &foc_iqL_q4, &foc_idL_q4);
+      const uint8_t dqSane = (uint8_t)(ABS(rtY_Left.iq) < 32000 && ABS(rtY_Left.id) < 32000);
+      if (generatedType == FOC_CTRL && leftDriveEnable && dqSane) {
+        foc_iqL_q4 = rtY_Left.iq;
+        foc_idL_q4 = rtY_Left.id;
+      } else {
+        /* At STOP, or if generated dq ever hits int16 saturation despite sane
+         * phase-current ADC deltas, show an independent measurement instead of
+         * a bogus +/-40.95 A value. */
+        measureCurrentDQ(curL_phaA, curL_phaB, 0u, theta_l, 0u, 0,
+                         rtP_Left.cf_currFilt, &dq_filter_l, &foc_iqL_q4, &foc_idL_q4);
+        if (generatedType == FOC_CTRL && leftDriveEnable && !dqSane &&
+            ABS(curL_phaA) < ADC_IDLE_RECAL_CURRENT_COUNTS && ABS(curL_phaB) < ADC_IDLE_RECAL_CURRENT_COUNTS) {
+          enable = 0u; /* fail closed; next genuine start causes clean b_motEna edge */
+        }
+      }
     }
 
     ul = rtY_Left.DC_phaA;
@@ -670,13 +732,20 @@ void DMA1_Channel1_IRQHandler(void) {
     BLDC_controller_step(rtM_Right);
     #endif
     const uint8_t encoding_r = (uint8_t)((hall_ur << 2) + (hall_vr << 1) + hall_wr);
-    if (generatedType == FOC_CTRL) {
-      foc_iqR_q4 = rtY_Right.iq;
-      foc_idR_q4 = rtY_Right.id;
-    } else {
+    {
       const uint16_t theta_r = electricalDegreesToPhase(rtY_Right.a_elecAngle);
-      measureCurrentDQ(curR_phaB, curR_phaC, 1u, theta_r, 0u, 0,
-                       rtP_Right.cf_currFilt, &dq_filter_r, &foc_iqR_q4, &foc_idR_q4);
+      const uint8_t dqSane = (uint8_t)(ABS(rtY_Right.iq) < 32000 && ABS(rtY_Right.id) < 32000);
+      if (generatedType == FOC_CTRL && rightDriveEnable && dqSane) {
+        foc_iqR_q4 = rtY_Right.iq;
+        foc_idR_q4 = rtY_Right.id;
+      } else {
+        measureCurrentDQ(curR_phaB, curR_phaC, 1u, theta_r, 0u, 0,
+                         rtP_Right.cf_currFilt, &dq_filter_r, &foc_iqR_q4, &foc_idR_q4);
+        if (generatedType == FOC_CTRL && rightDriveEnable && !dqSane &&
+            ABS(curR_phaB) < ADC_IDLE_RECAL_CURRENT_COUNTS && ABS(curR_phaC) < ADC_IDLE_RECAL_CURRENT_COUNTS) {
+          enable = 0u;
+        }
+      }
     }
 
     ur = rtY_Right.DC_phaA;

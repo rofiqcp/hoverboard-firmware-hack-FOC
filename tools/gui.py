@@ -16,7 +16,7 @@ except ImportError as exc:
 
 from hoverlink import (
     CMD_MAX, CMD_MIN, CPU_HZ, FOC_BUDGET_CYCLES, MODE_NAMES, TELEMETRY_HZ,
-    CsvLogger, HoverLink, Telemetry, available_ports, clamp_cmd,
+    CsvLogger, HoverLink, Telemetry, available_ports, auto_port, clamp_cmd,
 )
 
 
@@ -172,12 +172,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         calibration = QtWidgets.QGroupBox("Current ADC Calibration"); cf = QtWidgets.QVBoxLayout(calibration)
         self.cal_progress = QtWidgets.QProgressBar(); self.cal_progress.setRange(0, 1000); self.cal_progress.setFormat("%p%")
+        self.cal_status = ValueLabel("waiting")
         self.cal_info = QtWidgets.QLabel(
-            "Automatic every boot and identical for manual calibration: bridge OFF settle 100 ms, "
-            "arithmetic mean of 2000 ADC samples (~125 ms at 16 kHz), then full generated-controller state reset. "
+            "Boot and manual calibration use the same safe path: bridge OFF, 100 ms settle, validated 2000-sample mean. "
+            "A noisy/out-of-range candidate is rejected and retried; partial/zero offsets are never applied. "
             "Manual CALIBRATE requires cmdL/cmdR=0 and |rpm|<=5."
         ); self.cal_info.setWordWrap(True)
-        cf.addWidget(self.cal_progress); cf.addWidget(self.cal_info); cf.addStretch(1)
+        self.cal_offsets_btn = QtWidgets.QPushButton("Read ADC offsets"); self.cal_offsets_btn.clicked.connect(
+            lambda: [self.link.send_debug(f"GET {n}") for n in ("ADC_OFF_RLA","ADC_OFF_RLB","ADC_OFF_RRB","ADC_OFF_RRC","ADC_OFF_DCL","ADC_OFF_DCR") if self.link])
+        cf.addWidget(self.cal_progress); cf.addWidget(self.cal_status); cf.addWidget(self.cal_offsets_btn); cf.addWidget(self.cal_info); cf.addStretch(1)
 
         row.addWidget(system, 2); row.addWidget(raw, 1); row.addWidget(calibration, 2)
         layout.addLayout(row); layout.addStretch(1)
@@ -280,7 +283,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_ports(self) -> None:
         current = self.port_combo.currentText(); ports = available_ports()
         self.port_combo.clear(); self.port_combo.addItems(ports)
-        preferred = "/dev/ttyUSB0" if "/dev/ttyUSB0" in ports else current
+        preferred = current if current in ports else auto_port()
         if preferred in ports: self.port_combo.setCurrentText(preferred)
 
     def toggle_connection(self) -> None:
@@ -299,8 +302,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.target_l = self.target_r = 0
             self.tx_timer.start()
             self.connect_btn.setText("Disconnect")
-            self.statusBar().showMessage(f"Connected {port} @ {self.link.baud}")
-            self.append_console(f"Connected {port} @ {self.link.baud}; firmware telemetry {TELEMETRY_HZ} Hz")
+            self.statusBar().showMessage(f"Connecting {port} @ {self.link.baud} (auto-reconnect enabled)")
+            self.append_console(f"USART3 adapter {port} @ {self.link.baud}; auto-reconnect follows stable USB identity/by-id")
             QtCore.QTimer.singleShot(250, self.reload_parameters)
         except Exception as exc:
             self.link = None; QtWidgets.QMessageBox.critical(self, "Serial error", str(exc))
@@ -317,7 +320,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_btn.setText("Connect"); self.statusBar().showMessage("Disconnected"); self.update_controls()
 
     def on_serial_error(self, message: str) -> None:
-        self.append_console(f"[SERIAL ERROR] {message}"); self.statusBar().showMessage(message)
+        moving = self.target_l != 0 or self.target_r != 0 or bool(self.latest and not self.latest.stopped)
+        self.target_l = self.target_r = 0
+        if moving:
+            self.stop_pending = True
+        self.append_console(f"[SERIAL] {message}")
+        self.statusBar().showMessage("USB-UART disconnected; target forced to 0, auto-reconnecting...")
+        self.update_controls()
 
     # ---------- Control ----------
     def is_fully_stopped(self) -> bool:
@@ -325,8 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def transmit_target(self) -> None:
         if not self.link: return
-        try: self.link.send_command(self.target_l, self.target_r)
-        except Exception as exc: self.on_serial_error(str(exc))
+        self.link.send_command(self.target_l, self.target_r)
 
     def apply_mode(self) -> None:
         if not self.link: return
@@ -339,6 +347,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.link or not self.latest: return
         if self.latest.calibrating:
             QtWidgets.QMessageBox.warning(self, "Calibration", "Wait for ADC calibration to finish."); return
+        if not self.latest.calibration_valid:
+            QtWidgets.QMessageBox.warning(self, "Calibration", "ADC calibration is not valid. Keep motors still and wait/recalibrate."); return
         if not self.is_fully_stopped():
             QtWidgets.QMessageBox.warning(self, "Start", "Controller must be at full STOP first."); return
         if not self.logger.active:
@@ -447,6 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vals = (t.adc_dcl, t.adc_rla, t.adc_rlb, t.adc_dcr, t.adc_rrb, t.adc_rrc)
         for name, val in zip(self.raw_labels, vals): self.raw_labels[name].setText(str(val))
         self.cal_progress.setValue(t.calibration_permille)
+        self.cal_status.setText("VALID" if t.calibration_valid else ("CALIBRATING" if t.calibrating else "INVALID"))
         self.raw_line.setPlainText(t.summary())
         if self.logger.active: self.csv_value.setText(f"{self.logger.rows} rows | missed {self.logger.missed}")
 
@@ -486,7 +497,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.link.send_debug(line); self.append_console(f"> {line}"); self.raw_cmd.clear()
 
     def update_controls(self) -> None:
-        connected = self.link is not None
+        connected = bool(self.link is not None and self.link.is_connected)
         stopped = self.is_fully_stopped()
         calibrating = bool(self.latest and self.latest.calibrating)
         self.mode_btn.setEnabled(connected and stopped and not calibrating)
@@ -494,6 +505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.drive_btn.setEnabled(connected and not self.stop_pending and not calibrating)
         self.stop_btn.setEnabled(connected)
         self.cal_btn.setEnabled(connected and stopped and not calibrating and not self.logger.active)
+        self.cal_offsets_btn.setEnabled(connected)
         self.raw_send_btn.setEnabled(connected); self.raw_cmd.setEnabled(connected)
         self.reload_params_btn.setEnabled(connected); self.save_eeprom_btn.setEnabled(connected and not calibrating)
         for name,widgets in self.param_widgets.items(): widgets[0].setEnabled(connected and name in self.param_defs)

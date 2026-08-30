@@ -58,9 +58,13 @@ static uint8_t debugIndex = 0;
 int _write(int file, char *data, int len) {
   (void)file;
   if (len <= 0) return 0;
-  /* Debug output and binary feedback share USART3. Wait for feedback DMA to finish. */
-  while (huart3.gState != HAL_UART_STATE_READY) { }
-  return (HAL_UART_Transmit(&huart3, (uint8_t *)data, (uint16_t)len, 1000) == HAL_OK) ? len : 0;
+  /* Debug text and binary telemetry share USART3. Never interleave them and
+   * never spin forever if a TX DMA/error leaves HAL busy. */
+  const uint32_t started = HAL_GetTick();
+  while (huart3.gState != HAL_UART_STATE_READY) {
+    if ((HAL_GetTick() - started) > 25u) return 0;
+  }
+  return (HAL_UART_Transmit(&huart3, (uint8_t *)data, (uint16_t)len, 100) == HAL_OK) ? len : 0;
 }
 #endif
 
