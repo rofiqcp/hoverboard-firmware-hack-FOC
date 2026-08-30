@@ -64,7 +64,6 @@ extern int16_t cmdL;
 extern int16_t cmdR;
 extern volatile uint32_t foc_isr_cycles;
 extern volatile uint32_t foc_isr_cycles_max;
-extern volatile int16_t offsetrlA, offsetrlB, offsetrrB, offsetrrC, offsetdcl, offsetdcr;
 
 
 
@@ -75,7 +74,7 @@ static int8_t calibrateCurrentOffsets(void) {
     return 0;
   }
   currentCalibrationStart();
-  printf("# CALIBRATE bridge-off validation + %u-sample mean started\r\n", (unsigned)ADC_CALIBRATION_SAMPLES);
+  printf("# CALIBRATE started samples:%u\r\n", (unsigned)ADC_CALIBRATION_SAMPLES);
   return 1;
 }
 
@@ -196,36 +195,12 @@ const parameter_entry params[] = {
   {VARIABLE,"POS_SPD_REF",ADD_PARAM(enc_position_speed_target_rpm),NULL,0,0,0,0,0,0,0,0,NULL,"Position outer-loop speed target rpm"},
   {VARIABLE,"ENC_E_ANGLE",ADD_PARAM(enc_elec_angle_deg_x10),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder electrical angle deg x10"},
   {VARIABLE,"ENC_SYNC",ADD_PARAM(enc_sync_state),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder sync state"},
-  {VARIABLE,"ADC_OFF_RLA",ADD_PARAM(offsetrlA),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Left phase-A ADC zero offset"},
-  {VARIABLE,"ADC_OFF_RLB",ADD_PARAM(offsetrlB),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Left phase-B ADC zero offset"},
-  {VARIABLE,"ADC_OFF_RRB",ADD_PARAM(offsetrrB),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Right phase-B ADC zero offset"},
-  {VARIABLE,"ADC_OFF_RRC",ADD_PARAM(offsetrrC),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Right phase-C ADC zero offset"},
-  {VARIABLE,"ADC_OFF_DCL",ADD_PARAM(offsetdcl),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Left DC-link ADC zero offset"},
-  {VARIABLE,"ADC_OFF_DCR",ADD_PARAM(offsetdcr),NULL,0,0,0,0,0,0,0,0,NULL,"Calibrated Right DC-link ADC zero offset"},
   {VARIABLE,"FOC_ISR_CYC",ADD_PARAM(foc_isr_cycles),NULL,0,0,0,0,0,0,0,0,NULL,"Last FOC ISR cycles"},
   {VARIABLE,"FOC_ISR_MAX",ADD_PARAM(foc_isr_cycles_max),NULL,0,0,0,0,0,0,0,0,NULL,"Maximum FOC ISR cycles"},
 };
 
 debug_command command;
 int8_t watchParamList[MAX_PARAM_WATCH] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1}; 
-
-static int32_t eepromWordToInternal(uint8_t index, uint16_t word) {
-  switch (params[index].datatype) {
-    case INT8_T:   return (int8_t)(word & 0xffu);
-    case INT16_T:  return (int16_t)word;
-    case UINT8_T:  return (uint8_t)(word & 0xffu);
-    case UINT16_T: return (uint16_t)word;
-    default:       return (int16_t)word; /* persistent entries are <=16 bit */
-  }
-}
-
-static uint8_t eepromWordValidForParam(uint8_t index, uint16_t word) {
-  const int32_t raw = eepromWordToInternal(index, word);
-  const int32_t ext = intToExt(index, raw);
-  if (ext < params[index].min || ext > params[index].max) return 0u;
-  if (strcmp(params[index].name, "ENC_DIR") == 0 && ext == 0) return 0u;
-  return 1u;
-}
 
 // Set Param with Value from external format
 int8_t setParamValExt(uint8_t index, int32_t value) {   
@@ -458,14 +433,13 @@ int8_t saveAllParamVal() {
 
 void loadAllParamVal(void) {
   uint16_t key = 0u;
-  uint16_t invalidCount = 0u;
   paramSilent = 1u;
   HAL_FLASH_Unlock();
   const uint16_t keyStatus = EE_ReadVariable(VirtAddVarTab[0], &key);
   HAL_FLASH_Lock();
   if (keyStatus != 0u || key != FLASH_WRITE_KEY) {
     paramSilent = 0u;
-    printf("# EEPROM schema invalid/old; compiled defaults retained\r\n");
+    printf("# EEPROM not valid; using compiled defaults\r\n");
     return;
   }
   for (int i = 0; i < PARAM_SIZE(params); ++i) {
@@ -474,17 +448,12 @@ void loadAllParamVal(void) {
       HAL_FLASH_Unlock();
       const uint16_t st = EE_ReadVariable(VirtAddVarTab[params[i].addr], &v);
       HAL_FLASH_Lock();
-      if (st == 0u && eepromWordValidForParam((uint8_t)i, v)) {
-        setParamValInt((uint8_t)i, eepromWordToInternal((uint8_t)i, v));
-      } else {
-        ++invalidCount;
-      }
+      if (st == 0u) setParamValInt((uint8_t)i, (int16_t)v);
     }
   }
   advancedControlReset();
   paramSilent = 0u;
-  if (invalidCount) printf("# EEPROM loaded with %u invalid/missing fields ignored\r\n", (unsigned)invalidCount);
-  else printf("# EEPROM loaded to RAM (validated)\r\n");
+  printf("# EEPROM loaded to RAM\r\n");
 }
 
 // Translate from Internal to External format
@@ -525,9 +494,9 @@ int16_t getParamInitInt(uint8_t index){
     EE_ReadVariable(VirtAddVarTab[params[index].addr] , &readVal);
     HAL_FLASH_Lock();
     
-    // EEPROM was written and this specific field is valid, use stored value
-    if (writeCheck == FLASH_WRITE_KEY && eepromWordValidForParam(index, readVal)){
-      return (int16_t)eepromWordToInternal(index, readVal);
+    // EEPROM was written, use stored value
+    if (writeCheck == FLASH_WRITE_KEY){
+      return readVal;
     }else{
       // Use init value from array
       if (params[index].initFormat){

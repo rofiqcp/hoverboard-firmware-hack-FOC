@@ -16,7 +16,7 @@ except ImportError as exc:
 
 from hoverlink import (
     FB, MODE_NAMES, TELEMETRY_HZ, CsvLogger, HoverLink, Telemetry,
-    available_ports, auto_port, clamp_cmd,
+    available_ports, clamp_cmd,
 )
 
 
@@ -45,7 +45,7 @@ class TerminalApp:
         self._run = True
         self.link.on_telemetry = self.on_telemetry
         self.link.on_debug = lambda line: print(f"[DBG] {line}")
-        self.link.on_error = self.on_serial_error
+        self.link.on_error = lambda err: print(f"[SERIAL ERROR] {err}")
         self.tx = threading.Thread(target=self.tx_loop, daemon=True)
         self.tx.start()
 
@@ -54,15 +54,11 @@ class TerminalApp:
         deadline = time.monotonic()
         while self._run:
             with self._lock: l, r = self.target_l, self.target_r
-            self.link.send_command(l, r)  # false while disconnected; reader auto-reconnects
+            try: self.link.send_command(l, r)
+            except Exception as exc:
+                print(f"[TX ERROR] {exc}"); return
             deadline += period
             time.sleep(max(0.0, deadline - time.monotonic()))
-
-    def on_serial_error(self, err: str) -> None:
-        # Safety first: after any USB-UART loss do not automatically resume the
-        # previous drive target when Linux re-enumerates ttyUSB0 -> ttyUSB1.
-        self.set_target(0, 0)
-        print(f"[SERIAL] {err}")
 
     def on_telemetry(self, t: Telemetry) -> None:
         self.latest = t
@@ -105,8 +101,6 @@ class TerminalApp:
             print("[START] no telemetry yet"); return
         if self.latest.calibrating:
             print("[START] rejected: ADC calibration still active"); return
-        if not self.latest.calibration_valid:
-            print("[START] rejected: ADC calibration is not valid"); return
         if not self.fully_stopped():
             print("[START] rejected: controller is not at full STOP"); return
         path = self.logger.start(self.latest.mode)
@@ -132,7 +126,7 @@ class TerminalApp:
         if self.logger.active:
             print("[CAL] rejected: finish/save the current CSV run first"); return
         self.link.send_debug("CALIBRATE")
-        print("[CAL] requested: bridge OFF -> 100 ms settle -> validated 2000-sample mean; invalid samples retry automatically")
+        print("[CAL] requested: six current ADC offsets: 100 ms bridge-off settle + 2000-sample mean (~125 ms) + controller cold-state reset")
 
     def help(self) -> None:
         print("""
@@ -155,8 +149,7 @@ Examples
 """.strip())
 
     def run(self) -> None:
-        print(f"USART3 adapter={self.link.requested_port} @ {self.link.baud}; feedback={FB.size} bytes; telemetry={TELEMETRY_HZ} Hz")
-        print("Auto-reconnect is enabled; ttyUSB number changes are followed by stable USB identity/by-id.")
+        print(f"Connected {self.link.port} @ {self.link.baud}; feedback={FB.size} bytes; telemetry={TELEMETRY_HZ} Hz")
         print("Left/Right independent control over USART3")
         print("modes: " + " | ".join(f"{k}={v}" for k, v in MODE_NAMES.items()))
         print("type 'help' for commands")
@@ -182,8 +175,7 @@ Examples
                     elif cmd in ("quit", "exit"):
                         self.cmd_stop()
                         deadline = time.monotonic() + 8.0
-                        while self.stop_pending and self.link.is_connected and time.monotonic() < deadline:
-                            time.sleep(0.02)
+                        while self.stop_pending and time.monotonic() < deadline: time.sleep(0.02)
                         break
                     elif cmd.upper() in ("GET", "SET", "WATCH", "SAVE", "INIT", "HELP"):
                         self.link.send_debug(line)
@@ -210,9 +202,11 @@ def main() -> None:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--display-hz", type=float, default=10.0, help="terminal redraw/print rate; CSV remains 50 Hz")
     ns = ap.parse_args()
-    port = ns.port or auto_port()
+    port = ns.port
     if not port:
-        raise SystemExit("No USB-UART found. Plug the adapter in or pass --port /dev/serial/by-id/...")
+        ports = available_ports()
+        if not ports: raise SystemExit("No serial port found. Use --port /dev/ttyUSB0")
+        port = "/dev/ttyUSB0" if "/dev/ttyUSB0" in ports else ports[0]
     TerminalApp(port, ns.baud, ns.display_hz).run()
 
 

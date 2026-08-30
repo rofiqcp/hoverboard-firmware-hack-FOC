@@ -61,13 +61,6 @@
 #endif
 #define ADC_CALIBRATION_SETTLE_SAMPLES 1600u /* 100 ms at 16 kHz */
 #define ADC_CALIBRATION_SAMPLES  2000u
-/* Calibration is accepted only when all six zero-current ADC channels are sane
- * and quiet while both bridges are disabled.  These bounds are deliberately
- * broad around the hoverboard midscale (~1900..2000 counts). */
-#define ADC_CALIBRATION_MIN_RAW  1200u
-#define ADC_CALIBRATION_MAX_RAW  2800u
-#define ADC_CALIBRATION_MAX_SPAN 160u
-#define ADC_IDLE_RECAL_CURRENT_COUNTS 300 /* ~6 A with A2BIT_CONV=50 */
 #define TELEMETRY_HZ             50u
 #define MAIN_LOOP_HZ              (1000u / DELAY_IN_MAIN_LOOP)
 #if (MAIN_LOOP_HZ % TELEMETRY_HZ) != 0
@@ -99,7 +92,7 @@
 #define PRI_INPUT1               2, -1000, 0, 1000, 0
 #define PRI_INPUT2               2, -1000, 0, 1000, 0
 #define INPUTS_NR                1
-#define FLASH_WRITE_KEY          0xA35Cu /* schema key: invalidates older/broken EEPROM layouts */
+#define FLASH_WRITE_KEY          0x1002
 
 /* One physical communication interface only: USART3 PB10/PB11. */
 #define CONTROL_SERIAL_USART3    1
@@ -118,6 +111,5 @@
 #define SERIAL_STATUS_LEFT_FAULT (1u << 2)
 #define SERIAL_STATUS_RIGHT_FAULT (1u << 3)
 #define SERIAL_STATUS_CALIBRATING (1u << 4)
-#define SERIAL_STATUS_CAL_VALID   (1u << 5)
 
 #endif

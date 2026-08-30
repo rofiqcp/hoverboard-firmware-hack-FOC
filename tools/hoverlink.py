@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import csv
-import glob
-import os
 import struct
 import threading
 import time
@@ -72,32 +70,7 @@ def make_command(cmd_l: int, cmd_r: int) -> bytes:
 
 
 def available_ports() -> list[str]:
-    """Return stable Linux /dev/serial/by-id links first, then fallback ports.
-
-    ttyUSB numbers are kernel enumeration details and may change after a USB
-    reset/replug.  /dev/serial/by-id identifies the physical USB-UART adapter.
-    """
-    out: list[str] = []
-    if os.name == "posix":
-        out.extend(sorted(glob.glob("/dev/serial/by-id/*")))
-    resolved = {os.path.realpath(x) for x in out}
-    for info in list_ports.comports():
-        if info.device not in out and os.path.realpath(info.device) not in resolved:
-            out.append(info.device)
-    return out
-
-
-def auto_port() -> str | None:
-    ports = available_ports()
-    if not ports:
-        return None
-    # Stable by-id links are already first. Prefer common USB-UART adapters.
-    preferred_tokens = ("Prolific", "FTDI", "CH340", "CP210", "USB-Serial", "usb-")
-    for token in preferred_tokens:
-        for port in ports:
-            if token.lower() in port.lower():
-                return port
-    return ports[0]
+    return [p.device for p in list_ports.comports()]
 
 
 def _feedback_checksum(packet_without_checksum: bytes) -> int:
@@ -152,8 +125,6 @@ class Telemetry:
     @property
     def calibrating(self) -> bool: return bool(self.status & 0x10)
     @property
-    def calibration_valid(self) -> bool: return bool(self.status & 0x20)
-    @property
     def stopped(self) -> bool: return self.cmd_l == 0 and self.cmd_r == 0
     @property
     def battery_v(self) -> float: return self.battery_x100 / 100.0
@@ -194,7 +165,6 @@ class Telemetry:
         if self.left_fault: flags.append("FAULT-L")
         if self.right_fault: flags.append("FAULT-R")
         if self.calibrating: flags.append("CAL")
-        if not self.calibration_valid: flags.append("CAL-INVALID")
         return "/".join(flags)
 
     def summary(self) -> str:
@@ -337,18 +307,11 @@ class CsvLogger:
 
 
 class HoverLink:
-    """Robust USART3 link with stable-device discovery and auto reconnect."""
-
-    def __init__(self, port: str | None = None, baud: int = 115200):
-        self.requested_port = port or auto_port() or "auto"
-        self.port = self.requested_port
-        self.baud = baud
-        self.serial = None
-        self._identity = self._capture_identity(self.requested_port)
+    def __init__(self, port: str, baud: int = 115200):
+        self.port, self.baud = port, baud
+        self.serial = serial.Serial(port, baudrate=baud, timeout=0.05, write_timeout=0.2)
         self._write_lock = threading.Lock()
-        self._serial_lock = threading.Lock()
         self._run = threading.Event(); self._run.set()
-        self._connected = threading.Event()
         self._thread = threading.Thread(target=self._reader, name="hover-usart3-rx", daemon=True)
         self.on_telemetry: Callable[[Telemetry], None] | None = None
         self.on_debug: Callable[[str], None] | None = None
@@ -356,197 +319,63 @@ class HoverLink:
         self.latest: Telemetry | None = None
         self._buffer = bytearray()
         self._text = bytearray()
-        self._binary_resync = False
-        self._last_error = ""
         self._thread.start()
 
-    @property
-    def is_connected(self) -> bool:
-        return self._connected.is_set()
-
-    def _capture_identity(self, port: str):
-        real = os.path.realpath(port) if port and port != "auto" else ""
-        for info in list_ports.comports():
-            if info.device == port or (real and os.path.realpath(info.device) == real):
-                return (info.vid, info.pid, info.serial_number, info.location, info.manufacturer, info.product)
-        return None
-
-    def _resolve_port(self) -> str | None:
-        if self.requested_port != "auto" and os.path.exists(self.requested_port):
-            return self.requested_port
-        if self._identity:
-            vid, pid, serial_no, location, manufacturer, product = self._identity
-            candidates = list(list_ports.comports())
-            # Serial number is strongest, then VID/PID+location, then VID/PID.
-            for info in candidates:
-                if serial_no and info.serial_number == serial_no and info.vid == vid and info.pid == pid:
-                    return info.device
-            for info in candidates:
-                if location and info.location == location and info.vid == vid and info.pid == pid:
-                    return info.device
-            matches = [i.device for i in candidates if i.vid == vid and i.pid == pid]
-            if len(matches) == 1:
-                return matches[0]
-        return auto_port()
-
-    def _open_serial(self) -> bool:
-        path = self._resolve_port()
-        if not path:
-            return False
-        try:
-            kwargs = dict(port=path, baudrate=self.baud, timeout=0.05, write_timeout=0.2)
-            try:
-                ser = serial.Serial(exclusive=True, **kwargs)
-            except (TypeError, ValueError):
-                ser = serial.Serial(**kwargs)
-            try:
-                ser.reset_input_buffer()
-                ser.reset_output_buffer()
-            except Exception:
-                pass
-            with self._serial_lock:
-                old = self.serial
-                self.serial = ser
-                self.port = path
-            if old is not None:
-                try: old.close()
-                except Exception: pass
-            self._buffer.clear(); self._text.clear(); self._binary_resync = False
-            was = self._connected.is_set()
-            self._connected.set()
-            self._last_error = ""
-            if not was and self.on_debug:
-                self.on_debug(f"# SERIAL_CONNECTED {path}")
-            return True
-        except Exception as exc:
-            self._report_error(f"connect {path}: {exc}")
-            return False
-
-    def _report_error(self, message: str) -> None:
-        if message == self._last_error:
-            return
-        self._last_error = message
-        if self.on_error:
-            self.on_error(message)
-
-    def _disconnect(self, reason: str = "") -> None:
-        self._connected.clear()
-        with self._serial_lock:
-            ser, self.serial = self.serial, None
-        if ser is not None:
-            try: ser.close()
-            except Exception: pass
-        self._buffer.clear(); self._text.clear(); self._binary_resync = False
-        if reason:
-            self._report_error(reason)
-
-    def send_command(self, cmd_l: int, cmd_r: int) -> bool:
+    def send_command(self, cmd_l: int, cmd_r: int) -> None:
         payload = make_command(cmd_l, cmd_r)
-        return self._write(payload)
-
-    def send_debug(self, line: str) -> bool:
-        data = line.strip().encode("ascii", errors="ignore") + b"\r\n"
-        return self._write(data)
-
-    def _write(self, data: bytes) -> bool:
-        if not self._connected.is_set():
-            return False
         with self._write_lock:
-            with self._serial_lock:
-                ser = self.serial
-            if ser is None or not ser.is_open:
-                return False
-            try:
-                ser.write(data)
-                return True
-            except Exception as exc:
-                self._disconnect(f"write: {exc}")
-                return False
+            if self.serial.is_open: self.serial.write(payload)
+
+    def send_debug(self, line: str) -> None:
+        data = line.strip().encode("ascii", errors="ignore") + b"\r\n"
+        with self._write_lock:
+            if self.serial.is_open: self.serial.write(data)
 
     def close(self) -> None:
         self._run.clear()
-        self._disconnect()
-        try: self._thread.join(timeout=0.8)
+        try: self._thread.join(timeout=0.5)
         except RuntimeError: pass
+        if self.serial.is_open: self.serial.close()
 
     def _emit_text(self, data: bytes) -> None:
-        if not data:
-            return
-        # Only feed plausible ASCII into the debug line accumulator. Binary
-        # telemetry fragments that fail checksum are discarded, not displayed.
-        for b in data:
-            if b in (9, 10, 13) or 0x20 <= b <= 0x7e:
-                self._text.append(b)
-            else:
-                self._text.clear()
+        if not data: return
+        self._text.extend(data)
         while True:
             pos_n = self._text.find(b"\n")
-            if pos_n < 0:
-                break
+            if pos_n < 0: break
             raw = bytes(self._text[:pos_n + 1]); del self._text[:pos_n + 1]
-            line = raw.decode("ascii", errors="ignore").strip("\r\n\x00")
-            if line and self.on_debug:
-                self.on_debug(line)
-        if len(self._text) > 512:
-            self._text.clear()
-
-    def _parse_buffer(self) -> None:
-        while self._buffer:
-            idx = self._buffer.find(START_BYTES)
-            if idx < 0:
-                keep = 1 if self._buffer[-1:] == START_BYTES[:1] else 0
-                cut = len(self._buffer) - keep
-                if self._binary_resync:
-                    # After a bad binary checksum, all bytes up to the next magic
-                    # belong to the damaged packet. Drop them silently instead of
-                    # ever reinterpreting payload bytes as ASCII debug text.
-                    del self._buffer[:cut]
-                else:
-                    self._emit_text(bytes(self._buffer[:cut])); del self._buffer[:cut]
-                return
-            if idx > 0:
-                if self._binary_resync:
-                    del self._buffer[:idx]
-                else:
-                    self._emit_text(bytes(self._buffer[:idx])); del self._buffer[:idx]
-                continue
-            if len(self._buffer) < FB.size:
-                return
-            packet = bytes(self._buffer[:FB.size])
-            t = decode_feedback(packet)
-            if t is None:
-                # Start marker was inside a damaged packet. Enter binary resync:
-                # discard silently until the next complete valid magic/frame.
-                self._binary_resync = True
-                del self._buffer[:1]
-                continue
-            del self._buffer[:FB.size]
-            self._binary_resync = False
-            self.latest = t
-            if self.on_telemetry:
-                self.on_telemetry(t)
+            line = raw.decode("utf-8", errors="replace").strip("\r\n\x00")
+            if line and self.on_debug: self.on_debug(line)
+        if len(self._text) > 1024:
+            raw = bytes(self._text); self._text.clear()
+            line = raw.decode("utf-8", errors="replace").strip("\r\n\x00")
+            if line and self.on_debug: self.on_debug(line)
 
     def _reader(self) -> None:
-        next_retry = 0.0
-        while self._run.is_set():
-            if not self._connected.is_set():
-                now = time.monotonic()
-                if now < next_retry:
-                    time.sleep(min(0.1, next_retry - now)); continue
-                if not self._open_serial():
-                    next_retry = time.monotonic() + 0.5
-                    time.sleep(0.05)
-                    continue
-            with self._serial_lock:
-                ser = self.serial
-            if ser is None:
-                self._connected.clear(); continue
-            try:
-                data = ser.read(max(1, ser.in_waiting or 1))
-                if data:
-                    self._buffer.extend(data)
-                    self._parse_buffer()
-            except Exception as exc:
-                self._disconnect(f"read: {exc}; reconnecting")
-                next_retry = time.monotonic() + 0.25
-
+        try:
+            while self._run.is_set():
+                data = self.serial.read(max(1, self.serial.in_waiting or 1))
+                if not data: continue
+                self._buffer.extend(data)
+                while self._buffer:
+                    idx = self._buffer.find(START_BYTES)
+                    if idx < 0:
+                        keep = 1 if self._buffer[-1:] == START_BYTES[:1] else 0
+                        cut = len(self._buffer) - keep
+                        self._emit_text(bytes(self._buffer[:cut])); del self._buffer[:cut]
+                        break
+                    if idx > 0:
+                        self._emit_text(bytes(self._buffer[:idx])); del self._buffer[:idx]
+                        continue
+                    if len(self._buffer) < FB.size: break
+                    packet = bytes(self._buffer[:FB.size])
+                    t = decode_feedback(packet)
+                    if t is None:
+                        self._emit_text(bytes(self._buffer[:1])); del self._buffer[:1]
+                        continue
+                    del self._buffer[:FB.size]
+                    self.latest = t
+                    if self.on_telemetry: self.on_telemetry(t)
+        except Exception as exc:
+            if self._run.is_set() and self.on_error:
+                self.on_error(str(exc))
