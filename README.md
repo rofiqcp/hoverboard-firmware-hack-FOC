@@ -1,3 +1,54 @@
+# VESC HOVERBOARD RUNTIME MOTOR CORE — FINAL
+
+This branch is the refactored STM32F103RCT6 dual-motor build. The motor-control ownership is now concentrated in exactly seven files under `Src/motor/`:
+
+- `mcpwm_foc.c/.h` — DMA motor ISR, current calibration, Hall/open-loop/encoder phase handling, six-step, sine PWM, FOC, Clarke/Park, PI current control, sine LUT and SVPWM.
+- `mc_interface.c/.h` — VESC-style application API, runtime sensor/comm/control selection, speed/position outer loops, encoder AB re-init and `live on/off`.
+- `foc_math.c/.h` — fixed-point Clarke/Park/inverse-Park helpers.
+- `mcconf_default.h` — runtime mode IDs and outer-loop defaults.
+
+Only one PlatformIO environment exists: `vesc_hoverboard`.
+
+## Runtime commands
+
+Use `tools/hoverserial.py`. Mode changes are only accepted while stopped (`command=0`, applied target=0, measured RPM <=5).
+
+```text
+mode sensor 1             # both: open-loop / no feedback sensor
+mode sensor 2             # both: Hall
+mode sensor left 3        # Left only: encoder AB; TIM4 is re-initialized/enabled
+
+mode comm 1               # both: six-step commutation
+mode comm 2               # both: sine PWM
+mode comm 3               # both: SVPWM / FOC
+
+mode control 1            # both: PWM/duty
+mode control 2            # both: current
+mode control 3            # both: closed-loop speed
+mode control left 4       # Left only: position; requires Left sensor 3
+
+live on
+live off
+start 100,100             # in control 3: exactly +100 mechanical RPM each; LIVE turns on
+stop                      # immediate zero command
+```
+
+An omitted side applies to both motors. `mode sensor 3` is intentionally rejected because Right has no encoder. Closed-loop speed is rejected in sensor mode 1 because this port currently has open-loop generation, not a sensorless closed-loop observer.
+
+## Speed-control fix
+
+The previous speed loop stored its integral in x1000 units but multiplied the integration increment by another `1000`, causing rapid wind-up. At a requested 100 RPM the captured firmware stayed around 400–460 RPM. The new loop integrates once with the real 200-Hz `dt`, has conditional anti-windup, and permits negative torque for overspeed braking. `start 100,100` in `mode control 3` is direct RPM; it is no longer normalized through `N_MOT_MAX`.
+
+Useful debug variables without changing the binary telemetry frame are `SPD_SET_L/R`, `SPD_ERR_L/R`, and `SPD_OUT_L/R`.
+
+## ADC / ISR safety
+
+`MX_ADC1_Init`, `MX_ADC2_Init`, and the `DMA1_Channel1_IRQHandler` prefix through all six current samples are byte-for-byte identical to the previously validated ADC/STOP source. TIM1/TIM8 PWM and ADC trigger setup are unchanged; only TIM4 encoder ownership is runtime-managed. See `VALIDATION_VESC_HOVERBOARD_FINAL.md` for hashes and test results.
+
+> Note: this environment does not contain PlatformIO or `arm-none-eabi-gcc`, so the archive is host-validated/source-audited, not claimed as an on-hardware ARM build or bench run.
+
+---
+
 # hoverboard-firmware-hack-FOC
 [![Build Status](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC.svg?branch=master)](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)

@@ -31,25 +31,16 @@ FOC_BUDGET_CYCLES = CPU_HZ // FOC_HZ
 CMD_MIN = -1000
 CMD_MAX = 1000
 
-MODE_NAMES = {
-    1: "FOC VLT",
-    2: "FOC SPD",
-    3: "FOC TRQ",
-    4: "SVPWM sensorless",
-    5: "6-step commutation",
-    6: "Sine PWM",
-    7: "Position cascade (enc_hall Left)",
-}
+SENSOR_NAMES = {1: "OPENLOOP", 2: "HALL", 3: "ENCODER_AB"}
+COMM_NAMES = {1: "SIX_STEP", 2: "SINE_PWM", 3: "SVPWM"}
+CONTROL_NAMES = {1: "PWM", 2: "CURRENT", 3: "SPEED", 4: "POSITION"}
 
-DQ_REFERENCES = {
-    1: "generated rotor dq",
-    2: "generated rotor dq",
-    3: "generated rotor dq",
-    4: "commanded stator dq (measurement only)",
-    5: "generated electrical-angle dq (measurement only)",
-    6: "generated electrical-angle dq (measurement only)",
-    7: "encoder rotor dq (position→speed→torque→FOC)",
-}
+
+def unpack_mode_word(word: int) -> tuple[int, int, int, int, int, int]:
+    return (word & 0x7, (word >> 3) & 0x7,
+            (word >> 6) & 0x3, (word >> 8) & 0x3,
+            (word >> 10) & 0x3, (word >> 12) & 0x3)
+
 
 
 def clamp_cmd(value: int) -> int:
@@ -125,6 +116,12 @@ class Telemetry:
     @property
     def calibrating(self) -> bool: return bool(self.status & 0x10)
     @property
+    def adc_current_valid(self) -> bool: return bool(self.status & 0x20)
+    @property
+    def adc_left_valid(self) -> bool: return bool(self.status & 0x40)
+    @property
+    def adc_right_valid(self) -> bool: return bool(self.status & 0x80)
+    @property
     def stopped(self) -> bool: return self.cmd_l == 0 and self.cmd_r == 0
     @property
     def battery_v(self) -> float: return self.battery_x100 / 100.0
@@ -149,14 +146,32 @@ class Telemetry:
     @property
     def foc_max_us(self) -> float: return self.foc_cycles_max * 1_000_000.0 / CPU_HZ
     @property
-    def hw_profile_name(self) -> str: return {1: "two_hall", 2: "enc_hall"}.get(self.hw_profile, f"profile{self.hw_profile}")
+    def hw_profile_name(self) -> str: return {3: "vesc_hoverboard"}.get(self.hw_profile, f"profile{self.hw_profile}")
     @property
     def encoder_sync_text(self) -> str:
         return {0:"idle",1:"wait-cal",2:"sweep",3:"align-hold",4:"return",5:"ready",6:"failed"}.get(self.encoder_sync_state, str(self.encoder_sync_state))
     @property
-    def mode_name(self) -> str: return MODE_NAMES.get(self.mode, f"MODE {self.mode}")
+    def mode_fields(self) -> tuple[int, int, int, int, int, int]: return unpack_mode_word(self.mode)
     @property
-    def dq_reference(self) -> str: return DQ_REFERENCES.get(self.mode, "unknown")
+    def control_l(self) -> int: return self.mode_fields[0]
+    @property
+    def control_r(self) -> int: return self.mode_fields[1]
+    @property
+    def comm_l(self) -> int: return self.mode_fields[2]
+    @property
+    def comm_r(self) -> int: return self.mode_fields[3]
+    @property
+    def sensor_l(self) -> int: return self.mode_fields[4]
+    @property
+    def sensor_r(self) -> int: return self.mode_fields[5]
+    @property
+    def mode_name(self) -> str:
+        return (f"CTL {CONTROL_NAMES.get(self.control_l,self.control_l)}/{CONTROL_NAMES.get(self.control_r,self.control_r)} | "
+                f"COMM {COMM_NAMES.get(self.comm_l,self.comm_l)}/{COMM_NAMES.get(self.comm_r,self.comm_r)} | "
+                f"SENS {SENSOR_NAMES.get(self.sensor_l,self.sensor_l)}/{SENSOR_NAMES.get(self.sensor_r,self.sensor_r)}")
+    @property
+    def dq_reference(self) -> str:
+        return "rotor dq" if self.comm_l == 3 or self.comm_r == 3 else "measurement dq"
 
     @property
     def status_text(self) -> str:
@@ -165,12 +180,13 @@ class Telemetry:
         if self.left_fault: flags.append("FAULT-L")
         if self.right_fault: flags.append("FAULT-R")
         if self.calibrating: flags.append("CAL")
+        flags.append("ADC-OK" if self.adc_current_valid else f"ADC-L{int(self.adc_left_valid)}R{int(self.adc_right_valid)}")
         return "/".join(flags)
 
     def summary(self) -> str:
         """Fixed width output: columns stay aligned while values change."""
         return (
-            f"M{self.mode:d} "
+            f"M0x{self.mode:04X} "
             f"cmd={self.cmd_l:+5d},{self.cmd_r:+5d}  "
             f"rpm={self.rpm_l:+5d},{self.rpm_r:+5d}  "
             f"iq={self.iq_l_a:+7.2f},{self.iq_r_a:+7.2f}A  "
@@ -214,7 +230,7 @@ class CsvLogger:
         "hallL", "hallR", "dcl_raw", "rla_raw", "rlb_raw", "dcr_raw", "rrb_raw", "rrc_raw",
         "battery_V", "temperature_C", "foc_isr_cycles", "foc_isr_us", "foc_isr_load_pct",
         "encoder_position", "position_target", "position_speed_ref_rpm", "encoder_elec_angle_deg", "encoder_rpm", "encoder_sync_state", "encoder_sync_text", "hw_profile", "hw_profile_name", "foc_isr_cycles_max",
-        "enabled", "timeout", "left_fault", "right_fault", "calibrating", "calibration_pct",
+        "enabled", "timeout", "left_fault", "right_fault", "calibrating", "adc_current_valid", "adc_left_valid", "adc_right_valid", "calibration_pct",
     ]
 
     def __init__(self, directory: Path):
@@ -246,7 +262,7 @@ class CsvLogger:
             if self._fp is not None:
                 return self._path  # type: ignore[return-value]
             self.directory.mkdir(parents=True, exist_ok=True)
-            suffix = f"_mode{mode}" if mode in MODE_NAMES else ""
+            suffix = f"_mode{mode:04x}" if mode is not None else ""
             self._path = self.directory / f"hover_{datetime.now():%Y%m%d_%H%M%S}{suffix}.csv"
             self._fp = self._path.open("w", newline="", encoding="utf-8")
             self._writer = csv.DictWriter(self._fp, fieldnames=self.FIELDNAMES)
@@ -291,6 +307,8 @@ class CsvLogger:
                 "encoder_sync_text": t.encoder_sync_text, "hw_profile": t.hw_profile, "hw_profile_name": t.hw_profile_name,
                 "foc_isr_cycles_max": t.foc_cycles_max,
                 "right_fault": int(t.right_fault), "calibrating": int(t.calibrating),
+                "adc_current_valid": int(t.adc_current_valid),
+                "adc_left_valid": int(t.adc_left_valid), "adc_right_valid": int(t.adc_right_valid),
                 "calibration_pct": f"{t.calibration_permille / 10.0:.1f}",
             })
             self._rows += 1

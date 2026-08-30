@@ -40,26 +40,10 @@
 #define COM_CTRL                 0
 #define SIN_CTRL                 1
 #define FOC_CTRL                 2
-#define OPEN_MODE                0
-#define VLT_MODE                 1
-#define SPD_MODE                 2
-#define TRQ_MODE                 3
-#define SVPWM_MODE               4
-#define COMMUTATION_MODE         5
-#define SINE_MODE                6
-#define POSITION_MODE            7
 #define MOTOR_LEFT_ENA
 #define MOTOR_RIGHT_ENA
-#define CTRL_MOD_REQ             SPD_MODE
-
-#if defined(HW_PROFILE_ENC_HALL)
-#define HW_PROFILE_ID            2u
-#define CTRL_MODE_MAX            POSITION_MODE
-#else
-#define HW_PROFILE_ID            1u
-#define CTRL_MODE_MAX            SINE_MODE
-#endif
-#define ADC_CALIBRATION_SETTLE_SAMPLES 1600u /* 100 ms at 16 kHz */
+/* One image. Runtime sensor/comm/control selection lives in mc_interface. */
+#define HW_PROFILE_ID            3u
 #define ADC_CALIBRATION_SAMPLES  2000u
 #define TELEMETRY_HZ             50u
 #define MAIN_LOOP_HZ              (1000u / DELAY_IN_MAIN_LOOP)
@@ -111,5 +95,8 @@
 #define SERIAL_STATUS_LEFT_FAULT (1u << 2)
 #define SERIAL_STATUS_RIGHT_FAULT (1u << 3)
 #define SERIAL_STATUS_CALIBRATING (1u << 4)
+#define SERIAL_STATUS_ADC_CURRENT_VALID (1u << 5)
+#define SERIAL_STATUS_ADC_LEFT_VALID    (1u << 6)
+#define SERIAL_STATUS_ADC_RIGHT_VALID   (1u << 7)
 
 #endif

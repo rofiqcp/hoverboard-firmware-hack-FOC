@@ -15,7 +15,7 @@ except ImportError as exc:
     raise SystemExit("Install GUI requirements: python3 -m pip install -r tools/requirements.txt") from exc
 
 from hoverlink import (
-    CMD_MAX, CMD_MIN, CPU_HZ, FOC_BUDGET_CYCLES, MODE_NAMES, TELEMETRY_HZ,
+    CMD_MAX, CMD_MIN, CPU_HZ, FOC_BUDGET_CYCLES, TELEMETRY_HZ,
     CsvLogger, HoverLink, Telemetry, available_ports, clamp_cmd,
 )
 
@@ -115,8 +115,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_btn = QtWidgets.QPushButton("Refresh"); self.refresh_btn.clicked.connect(self.refresh_ports)
         self.baud_combo = QtWidgets.QComboBox(); self.baud_combo.addItems(["115200", "230400", "460800"]); self.baud_combo.setCurrentText("115200")
         self.connect_btn = QtWidgets.QPushButton("Connect"); self.connect_btn.clicked.connect(self.toggle_connection)
-        self.mode_combo = QtWidgets.QComboBox()
-        for mode, name in MODE_NAMES.items(): self.mode_combo.addItem(f"{mode} — {name}", mode)
+        self.mode_kind = QtWidgets.QComboBox(); self.mode_kind.addItems(["sensor", "comm", "control"])
+        self.mode_side = QtWidgets.QComboBox(); self.mode_side.addItem("Both", ""); self.mode_side.addItem("Left", "left"); self.mode_side.addItem("Right", "right")
+        self.mode_select_value = QtWidgets.QSpinBox(); self.mode_select_value.setRange(1, 4); self.mode_select_value.setValue(2)
         self.mode_btn = QtWidgets.QPushButton("Apply Mode"); self.mode_btn.clicked.connect(self.apply_mode)
         self.cmd_l = QtWidgets.QSpinBox(); self.cmd_r = QtWidgets.QSpinBox()
         for spin in (self.cmd_l, self.cmd_r):
@@ -129,7 +130,8 @@ class MainWindow(QtWidgets.QMainWindow):
         g.addWidget(QtWidgets.QLabel("Port"), 0, 0); g.addWidget(self.port_combo, 0, 1)
         g.addWidget(self.refresh_btn, 0, 2); g.addWidget(QtWidgets.QLabel("Baud"), 0, 3)
         g.addWidget(self.baud_combo, 0, 4); g.addWidget(self.connect_btn, 0, 5)
-        g.addWidget(QtWidgets.QLabel("Mode"), 1, 0); g.addWidget(self.mode_combo, 1, 1, 1, 2); g.addWidget(self.mode_btn, 1, 3)
+        g.addWidget(QtWidgets.QLabel("Mode"), 1, 0); g.addWidget(self.mode_kind, 1, 1)
+        g.addWidget(self.mode_side, 1, 2); g.addWidget(self.mode_select_value, 1, 3); g.addWidget(self.mode_btn, 1, 4)
         g.addWidget(QtWidgets.QLabel("cmdL"), 2, 0); g.addWidget(self.cmd_l, 2, 1)
         g.addWidget(QtWidgets.QLabel("cmdR"), 2, 2); g.addWidget(self.cmd_r, 2, 3)
         g.addWidget(self.start_btn, 2, 4); g.addWidget(self.drive_btn, 2, 5)
@@ -173,8 +175,8 @@ class MainWindow(QtWidgets.QMainWindow):
         calibration = QtWidgets.QGroupBox("Current ADC Calibration"); cf = QtWidgets.QVBoxLayout(calibration)
         self.cal_progress = QtWidgets.QProgressBar(); self.cal_progress.setRange(0, 1000); self.cal_progress.setFormat("%p%")
         self.cal_info = QtWidgets.QLabel(
-            "Automatic every boot and identical for manual calibration: bridge OFF settle 100 ms, "
-            "arithmetic mean of 2000 ADC samples (~125 ms at 16 kHz), then full generated-controller state reset. "
+            "Automatic every boot and identical for manual calibration: bridge OFF, then the proven "
+            "2000-sample recursive offset convergence (~125 ms at 16 kHz), followed by controller state reset. "
             "Manual CALIBRATE requires cmdL/cmdR=0 and |rpm|<=5."
         ); self.cal_info.setWordWrap(True)
         cf.addWidget(self.cal_progress); cf.addWidget(self.cal_info); cf.addStretch(1)
@@ -261,7 +263,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("Firmware debug / response"))
         self.console = QtWidgets.QPlainTextEdit(); self.console.setReadOnly(True); self.console.setMaximumBlockCount(1000); self.console.setFont(f)
         layout.addWidget(self.console, 1)
-        send = QtWidgets.QHBoxLayout(); self.raw_cmd = QtWidgets.QLineEdit(); self.raw_cmd.setPlaceholderText("GET FOC_ISR_CYC  |  GET CTRL_MOD  |  HELP")
+        send = QtWidgets.QHBoxLayout(); self.raw_cmd = QtWidgets.QLineEdit(); self.raw_cmd.setPlaceholderText("GET FOC_ISR_CYC | mode control 3 | live on | HELP")
         self.raw_cmd.returnPressed.connect(self.send_raw_debug)
         self.raw_send_btn = QtWidgets.QPushButton("Send"); self.raw_send_btn.clicked.connect(self.send_raw_debug)
         send.addWidget(self.raw_cmd, 1); send.addWidget(self.raw_send_btn); layout.addLayout(send)
@@ -332,8 +334,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.link: return
         if not self.is_fully_stopped():
             QtWidgets.QMessageBox.warning(self, "Mode", "Mode can change only after STOP and cmd=0,0."); return
-        mode = int(self.mode_combo.currentData())
-        self.link.send_debug(f"SET CTRL_MOD {mode}"); self.append_console(f"[MODE] requested {mode}={MODE_NAMES[mode]}")
+        kind = self.mode_kind.currentText().lower()
+        side = str(self.mode_side.currentData())
+        value = int(self.mode_select_value.value())
+        if kind in ("sensor", "comm") and value > 3:
+            QtWidgets.QMessageBox.warning(self, "Mode", f"{kind} supports only 1..3"); return
+        if kind == "sensor" and value == 3 and side != "left":
+            QtWidgets.QMessageBox.warning(self, "Mode", "Encoder AB (sensor 3) is Left-only; select Left."); return
+        if kind == "control" and value == 4 and side != "left":
+            QtWidgets.QMessageBox.warning(self, "Mode", "Position control (control 4) requires explicit Left + encoder AB."); return
+        command = f"mode {kind}" + (f" {side}" if side else "") + f" {value}"
+        self.link.send_debug(command); self.append_console(f"[MODE] requested: {command}")
 
     def start_run(self) -> None:
         if not self.link or not self.latest: return
@@ -341,6 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Calibration", "Wait for ADC calibration to finish."); return
         if not self.is_fully_stopped():
             QtWidgets.QMessageBox.warning(self, "Start", "Controller must be at full STOP first."); return
+        self.link.send_debug("live on")
         if not self.logger.active:
             path = self.logger.start(self.latest.mode); self.append_console(f"[CSV] 50-Hz recording -> {path}")
         self.target_l = clamp_cmd(self.cmd_l.value()); self.target_r = clamp_cmd(self.cmd_r.value())
@@ -356,7 +368,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def stop_run(self) -> None:
         if not self.link: return
         self.target_l = self.target_r = 0; self.stop_pending = True; self.stop_zero_frames = 0
-        self.append_console("[STOP] target=0,0; firmware rate limiter remains active ..."); self.update_controls()
+        # Do not wait for the next 50-Hz TX timer slot: send the authoritative
+        # zero command immediately. Firmware also bypasses its smoothing on STOP.
+        self.transmit_target()
+        self.append_console("[STOP] immediate target=0,0; firmware zero-vector STOP requested"); self.update_controls()
 
     def calibrate(self) -> None:
         if not self.link: return
@@ -459,7 +474,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stop_zero_frames = self.stop_zero_frames + 1 if t.stopped else 0
             if self.stop_zero_frames >= 3:
                 self.stop_pending = False
-                self.append_console("[STOP] cmdL=0 cmdR=0 confirmed after rate limiter")
+                self.append_console("[STOP] cmdL=0 cmdR=0 confirmed")
                 self.finish_csv()
                 self.update_controls()
         if self.eeprom_save_pending and self.link and t.stopped and abs(t.rpm_l) <= 5 and abs(t.rpm_r) <= 5 and not self.stop_pending:

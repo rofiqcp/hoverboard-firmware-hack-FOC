@@ -32,7 +32,6 @@ enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,INT,FLOAT};
     int8_t:     INT8_T, \
     int16_t:    INT16_T, \
     int32_t:    INT32_T, \
-    int:        INT, \
     float:      FLOAT)
 
 #define PARAM_SIZE(param) sizeof(param) / sizeof(parameter_entry)

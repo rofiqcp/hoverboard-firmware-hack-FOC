@@ -1,0 +1,1483 @@
+--- a/Src/bldc.c
++++ b/Src/bldc.c
+@@ -69,6 +69,13 @@
+ volatile int16_t m_foc_iq_right_q4 = 0;
+ volatile int16_t m_foc_id_left_q4 = 0;
+ volatile int16_t m_foc_id_right_q4 = 0;
++volatile uint16_t m_sensor_hall_left = 0;
++volatile uint16_t m_sensor_hall_right = 0;
++volatile int16_t m_sensor_rpm_left = 0;
++volatile int16_t m_sensor_rpm_right = 0;
++volatile uint8_t m_adc_current_valid = 0;
++volatile uint8_t m_adc_current_valid_left = 0;
++volatile uint8_t m_adc_current_valid_right = 0;
+ 
+ static inline void focIsrMonitorEnd(uint32_t start_cycles) {
+   const uint32_t elapsed = DWT->CYCCNT - start_cycles;
+@@ -134,13 +141,10 @@
+ static uint8_t m_dq_last_runtime_mode = 0xffu;
+ 
+ static inline void dqMeasurementReset(void) {
++  /* D/Q filters are mode-dependent, but physical sensor acquisition is not.
++   * Never reset Hall edge timing merely because the control mode changed. */
+   m_dq_filter_left.iq_state = m_dq_filter_left.id_state = 0;
+   m_dq_filter_right.iq_state = m_dq_filter_right.id_state = 0;
+-  m_hall_speed_left.initialized = m_hall_speed_right.initialized = 0;
+-  m_hall_speed_left.ticks = m_hall_speed_right.ticks = 0;
+-  m_hall_speed_left.period = m_hall_speed_right.period = 0;
+-  m_hall_speed_left.direction = m_hall_speed_right.direction = 0;
+-  m_hall_speed_left.rpm = m_hall_speed_right.rpm = 0;
+ }
+ 
+ static inline int16_t dqLowPassQ4(int16_t input, uint16_t coef, int32_t *state) {
+@@ -366,7 +370,12 @@
+   m_current_cal_count = 0u;
+   m_foc_iq_left_q4 = m_foc_iq_right_q4 = 0;
+   m_foc_id_left_q4 = m_foc_id_right_q4 = 0;
++  m_adc_current_valid = 0u;
++  m_adc_current_valid_left = 0u;
++  m_adc_current_valid_right = 0u;
+   dqMeasurementReset();
++  memset(&m_hall_speed_left, 0, sizeof(m_hall_speed_left));
++  memset(&m_hall_speed_right, 0, sizeof(m_hall_speed_right));
+ 
+   if (!primask) __enable_irq();
+ }
+@@ -402,6 +411,9 @@
+   // HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+ 
+   if (m_current_cal_count < ADC_CALIBRATION_SAMPLES) {  // automatic boot or manual ADC offset calibration
++    m_adc_current_valid = 0u;
++    m_adc_current_valid_left = 0u;
++    m_adc_current_valid_right = 0u;
+     m_current_cal_count++;
+     m_current_offset_phase_a_left = (m_adc_buffer.rlA + m_current_offset_phase_a_left) / 2;
+     m_current_offset_phase_b_left = (m_adc_buffer.rlB + m_current_offset_phase_b_left) / 2;
+@@ -429,6 +441,28 @@
+   m_current_phase_c_right = (int16_t)(m_current_offset_phase_c_right - m_adc_buffer.rrC);
+   m_current_input_right   = (int16_t)(m_current_offset_input_right - m_adc_buffer.dcr);
+ 
++  /* Acquire all available position/speed sensors before selecting a control
++   * algorithm. Telemetry therefore keeps working in VLT/SPD/TRQ/SVPWM/COM/SIN
++   * and POSITION modes instead of being tied to the active controller. */
++#ifdef HW_PROFILE_ENC_HALL
++  const uint8_t hall_code_left_sensor = encoderSyntheticHall();
++  m_sensor_hall_left = hall_code_left_sensor;
++  m_sensor_rpm_left = m_encoder_rpm;
++#else
++  const uint8_t hall_u_left_sensor = !(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN);
++  const uint8_t hall_v_left_sensor = !(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN);
++  const uint8_t hall_w_left_sensor = !(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
++  const uint8_t hall_code_left_sensor = (uint8_t)((hall_u_left_sensor << 2) + (hall_v_left_sensor << 1) + hall_w_left_sensor);
++  m_sensor_hall_left = hall_code_left_sensor;
++  m_sensor_rpm_left = hallSpeedUpdate(hall_code_left_sensor, m_mcconf_1.si_motor_pole_pairs, &m_hall_speed_left);
++#endif
++  const uint8_t hall_u_right_sensor = !(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN);
++  const uint8_t hall_v_right_sensor = !(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN);
++  const uint8_t hall_w_right_sensor = !(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
++  const uint8_t hall_code_right_sensor = (uint8_t)((hall_u_right_sensor << 2) + (hall_v_right_sensor << 1) + hall_w_right_sensor);
++  m_sensor_hall_right = hall_code_right_sensor;
++  m_sensor_rpm_right = hallSpeedUpdate(hall_code_right_sensor, m_mcconf_2.si_motor_pole_pairs, &m_hall_speed_right);
++
+   const uint8_t svpwm_sync_active = encoder_sync_active();
+   const uint8_t control_mode_now = svpwm_sync_active ? SVPWM_MODE : m_control_mode_request;
+   const uint8_t svpwm_mode_active = (control_mode_now == SVPWM_MODE);
+@@ -454,20 +488,30 @@
+       (ABS(m_current_phase_a_left) > (m_mcconf_1.l_current_max >> 4) || ABS(m_current_phase_b_left) > (m_mcconf_1.l_current_max >> 4) || ABS(current_phase_c_left) > (m_mcconf_1.l_current_max >> 4));
+   const uint8_t phase_current_trip_right = svpwm_mode_active &&
+       (ABS(m_current_phase_b_right) > (m_mcconf_2.l_current_max >> 4) || ABS(m_current_phase_c_right) > (m_mcconf_2.l_current_max >> 4) || ABS(current_phase_a_right) > (m_mcconf_2.l_current_max >> 4));
+-  const uint8_t svpwm_idle_left = svpwm_mode_active && (m_motor_target_left == 0) && !encoder_sync_hold_vector();
+-  const uint8_t svpwm_idle_right = svpwm_mode_active && (m_motor_target_right == 0);
+-
+-  if (ABS(m_current_input_left) > m_current_input_max || phase_current_trip_left || svpwm_idle_left || !drive_enable_left) {
+-    LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
+-  } else {
+-    LEFT_TIM->BDTR |= TIM_BDTR_MOE;
+-  }
+-
+-  if (ABS(m_current_input_right) > m_current_input_max || phase_current_trip_right || svpwm_idle_right || !drive_enable_right) {
+-    RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+-  } else {
+-    RIGHT_TIM->BDTR |= TIM_BDTR_MOE;
+-  }
++  /* Normal STOP and soft phase-current limiting use a synchronous zero vector,
++   * not a tri-state bridge. On this hoverboard current-sense front end the ADC
++   * phase channels are only repeatable when the half bridges stay in the same
++   * PWM common-mode condition. Clearing MOE makes the phase nodes float and the
++   * raw ADC values can jump from the calibrated ~2k midpoint to ~0/~4k.
++   *
++   * Therefore MOE is reserved for a HARD inhibit only (DC-input overcurrent or
++   * drive disabled by timeout/fault/calibration/power state). Open-loop phase
++   * overcurrent is handled below by forcing 50/50/50 zero-vector PWM while MOE
++   * remains on, so the next ADC sample is still valid. */
++  const uint8_t hard_inhibit_left = (uint8_t)(ABS(m_current_input_left) > m_current_input_max ||
++                                             !drive_enable_left);
++  const uint8_t hard_inhibit_right = (uint8_t)(ABS(m_current_input_right) > m_current_input_max ||
++                                              !drive_enable_right);
++
++  if (hard_inhibit_left) LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
++  else LEFT_TIM->BDTR |= TIM_BDTR_MOE;
++
++  if (hard_inhibit_right) RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
++  else RIGHT_TIM->BDTR |= TIM_BDTR_MOE;
++
++  m_adc_current_valid_left = (uint8_t)(!hard_inhibit_left);
++  m_adc_current_valid_right = (uint8_t)(!hard_inhibit_right);
++  m_adc_current_valid = (uint8_t)(m_adc_current_valid_left && m_adc_current_valid_right);
+ 
+   // Create square wave for buzzer
+   m_buzzer_timer++;
+@@ -512,12 +556,6 @@
+   m_motor_1.m_input.current_input = m_current_input_left;
+ 
+   if (svpwm_mode_active) {
+-#ifndef HW_PROFILE_ENC_HALL
+-    const uint8_t hall_u_left = !(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN);
+-    const uint8_t hall_v_left = !(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN);
+-    const uint8_t hall_w_left = !(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
+-    const uint8_t hall_code_left = (uint8_t)((hall_u_left << 2) + (hall_v_left << 1) + hall_w_left);
+-#endif
+     m_motor_1.m_input.control_mode = OPEN_MODE;
+     m_motor_1.m_input.control_setpoint = 0;
+     m_motor_1.m_output.fault_code = 0;
+@@ -525,7 +563,7 @@
+ #ifdef HW_PROFILE_ENC_HALL
+     m_motor_1.m_output.rpm = m_encoder_rpm;
+ #else
+-    m_motor_1.m_output.rpm = hallSpeedUpdate(hall_code_left, m_mcconf_1.si_motor_pole_pairs, &m_hall_speed_left);
++    m_motor_1.m_output.rpm = m_sensor_rpm_left;
+ #endif
+     m_motor_1.m_output.iq = 0;
+     m_motor_1.m_output.id = 0;
+@@ -536,7 +574,15 @@
+     measureCurrentDQ(m_current_phase_a_left, m_current_phase_b_left, 0u, (uint16_t)(0u - m_svpwm_phase_left),
+                      1u, openloop_command_left, m_mcconf_1.foc_current_filter_const, &m_dq_filter_left,
+                      &m_foc_iq_left_q4, &m_foc_id_left_q4);
+-    if (encoder_sync_hold_vector()) {
++    if (phase_current_trip_left) {
++      /* Soft current chop: keep bridge common mode at 50/50/50 so ADC current
++       * channels stay referenced to the calibrated midpoint. Do not advance the
++       * open-loop electrical angle while chopped; resuming at the same vector
++       * avoids a phase jump after current decays. */
++      duty_u_left = 0;
++      duty_v_left = 0;
++      duty_w_left = 0;
++    } else if (encoder_sync_hold_vector()) {
+       m_svpwm_phase_left = encoder_sync_hold_phase();
+       svpwmFixedVector(m_encoder_sync_command, m_svpwm_phase_left, &duty_u_left, &duty_v_left, &duty_w_left);
+     } else {
+@@ -551,10 +597,10 @@
+     m_motor_1.m_input.phase_encoder_deg_x16 = encoder_left_mechanical_angle_x16();
+     m_mcconf_1.si_motor_pole_pairs = (uint8_t)m_encoder_pole_pairs;
+ #else
+-    const uint8_t hall_u_left = !(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN);
+-    const uint8_t hall_v_left = !(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN);
+-    const uint8_t hall_w_left = !(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
+-    const uint8_t hall_code_left = (uint8_t)((hall_u_left << 2) + (hall_v_left << 1) + hall_w_left);
++    const uint8_t hall_code_left = hall_code_left_sensor;
++    const uint8_t hall_u_left = (uint8_t)((hall_code_left >> 2) & 1u);
++    const uint8_t hall_v_left = (uint8_t)((hall_code_left >> 1) & 1u);
++    const uint8_t hall_w_left = (uint8_t)(hall_code_left & 1u);
+ #endif
+ 
+     m_motor_1.m_input.control_mode = control_mode_left_now;
+@@ -566,9 +612,8 @@
+     #ifdef MOTOR_LEFT_ENA
+     mcpwm_foc_control(&m_motor_1);
+     #endif
+-#ifdef HW_PROFILE_ENC_HALL
+-    m_motor_1.m_output.rpm = m_encoder_rpm;
+-#endif
++    /* Public RPM is always the physical sensor snapshot, independent of mode. */
++    m_motor_1.m_output.rpm = m_sensor_rpm_left;
+     if (motor_type_now == FOC_CTRL) {
+       m_foc_iq_left_q4 = m_motor_1.m_output.iq;
+       m_foc_id_left_q4 = m_motor_1.m_output.id;
+@@ -600,24 +645,27 @@
+   m_motor_2.m_input.current_input = m_current_input_right;
+ 
+   if (svpwm_mode_active) {
+-    const uint8_t hall_u_right = !(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN);
+-    const uint8_t hall_v_right = !(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN);
+-    const uint8_t hall_w_right = !(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
+-    const uint8_t hall_code_right = (uint8_t)((hall_u_right << 2) + (hall_v_right << 1) + hall_w_right);
+     m_motor_2.m_input.control_mode = OPEN_MODE;
+     m_motor_2.m_input.control_setpoint = 0;
+     m_motor_2.m_output.fault_code = 0;
+-    m_motor_2.m_output.rpm = hallSpeedUpdate(hall_code_right, m_mcconf_2.si_motor_pole_pairs, &m_hall_speed_right);
++    m_motor_2.m_output.rpm = m_sensor_rpm_right;
+     m_motor_2.m_output.iq = 0;
+     m_motor_2.m_output.id = 0;
+     measureCurrentDQ(m_current_phase_b_right, m_current_phase_c_right, 1u, (uint16_t)(0u - m_svpwm_phase_right),
+                      1u, m_motor_target_right, m_mcconf_2.foc_current_filter_const, &m_dq_filter_right,
+                      &m_foc_iq_right_q4, &m_foc_id_right_q4);
+-    svpwmOpenLoopStep(m_motor_target_right, (uint8_t)m_mcconf_2.si_motor_pole_pairs, &m_svpwm_phase_right, &duty_u_right, &duty_v_right, &duty_w_right);
++    if (phase_current_trip_right) {
++      duty_u_right = 0;
++      duty_v_right = 0;
++      duty_w_right = 0;
++    } else {
++      svpwmOpenLoopStep(m_motor_target_right, (uint8_t)m_mcconf_2.si_motor_pole_pairs, &m_svpwm_phase_right, &duty_u_right, &duty_v_right, &duty_w_right);
++    }
+   } else {
+-    const uint8_t hall_u_right = !(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN);
+-    const uint8_t hall_v_right = !(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN);
+-    const uint8_t hall_w_right = !(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
++    const uint8_t hall_code_right = hall_code_right_sensor;
++    const uint8_t hall_u_right = (uint8_t)((hall_code_right >> 2) & 1u);
++    const uint8_t hall_v_right = (uint8_t)((hall_code_right >> 1) & 1u);
++    const uint8_t hall_w_right = (uint8_t)(hall_code_right & 1u);
+ 
+     m_motor_2.m_input.control_mode = control_mode_right_now;
+     m_motor_2.m_input.control_setpoint = m_motor_target_right;
+@@ -628,7 +676,7 @@
+     #ifdef MOTOR_RIGHT_ENA
+     mcpwm_foc_control(&m_motor_2);
+     #endif
+-    const uint8_t hall_code_right = (uint8_t)((hall_u_right << 2) + (hall_v_right << 1) + hall_w_right);
++    m_motor_2.m_output.rpm = m_sensor_rpm_right;
+     if (motor_type_now == FOC_CTRL) {
+       m_foc_iq_right_q4 = m_motor_2.m_output.iq;
+       m_foc_id_right_q4 = m_motor_2.m_output.id;
+--- a/Src/bldc.h
++++ b/Src/bldc.h
+@@ -10,6 +10,17 @@
+ extern volatile int16_t m_foc_id_left_q4;
+ extern volatile int16_t m_foc_id_right_q4;
+ 
++/* Sensor acquisition is mode-independent. These snapshots are refreshed from
++ * the motor ISR (Hall) or encoder service and are used for telemetry in every
++ * control mode. */
++extern volatile uint16_t m_sensor_hall_left;
++extern volatile uint16_t m_sensor_hall_right;
++extern volatile int16_t m_sensor_rpm_left;
++extern volatile int16_t m_sensor_rpm_right;
++extern volatile uint8_t m_adc_current_valid;
++extern volatile uint8_t m_adc_current_valid_left;
++extern volatile uint8_t m_adc_current_valid_right;
++
+ void currentCalibrationStart(void);
+ uint8_t currentCalibrationActive(void);
+ uint16_t currentCalibrationProgressPermille(void);
+--- a/Src/config.h
++++ b/Src/config.h
+@@ -59,7 +59,6 @@
+ #define HW_PROFILE_ID            1u
+ #define CTRL_MODE_MAX            SINE_MODE
+ #endif
+-#define ADC_CALIBRATION_SETTLE_SAMPLES 1600u /* 100 ms at 16 kHz */
+ #define ADC_CALIBRATION_SAMPLES  2000u
+ #define TELEMETRY_HZ             50u
+ #define MAIN_LOOP_HZ              (1000u / DELAY_IN_MAIN_LOOP)
+@@ -111,5 +110,8 @@
+ #define SERIAL_STATUS_LEFT_FAULT (1u << 2)
+ #define SERIAL_STATUS_RIGHT_FAULT (1u << 3)
+ #define SERIAL_STATUS_CALIBRATING (1u << 4)
++#define SERIAL_STATUS_ADC_CURRENT_VALID (1u << 5)
++#define SERIAL_STATUS_ADC_LEFT_VALID    (1u << 6)
++#define SERIAL_STATUS_ADC_RIGHT_VALID   (1u << 7)
+ 
+ #endif
+--- a/Src/main.c
++++ b/Src/main.c
+@@ -118,25 +118,11 @@
+ }
+ 
+ static uint16_t readHallLeft(void) {
+-#ifdef HW_PROFILE_ENC_HALL
+-  int32_t a = m_encoder_elec_angle_deg_x10;
+-  while (a < 0) a += 3600;
+-  while (a >= 3600) a -= 3600;
+-  static const uint8_t hallBySector[6] = {2u, 3u, 1u, 5u, 4u, 6u};
+-  return hallBySector[(uint8_t)(a / 600)];
+-#else
+-  const uint16_t u = (LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN) ? 0u : 1u;
+-  const uint16_t v = (LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN) ? 0u : 1u;
+-  const uint16_t w = (LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN) ? 0u : 1u;
+-  return (uint16_t)((u << 2) | (v << 1) | w);
+-#endif
++  return m_sensor_hall_left;
+ }
+ 
+ static uint16_t readHallRight(void) {
+-  const uint16_t u = (RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN) ? 0u : 1u;
+-  const uint16_t v = (RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN) ? 0u : 1u;
+-  const uint16_t w = (RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN) ? 0u : 1u;
+-  return (uint16_t)((u << 2) | (v << 1) | w);
++  return m_sensor_hall_right;
+ }
+ 
+ static void cycleCounterInit(void) {
+@@ -207,35 +193,41 @@
+     const uint8_t profileReady = 1u;
+     const uint8_t positionMoveRequested = 0u;
+ #endif
+-    const uint8_t hostMoveRequested = (uint8_t)(input1[0].cmd != 0 || input2[0].cmd != 0 || positionMoveRequested);
++    const uint8_t normalStopRequested = (uint8_t)(!positionMoveRequested &&
++                                                   input1[0].cmd == 0 && input2[0].cmd == 0);
+ 
+-    /* Arm only for a real movement request. The last FIX02 version armed while
+-     * both commands were near zero, which left the bridge active at idle. */
+-    if (!timeoutFlgSerial && profileReady && m_motor_enable == 0u && !currentCalibrationActive() &&
+-        hostMoveRequested && !controllerFaultActive()) {
++    /* Hard inhibit conditions really disable the bridge. A normal user STOP
++     * does not: it selects the neutral 50/50/50 zero vector so torque becomes
++     * zero while phase-current ADC sampling stays in its valid operating point. */
++    if (timeoutFlgSerial || !profileReady || currentCalibrationActive() || controllerFaultActive()) {
++      m_motor_enable = 0u;
++    } else if (m_motor_enable == 0u) {
++      /* Match the proven baseline: after a valid serial frame the bridge is
++       * armed even at zero command, but the commanded voltage/torque is zero. */
+       m_motor_enable = 1u;
+-      printf("# MOTOR_ARM\r\n");
++      printf("# MOTOR_ARM_NEUTRAL\r\n");
+     }
+ 
+-    /* Left and right motor commands are independent. STOP also follows the
+-     * same rate limiter so the motors decelerate instead of dropping torque
+-     * abruptly. Snap only the final <=1 command-count residual to exact zero
+-     * after the rate-limiter target has already reached zero. */
+-    rateLimiter16(input1[0].cmd, m_command_rate, &cmdLRateFixdt);
+-    rateLimiter16(input2[0].cmd, m_command_rate, &cmdRRateFixdt);
+-    filtLowPass32(cmdLRateFixdt >> 4, (uint16_t)m_command_filter, &cmdLFixdt);
+-    filtLowPass32(cmdRRateFixdt >> 4, (uint16_t)m_command_filter, &cmdRFixdt);
+-    cmdL = (int16_t)(cmdLFixdt >> 16);
+-    cmdR = (int16_t)(cmdRFixdt >> 16);
+-
+-    if (input1[0].cmd == 0 && cmdLRateFixdt == 0 && abs(cmdL) <= 1) {
++    if (normalStopRequested) {
++      /* STOP is authoritative and bypasses all command smoothing. This removes
++       * the previous tail where the rate limiter / LPF could keep a non-zero
++       * setpoint after the host had already requested zero. */
++      cmdLRateFixdt = 0;
++      cmdRRateFixdt = 0;
+       cmdLFixdt = 0;
+-      cmdL = 0;
+-    }
+-    if (input2[0].cmd == 0 && cmdRRateFixdt == 0 && abs(cmdR) <= 1) {
+       cmdRFixdt = 0;
++      cmdL = 0;
+       cmdR = 0;
++      advanced_control_reset();
++    } else {
++      rateLimiter16(input1[0].cmd, m_command_rate, &cmdLRateFixdt);
++      rateLimiter16(input2[0].cmd, m_command_rate, &cmdRRateFixdt);
++      filtLowPass32(cmdLRateFixdt >> 4, (uint16_t)m_command_filter, &cmdLFixdt);
++      filtLowPass32(cmdRRateFixdt >> 4, (uint16_t)m_command_filter, &cmdRFixdt);
++      cmdL = (int16_t)(cmdLFixdt >> 16);
++      cmdR = (int16_t)(cmdRFixdt >> 16);
+     }
++
+     int16_t controlL = 0, controlR = 0;
+     uint8_t genL = m_control_mode_request, genR = m_control_mode_request;
+ #ifdef HW_PROFILE_ENC_HALL
+@@ -245,27 +237,21 @@
+     const uint8_t controlMode = m_control_mode_request;
+ #endif
+     advanced_control_update(controlMode, cmdL, cmdR,
+-#ifdef HW_PROFILE_ENC_HALL
+-                          m_encoder_rpm, (int16_t)(-m_motor_2.m_output.rpm),
+-#else
+-                          m_motor_1.m_output.rpm, (int16_t)(-m_motor_2.m_output.rpm),
+-#endif
+-                          &controlL, &controlR, &genL, &genR);
++                            m_sensor_rpm_left, (int16_t)(-m_sensor_rpm_right),
++                            &controlL, &controlR, &genL, &genR);
++
++    /* The normal STOP path always wins over every outer-loop integrator. */
++    if (normalStopRequested) {
++      controlL = 0;
++      controlR = 0;
++      advanced_control_reset();
++    }
++
+     m_motor_target_left = controlL;
+     m_motor_target_right = controlR;
+     m_control_mode_left = genL;
+     m_control_mode_right = genR;
+ 
+-    /* Smooth STOP: keep the bridge active only while the existing input ramp
+-     * is decaying. Once host command, ramped command and controller output are
+-     * all exactly zero, disarm the bridge and clear outer-loop PID memory. */
+-    if (!positionMoveRequested && input1[0].cmd == 0 && input2[0].cmd == 0 &&
+-        cmdL == 0 && cmdR == 0 && m_motor_target_left == 0 && m_motor_target_right == 0 && m_motor_enable) {
+-      m_motor_enable = 0u;
+-      advanced_control_reset();
+-      printf("# MOTOR_DISARM\r\n");
+-    }
+-
+     filtLowPass32(m_adc_buffer.temp, TEMP_FILT_COEF, &boardTempAdcFixdt);
+     boardTempAdcFilt = (int16_t)(boardTempAdcFixdt >> 16);
+     board_temp_deg_c = (TEMP_CAL_HIGH_DEG_C - TEMP_CAL_LOW_DEG_C) *
+@@ -292,9 +278,9 @@
+       /* Report the rate-limited command actually applied to each motor. */
+       feedback.cmdL = cmdL;
+       feedback.cmdR = cmdR;
+-      feedback.rpmL = (int16_t)m_motor_1.m_output.rpm;
++      feedback.rpmL = m_sensor_rpm_left;
+       /* Right motor is physically mirrored internally; host telemetry is normalized so positive means forward on both wheels. */
+-      feedback.rpmR = (int16_t)(-m_motor_2.m_output.rpm);
++      feedback.rpmR = (int16_t)(-m_sensor_rpm_right);
+       feedback.iqL_cA = focCurrentQ4ToCentiAmp(m_foc_iq_left_q4);
+       feedback.iqR_cA = focCurrentQ4ToCentiAmp(-((int32_t)m_foc_iq_right_q4));
+       /* id is flux-axis current. Mirroring wheel direction does not invert the
+@@ -317,7 +303,10 @@
+                         (timeoutFlgSerial ? SERIAL_STATUS_TIMEOUT : 0u) |
+                         ((m_control_mode_request != SVPWM_MODE && m_motor_1.m_output.fault_code) ? SERIAL_STATUS_LEFT_FAULT : 0u) |
+                         ((m_control_mode_request != SVPWM_MODE && m_motor_2.m_output.fault_code) ? SERIAL_STATUS_RIGHT_FAULT : 0u) |
+-                        (currentCalibrationActive() ? SERIAL_STATUS_CALIBRATING : 0u);
++                        (currentCalibrationActive() ? SERIAL_STATUS_CALIBRATING : 0u) |
++                        (m_adc_current_valid ? SERIAL_STATUS_ADC_CURRENT_VALID : 0u) |
++                        (m_adc_current_valid_left ? SERIAL_STATUS_ADC_LEFT_VALID : 0u) |
++                        (m_adc_current_valid_right ? SERIAL_STATUS_ADC_RIGHT_VALID : 0u);
+       feedback.mode = m_control_mode_request_raw;
+       feedback.calibration_permille = currentCalibrationProgressPermille();
+       feedback.telemetry_seq = scheduledTelemetrySeq;
+@@ -340,6 +329,10 @@
+     if ((TEMP_POWEROFF_ENABLE && board_temp_deg_c >= TEMP_POWEROFF && speedAvgAbs < 20) ||
+         (m_input_voltage_adc < BAT_DEAD && speedAvgAbs < 20)) {
+       poweroff();
++    } else if (timeoutFlgSerial) {
++      m_motor_enable = 0u;
++      advanced_control_reset();
++      beepCount(0, 0, 0);
+     } else if (controllerFaultActive()) {
+       m_motor_enable = 0;
+       beepCount(1, 24, 1);
+--- a/Src/util.c
++++ b/Src/util.c
+@@ -10,6 +10,7 @@
+ #include "BLDC_controller.h"
+ #include "comms.h"
+ #include "advanced_control.h"
++#include "bldc.h"
+ 
+ extern UART_HandleTypeDef huart3;
+ extern uint8_t m_buzzer_count;
+@@ -125,7 +126,8 @@
+ }
+ 
+ void calcAvgSpeed(void) {
+-  speedAvg = (m_motor_1.m_output.rpm - m_motor_2.m_output.rpm) / 2;
++  /* Sensor snapshots are refreshed regardless of the active control algorithm. */
++  speedAvg = (m_sensor_rpm_left - m_sensor_rpm_right) / 2;
+   speedAvgAbs = abs(speedAvg);
+ }
+ 
+--- a/Src/comms.c
++++ b/Src/comms.c
+@@ -31,6 +31,7 @@
+ #include "comms.h"
+ #include "bldc.h"
+ #include "advanced_control.h"
++#include "bldc.h"
+ 
+ 
+ #define RAW_MIN -1000
+@@ -47,6 +48,7 @@
+ extern InputStruct input2[];            // input structure
+ 
+ extern uint16_t VirtAddVarTab[NB_OF_VAR];
++extern volatile adc_buf_t m_adc_buffer;
+ extern int16_t speedAvg;                      // average measured speed
+ extern int16_t speedAvgAbs;                   // average measured speed in absolute
+ extern uint8_t m_control_mode_request_raw;
+@@ -190,6 +192,15 @@
+   {VARIABLE,"POS_SPD_REF",ADD_PARAM(m_position_speed_set),NULL,0,0,0,0,0,0,0,0,NULL,"Position outer-loop speed target rpm"},
+   {VARIABLE,"ENC_E_ANGLE",ADD_PARAM(m_encoder_elec_angle_deg_x10),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder electrical angle deg x10"},
+   {VARIABLE,"ENC_SYNC",ADD_PARAM(m_encoder_sync_state),NULL,0,0,0,0,0,0,0,0,NULL,"Encoder sync state"},
++  {VARIABLE,"HALL_L",ADD_PARAM(m_sensor_hall_left),NULL,0,0,0,0,0,0,0,0,NULL,"Left Hall code; synthetic from encoder in enc_hall"},
++  {VARIABLE,"HALL_R",ADD_PARAM(m_sensor_hall_right),NULL,0,0,0,0,0,0,0,0,NULL,"Right physical Hall code"},
++  {VARIABLE,"SENS_RPM_L",ADD_PARAM(m_sensor_rpm_left),NULL,0,0,0,0,0,0,0,0,NULL,"Left mode-independent sensor rpm"},
++  {VARIABLE,"SENS_RPM_R",ADD_PARAM(m_sensor_rpm_right),NULL,0,0,0,0,0,0,0,0,NULL,"Right internal mode-independent sensor rpm"},
++  {VARIABLE,"ADC_PA2",ADD_PARAM(m_adc_buffer.adc2_spare4),NULL,0,0,0,0,0,0,0,0,NULL,"Raw ADC2 PA2 sample"},
++  {VARIABLE,"ADC_PA3",ADD_PARAM(m_adc_buffer.adc2_spare5),NULL,0,0,0,0,0,0,0,0,NULL,"Raw ADC2 PA3 sample"},
++  {VARIABLE,"ADC_I_VALID",ADD_PARAM(m_adc_current_valid),NULL,0,0,0,0,0,0,0,0,NULL,"1 when phase-current ADC is sampled with bridge in defined PWM state"},
++  {VARIABLE,"ADC_I_VALID_L",ADD_PARAM(m_adc_current_valid_left),NULL,0,0,0,0,0,0,0,0,NULL,"Left phase-current ADC sample valid"},
++  {VARIABLE,"ADC_I_VALID_R",ADD_PARAM(m_adc_current_valid_right),NULL,0,0,0,0,0,0,0,0,NULL,"Right phase-current ADC sample valid"},
+   {VARIABLE,"FOC_ISR_CYC",ADD_PARAM(m_foc_isr_cycles),NULL,0,0,0,0,0,0,0,0,NULL,"Last FOC ISR cycles"},
+   {VARIABLE,"FOC_ISR_MAX",ADD_PARAM(m_foc_isr_cycles_max),NULL,0,0,0,0,0,0,0,0,NULL,"Maximum FOC ISR cycles"},
+ };
+@@ -200,8 +211,8 @@
+ // Set Param with Value from external format
+ int8_t setParamValExt(uint8_t index, int32_t value) {   
+   int8_t ret = 0;
+-  /* Control mode may change only after the requested commands are zero AND
+-   * the rate-limited commands have fully ramped to zero. */
++  /* Control mode may change only after both requested and applied commands
++   * are zero. STOP now bypasses smoothing, so this converges immediately. */
+   if (strcmp(params[index].name, "CTRL_MOD") == 0 &&
+       (input1[0].cmd != 0 || input2[0].cmd != 0 || cmdL != 0 || cmdR != 0)) {
+     printf("! CTRL_MOD requires STOP and completed ramp-down (cmdL=0 cmdR=0)\r\n");
+--- a/Src/setup.c
++++ b/Src/setup.c
+@@ -38,6 +38,24 @@
+ #include "defines.h"
+ #include "config.h"
+ #include "setup.h"
++#include <stddef.h>
++
++/* DMA1 CH1 reads five 32-bit ADC1/ADC2 dual-mode words. The field order below
++ * is therefore a hardware ABI, not an ordinary C struct that may be reordered.
++ * Keep this locked to the proven baseline so a refactor cannot silently map a
++ * phase-current sample onto the wrong ADC channel. */
++_Static_assert(sizeof(adc_buf_t) == 10u * sizeof(uint16_t), "adc_buf_t dual-ADC DMA size changed");
++_Static_assert(offsetof(adc_buf_t, dcr) == 0u,  "ADC word0 ADC1 mapping changed");
++_Static_assert(offsetof(adc_buf_t, dcl) == 2u,  "ADC word0 ADC2 mapping changed");
++_Static_assert(offsetof(adc_buf_t, rlA) == 4u,  "ADC word1 ADC1 mapping changed");
++_Static_assert(offsetof(adc_buf_t, rlB) == 6u,  "ADC word1 ADC2 mapping changed");
++_Static_assert(offsetof(adc_buf_t, rrB) == 8u,  "ADC word2 ADC1 mapping changed");
++_Static_assert(offsetof(adc_buf_t, rrC) == 10u, "ADC word2 ADC2 mapping changed");
++_Static_assert(offsetof(adc_buf_t, batt1) == 12u, "ADC word3 ADC1 mapping changed");
++_Static_assert(offsetof(adc_buf_t, adc2_spare4) == 14u, "ADC word3 ADC2 mapping changed");
++_Static_assert(offsetof(adc_buf_t, temp) == 16u, "ADC word4 ADC1 mapping changed");
++_Static_assert(offsetof(adc_buf_t, adc2_spare5) == 18u, "ADC word4 ADC2 mapping changed");
++_Static_assert(ADC_TOTAL_CONV_TIME == 80u, "ADC trigger phase no longer matches validated 16 MHz/7.5-cycle timing");
+ 
+ TIM_HandleTypeDef htim_right;
+ TIM_HandleTypeDef htim_left;
+--- a/tools/hoverlink.py
++++ b/tools/hoverlink.py
+@@ -125,6 +125,12 @@
+     @property
+     def calibrating(self) -> bool: return bool(self.status & 0x10)
+     @property
++    def adc_current_valid(self) -> bool: return bool(self.status & 0x20)
++    @property
++    def adc_left_valid(self) -> bool: return bool(self.status & 0x40)
++    @property
++    def adc_right_valid(self) -> bool: return bool(self.status & 0x80)
++    @property
+     def stopped(self) -> bool: return self.cmd_l == 0 and self.cmd_r == 0
+     @property
+     def battery_v(self) -> float: return self.battery_x100 / 100.0
+@@ -165,6 +171,7 @@
+         if self.left_fault: flags.append("FAULT-L")
+         if self.right_fault: flags.append("FAULT-R")
+         if self.calibrating: flags.append("CAL")
++        flags.append("ADC-OK" if self.adc_current_valid else f"ADC-L{int(self.adc_left_valid)}R{int(self.adc_right_valid)}")
+         return "/".join(flags)
+ 
+     def summary(self) -> str:
+@@ -214,7 +221,7 @@
+         "hallL", "hallR", "dcl_raw", "rla_raw", "rlb_raw", "dcr_raw", "rrb_raw", "rrc_raw",
+         "battery_V", "temperature_C", "foc_isr_cycles", "foc_isr_us", "foc_isr_load_pct",
+         "encoder_position", "position_target", "position_speed_ref_rpm", "encoder_elec_angle_deg", "encoder_rpm", "encoder_sync_state", "encoder_sync_text", "hw_profile", "hw_profile_name", "foc_isr_cycles_max",
+-        "enabled", "timeout", "left_fault", "right_fault", "calibrating", "calibration_pct",
++        "enabled", "timeout", "left_fault", "right_fault", "calibrating", "adc_current_valid", "adc_left_valid", "adc_right_valid", "calibration_pct",
+     ]
+ 
+     def __init__(self, directory: Path):
+@@ -291,6 +298,8 @@
+                 "encoder_sync_text": t.encoder_sync_text, "hw_profile": t.hw_profile, "hw_profile_name": t.hw_profile_name,
+                 "foc_isr_cycles_max": t.foc_cycles_max,
+                 "right_fault": int(t.right_fault), "calibrating": int(t.calibrating),
++                "adc_current_valid": int(t.adc_current_valid),
++                "adc_left_valid": int(t.adc_left_valid), "adc_right_valid": int(t.adc_right_valid),
+                 "calibration_pct": f"{t.calibration_permille / 10.0:.1f}",
+             })
+             self._rows += 1
+--- a/tools/gui.py
++++ b/tools/gui.py
+@@ -173,8 +173,8 @@
+         calibration = QtWidgets.QGroupBox("Current ADC Calibration"); cf = QtWidgets.QVBoxLayout(calibration)
+         self.cal_progress = QtWidgets.QProgressBar(); self.cal_progress.setRange(0, 1000); self.cal_progress.setFormat("%p%")
+         self.cal_info = QtWidgets.QLabel(
+-            "Automatic every boot and identical for manual calibration: bridge OFF settle 100 ms, "
+-            "arithmetic mean of 2000 ADC samples (~125 ms at 16 kHz), then full generated-controller state reset. "
++            "Automatic every boot and identical for manual calibration: bridge OFF, then the proven "
++            "2000-sample recursive offset convergence (~125 ms at 16 kHz), followed by controller state reset. "
+             "Manual CALIBRATE requires cmdL/cmdR=0 and |rpm|<=5."
+         ); self.cal_info.setWordWrap(True)
+         cf.addWidget(self.cal_progress); cf.addWidget(self.cal_info); cf.addStretch(1)
+@@ -356,7 +356,10 @@
+     def stop_run(self) -> None:
+         if not self.link: return
+         self.target_l = self.target_r = 0; self.stop_pending = True; self.stop_zero_frames = 0
+-        self.append_console("[STOP] target=0,0; firmware rate limiter remains active ..."); self.update_controls()
++        # Do not wait for the next 50-Hz TX timer slot: send the authoritative
++        # zero command immediately. Firmware also bypasses its smoothing on STOP.
++        self.transmit_target()
++        self.append_console("[STOP] immediate target=0,0; firmware zero-vector STOP requested"); self.update_controls()
+ 
+     def calibrate(self) -> None:
+         if not self.link: return
+@@ -459,7 +462,7 @@
+             self.stop_zero_frames = self.stop_zero_frames + 1 if t.stopped else 0
+             if self.stop_zero_frames >= 3:
+                 self.stop_pending = False
+-                self.append_console("[STOP] cmdL=0 cmdR=0 confirmed after rate limiter")
++                self.append_console("[STOP] cmdL=0 cmdR=0 confirmed")
+                 self.finish_csv()
+                 self.update_controls()
+         if self.eeprom_save_pending and self.link and t.stopped and abs(t.rpm_l) <= 5 and abs(t.rpm_r) <= 5 and not self.stop_pending:
+--- a/tools/hoverserial.py
++++ b/tools/hoverserial.py
+@@ -77,7 +77,7 @@
+             if self.stop_zero_frames >= 3:
+                 self.stop_pending = False
+                 path, rows, missed = self.logger.stop()
+-                print("[STOP] cmdL=0 cmdR=0 confirmed after rate limiter")
++                print("[STOP] cmdL=0 cmdR=0 confirmed")
+                 if path:
+                     print(f"[CSV] saved {rows} rows @50Hz -> {path} (missed_seq={missed})")
+ 
+@@ -118,7 +118,9 @@
+         self.set_target(0, 0)
+         self.stop_pending = True
+         self.stop_zero_frames = 0
+-        print("[STOP] target=0,0; firmware rate limiter remains active ...")
++        # Send zero immediately as well as through the periodic keepalive loop.
++        self.link.send_command(0, 0)
++        print("[STOP] immediate target=0,0; firmware zero-vector STOP requested")
+ 
+     def cmd_calibrate(self) -> None:
+         if not self.fully_stopped():
+@@ -126,7 +128,7 @@
+         if self.logger.active:
+             print("[CAL] rejected: finish/save the current CSV run first"); return
+         self.link.send_debug("CALIBRATE")
+-        print("[CAL] requested: six current ADC offsets: 100 ms bridge-off settle + 2000-sample mean (~125 ms) + controller cold-state reset")
++        print("[CAL] requested: six current ADC offsets: bridge OFF + proven 2000-sample recursive convergence (~125 ms) + controller state reset")
+ 
+     def help(self) -> None:
+         print("""
+--- /dev/null
++++ b/tools/check_capture.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""Quick validation for hoverboard 50-Hz telemetry CSV captures.
++
++Usage:
++    python3 tools/check_capture.py hover_YYYYMMDD_HHMMSS_modeX.csv
++
++This does not 'correct' ADC values. It separates bridge-valid samples from hard-
++disabled/floating samples and reports raw current channels, STOP behavior, and
++mode-independent sensor activity.
++"""
++from __future__ import annotations
++import csv, statistics, sys
++from pathlib import Path
++
++RAW = ("dcl_raw", "rla_raw", "rlb_raw", "dcr_raw", "rrb_raw", "rrc_raw")
++PHASE = ("rla_raw", "rlb_raw", "rrb_raw", "rrc_raw")
++
++def num(row, key, default=0.0):
++    try: return float(row.get(key, default) or default)
++    except (TypeError, ValueError): return float(default)
++
++def med(rows, key):
++    vals=[num(r,key) for r in rows if r.get(key,"")!=""]
++    return statistics.median(vals) if vals else float('nan')
++
++def main(path: str) -> int:
++    p=Path(path)
++    with p.open(newline="", encoding="utf-8") as f:
++        rows=list(csv.DictReader(f))
++    if not rows:
++        print("FAIL: CSV has no rows"); return 2
++
++    mode=rows[0].get("mode", "legacy")
++    has_valid="adc_current_valid" in rows[0]
++    valid=[r for r in rows if (not has_valid or int(num(r,"adc_current_valid")) == 1)]
++    stopped=[r for r in valid if int(num(r,"cmdL")) == 0 and int(num(r,"cmdR")) == 0]
++
++    print(f"file={p.name} rows={len(rows)} mode={mode} valid_adc_rows={len(valid)} stopped_valid_rows={len(stopped)}")
++    for k in RAW:
++        vals=[num(r,k) for r in valid if r.get(k,"")!=""]
++        if vals:
++            print(f"{k:8s} median={statistics.median(vals):7.1f} min={min(vals):7.1f} max={max(vals):7.1f}")
++    if stopped:
++        print("STOP valid-phase medians:", " ".join(f"{k}={med(stopped,k):.0f}" for k in PHASE))
++        bad=[(k,med(stopped,k)) for k in PHASE if not (1000 <= med(stopped,k) <= 3000)]
++        print("STOP_ADC_WINDOW=" + ("WARN " + str(bad) if bad else "PASS"))
++    else:
++        print("STOP_ADC_WINDOW=NO_VALID_STOP_ROWS")
++
++    for hall in ("hallL","hallR"):
++        if hall in rows[0]:
++            unique=sorted({r.get(hall,"") for r in rows})
++            print(f"{hall}: unique={unique[:12]} count={len(unique)}")
++    for rpm in ("rpmL","rpmR","encoder_rpm"):
++        if rpm in rows[0]:
++            nz=sum(1 for r in rows if abs(num(r,rpm)) > 0)
++            print(f"{rpm}: nonzero_rows={nz}/{len(rows)} median={med(rows,rpm):.1f}")
++
++    if has_valid:
++        l=sum(1 for r in rows if int(num(r,"adc_left_valid")) == 1) if "adc_left_valid" in rows[0] else -1
++        rr=sum(1 for r in rows if int(num(r,"adc_right_valid")) == 1) if "adc_right_valid" in rows[0] else -1
++        print(f"ADC validity: both={len(valid)}/{len(rows)} left={l} right={rr}")
++    else:
++        print("NOTE: legacy CSV has no adc_current_valid flag; floating samples cannot be filtered automatically.")
++    return 0
++
++if __name__ == "__main__":
++    if len(sys.argv) != 2:
++        print(__doc__.strip()); raise SystemExit(2)
++    raise SystemExit(main(sys.argv[1]))
+--- a/README.md
++++ b/README.md
+@@ -1,290 +1,297 @@
+-# hoverboard-firmware-hack-FOC
+-[![Build Status](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC.svg?branch=master)](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC)
+-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+-[![paypal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_SM.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=CU2SWN2XV9SCY&currency_code=EUR&source=url)
+-
+-This repository implements Field Oriented Control (FOC) for stock hoverboards. Compared to the commutation method, this new FOC control method offers superior performance featuring:
+- - reduced noise and vibrations 	
+- - smooth torque output and improved motor efficiency. Thus, lower energy consumption
+- - field weakening to increase maximum speed range
+-
+-
+-Table of Contents
+-=======================
+-
+-* [Hardware](#hardware)
+-* [FOC Firmware](#foc-firmware)
+-* [Example Variants](#example-variants)
+-* [Dual Inputs](#dual-inputs)
+-* [Flashing](#flashing)
+-* [Troubleshooting](#troubleshooting)
+-* [Diagnostics](#diagnostics)
+-* [Projects and Links](#projects-and-links)
+-* [Contributions](#contributions)
+-
+-#### For the hoverboard sideboard firmware, see the following repositories:
+- - [hoverboard-sideboard-hack-GD](https://github.com/EmanuelFeru/hoverboard-sideboard-hack-GD)
+- - [hoverboard-sideboard-hack-STM](https://github.com/EmanuelFeru/hoverboard-sideboard-hack-STM)
+- 
+-#### For the FOC controller design, see the following repository:
+- - [bldc-motor-control-FOC](https://github.com/EmanuelFeru/bldc-motor-control-FOC)
+-
+-#### Videos:
+-<table>
+-  <tr>
+-    <td><a href="https://youtu.be/IgHCcj0NgWQ" title="Hovercar" rel="noopener"><img src="/docs/pictures/videos_preview/hovercar_intro.png"></a></td>
+-    <td><a href="https://youtu.be/gtyqtc37r10" title="Cruise Control functionality" rel="noopener"><img src="/docs/pictures/videos_preview/cruise_control.png"></a></td>
+-    <td><a href="https://youtu.be/jadD0M1VBoc" title="Hovercar pedal functionality" rel="noopener"><img src="/docs/pictures/videos_preview/hovercar_pedals.png"></a></td>
+-  </tr>
+-  <tr>
+-    <td><a href="https://youtu.be/UnlbMrCkjnE" title="Commutation vs. FOC (constant speed)" rel="noopener"><img src="/docs/pictures/videos_preview/com_foc_const.png"></a></td> 
+-    <td><a href="https://youtu.be/V-_L2w10wZk" title="Commutation vs. FOC (variable speed)" rel="noopener"><img src="/docs/pictures/videos_preview/com_foc_var.png"></a></td>       
+-    <td><a href="https://youtu.be/tVj_lpsRirA" title="Reliable Serial Communication" rel="noopener"><img src="/docs/pictures/videos_preview/serial_com.png"></a></td>
+-  </tr>
+-</table>
+-
+-
+----
+-## Hardware
+- 
+-![mainboard_pinout](/docs/pictures/mainboard_pinout.png)
+-
+-The original Hardware supports two 4-pin cables that originally were connected to the two sideboards. They break out GND, 12/15V and USART2&3 of the Hoverboard mainboard. Both USART2&3 support UART, PWM, PPM, and iBUS input. Additionally, the USART2 can be used as 12bit ADC, while USART3 can be used for I2C. Note that while USART3 (right sideboard cable) is 5V tolerant, USART2 (left sideboard cable) is **not** 5V tolerant.
+-
+-Typically, the mainboard brain is an [STM32F103RCT6](/docs/literature/[10]_STM32F103xC_datasheet.pdf), however some mainboards feature a [GD32F103RCT6](/docs/literature/[11]_GD32F103xx-Datasheet-Rev-2.7.pdf) which is also supported by this firmware.
+-
+-For the reverse-engineered schematics of the mainboard, see [20150722_hoverboard_sch.pdf](/docs/20150722_hoverboard_sch.pdf)
+-
+- 
+----
+-## FOC Firmware
+- 
+-In this firmware 3 control types are available:
+-- Commutation
+-- SIN (Sinusoidal)
+-- FOC (Field Oriented Control) with the following 3 control modes:
+-  - **VOLTAGE MODE**: in this mode the controller applies a constant Voltage to the motors. Recommended for robotics applications or applications where a fast motor response is required.
+-  - **SPEED MODE**: in this mode a closed-loop controller realizes the input speed target by rejecting any of the disturbance (resistive load) applied to the motor. Recommended for robotics applications or constant speed applications.
+-  - **TORQUE MODE**: in this mode the input torque target is realized. This mode enables motor "freewheeling" when the torque target is `0`. Recommended for most applications with a sitting human driver.
+-  
+-#### Comparison between different control methods
+-
+-|Control method| Complexity | Efficiency | Smoothness | Field Weakening | Freewheeling | Standstill hold |
+-|--|--|--|--|--|--|--|
+-|Commutation| - | - | ++ | n.a. | n.a. | + |
+-|Sinusoidal| + | ++ | ++ | +++ | n.a. | + |
+-|FOC VOLTAGE| ++ | +++ | ++ | ++ | n.a. | +<sup>(2)</sup> |
+-|FOC SPEED| +++ | +++ | + | ++ | n.a. | +++ |
+-|FOC TORQUE| +++ | +++ | +++ | ++ | +++<sup>(1)</sup> | n.a<sup>(2)</sup> |
+-
+-<sup>(1)</sup> By enabling `ELECTRIC_BRAKE_ENABLE` in `config.h`, the freewheeling amount can be adjusted using the `ELECTRIC_BRAKE_MAX` parameter.<br/>
+-<sup>(2)</sup> The standstill hold functionality can be forced by enabling `STANDSTILL_HOLD_ENABLE` in `config.h`. 
+-
+-In all FOC control modes, the controller features maximum motor speed and maximum motor current protection. This brings great advantages to fulfil the needs of many robotic applications while maintaining safe operation.
+-
+-
+-### Field Weakening / Phase Advance
+-
+- - By default the Field weakening is disabled. You can enable it in config.h file by setting the FIELD_WEAK_ENA = 1 
+- - The Field Weakening is a linear interpolation from 0 to FIELD_WEAK_MAX or PHASE_ADV_MAX (depeding if FOC or SIN is selected, respectively)
+- - The Field Weakening starts engaging at FIELD_WEAK_LO and reaches the maximum value at FIELD_WEAK_HI
+- - The figure below shows different possible calibrations for Field Weakening / Phase Advance
+- ![Field Weakening](/docs/pictures/FieldWeakening.png) 
+- - If you re-calibrate the Field Weakening please take all the safety measures! The motors can spin very fast!
+-
+-
+-### Parameters
+- - All the calibratable motor parameters can be found in the 'BLDC_controller_data.c'. I provided you with an already calibrated controller, but if you feel like fine tuning it feel free to do so 
+- - The parameters are represented in Fixed-point data type for a more efficient code execution
+- - For calibrating the fixed-point parameters use the [Fixed-Point Viewer](https://github.com/EmanuelFeru/FixedPointViewer) tool
+- - The controller parameters are given in [this table](https://github.com/EmanuelFeru/bldc-motor-control-FOC/blob/master/02_Figures/paramTable.png)
+-
+-
+----
+-## Example Variants
+-
+-This firmware offers currently these variants (selectable in [platformio.ini](/platformio.ini) or [config.h](/Inc/config.h)):
+-- **VARIANT_ADC**: The motors are controlled by two potentiometers connected to the Left sensor cable (long wired)
+-- **VARIANT_USART**: The motors are controlled via serial protocol (e.g. on USART3 right sensor cable, the short wired cable). The commands can be sent from an Arduino. Check out the [hoverserial.ino](/Arduino/hoverserial) as an example sketch.
+-- **VARIANT_NUNCHUK**: Wii Nunchuk offers one hand control for throttle, braking and steering. This was one of the first input device used for electric armchairs or bottle crates.
+-- **VARIANT_PPM**: RC remote control with PPM Sum signal.
+-- **VARIANT_PWM**: RC remote control with PWM signal.
+-- **VARIANT_IBUS**: RC remote control with Flysky iBUS protocol connected to the Left sensor cable.
+-- **VARIANT_HOVERCAR**: The motors are controlled by two pedals brake and throttle. Reverse is engaged by double tapping on the brake pedal at standstill. See [HOVERCAR wiki](https://github.com/EmanuelFeru/hoverboard-firmware-hack-FOC/wiki/Variant-HOVERCAR).
+-- **VARIANT_HOVERBOARD**: The mainboard reads the two sideboards data. The sideboards need to be flashed with the hacked version. The balancing controller is **not** yet implemented.
+-- **VARIANT_TRANSPOTTER**: This is for transpotter build, which is a hoverboard based transportation system. For more details on how to build it check [here](https://github.com/NiklasFauth/hoverboard-firmware-hack/wiki/Build-Instruction:-TranspOtter) and [here](https://hackaday.io/project/161891-transpotter-ng).
+-- **VARIANT_SKATEBOARD**: This is for skateboard build, controlled using an RC remote with PWM signal connected to the right sensor cable.
+-
+-Of course the firmware can be further customized for other needs or projects.
+-
+-
+----
+-## Dual Inputs
+-
+-The firmware supports the input to be provided from two different sources connected to the Left and Right cable, respectively. To enable dual-inputs functionality uncomment `#define DUAL_INPUTS` in config.h for the respective variant. Various dual-inputs combinations can be realized as illustrated in the following table:
+-| Left | Right | Availability |
+-| --- | --- | --- |
+-| ADC<sup>(0)</sup> | UART<sup>(1)</sup> | VARIANT_ADC |
+-| ADC<sup>(0)</sup> | {PPM,PWM,iBUS}<sup>(1)</sup> | VARIANT_{PPM,PWM,IBUS} |
+-| ADC<sup>(0)</sup> | Sideboard<sup></sup><sup>(1*)</sup> | VARIANT_HOVERCAR |
+-| UART<sup>(0)</sup> | Sideboard<sup>(1*)</sup> | VARIANT_UART |
+-| UART<sup>(1)</sup> | Nunchuk<sup>(0)</sup> | VARIANT_NUNCHUK |
+-
+-<sup>(0)</sup> Primary input: this input is used when the Auxilliary input is not available or not connected.<br/>
+-<sup>(1)</sup> Auxilliary input: this inputs is used when connected or enabled by a switch<sup>(*)</sup>. If the Auxilliary input is disconnected, the firmware will automatically switch to the Primary input. Timeout is reported **only** on the Primary input.
+-
+-With slight modifications in config.h, other dual-inputs combinations can be realized as:
+-| Left | Right | Possibility |
+-| --- | --- | --- |
+-| Sideboard<sup>(1*)</sup> | UART<sup>(0)</sup> | VARIANT_UART |
+-| UART<sup>(0)</sup> | {PPM,PWM,iBUS}<sup>(1)</sup> | VARIANT_{PPM,PWM,IBUS} |
+-| {PPM,PWM,iBUS}<sup>(1)</sup> | Nunchuk<sup>(0)</sup> | VARIANT_{PPM,PWM,IBUS} |
+-
+-
+----
+-## Flashing
+-
+-Right to the STM32, there is a debugging header with GND, 3V3, SWDIO and SWCLK. Connect GND, SWDIO and SWCLK to your SWD programmer, like the ST-Link found on many STM devboards.
+-
+-If you have never flashed your sideboard before, the MCU is probably locked. To unlock the flash, check-out the wiki page [How to Unlock MCU flash](https://github.com/EmanuelFeru/hoverboard-firmware-hack-FOC/wiki/How-to-Unlock-MCU-flash).
+-
+-Do not power the mainboard from the 3.3V of your programmer! This has already killed multiple mainboards.
+-
+-Make sure you hold the powerbutton or connect a jumper to the power button pins while flashing the firmware, as the STM might release the power latch and switches itself off during flashing. Battery > 36V have to be connected while flashing.
+-
+-To build and flash choose one of the following methods:
+-
+-### Method 1: Using Platformio IDE
+-
+-- open the folder in the IDE of choice (vscode or Atom)
+-- press the 'PlatformIO:Build' or the 'PlatformIO:Upload' button (bottom left in vscode).
+-
+-### Method 2: Using Keil uVision
+-
+-- in [Keil uVision](https://www.keil.com/download/product/), open the [mainboard-hack.uvproj](/MDK-ARM/)
+-- if you are asked to install missing packages, click Yes
+-- click Build Target (or press F7) to build the firmware
+-- click Load Code (or press F8) to flash the firmware.
+-
+-### Method 3: Using Linux CLI
+-
+-- prerequisites: install [ST-Flash utility](https://github.com/texane/stlink).
+-- open a terminal in the repo check-out folder and if you have definded the variant in [config.h](/Inc/config.h) type:
+-```
+-make
+-```
+-or you can set the variant like this
+-```
+-make -e VARIANT=VARIANT_####
+-```
+-- flash the firmware by typing:
+-```
+-make flash
+-```
+-- or
+-```
+-openocd -f interface/stlink-v2.cfg -f target/stm32f1x.cfg -c flash "write_image erase build/hover.bin 0x8000000"
+-```
+-
+-### Method 4: MacOS CLI
+-- prerequisites:  first get brew https://brew.sh
+-- then install stlink ST-Flash utility
+-
+-#### Using Make
+-```
+-brew install stlink
+-```
+-- open a terminal in the repo check-out folder and if you have definded the variant in [config.h](/Inc/config.h) type:
+-```
+-make
+-```
+-or you can set the variant like this
+-```
+-make -e VARIANT=VARIANT_####
+-```
+-If compiling fails because something is missing just install it with brew AND leave a comment to improve this howto or pull request ;-)
+-
+-- flash the firmware by typing:
+-```
+-make flash
+-```
+-- if unlock is needed
+-```
+-make unlock
+-```
+-
+-#### Using platformio CLI
+-
+-```
+-brew install platformio
+-platformio run -e VARIANT_####
+-platformio run –target upload -e VARIANT_####
+-```
+-If you have set default_envs in [platformio.ini](/platformio.ini) you can ommit -e parameter
+-
+-
+----
+-## Troubleshooting
+-First, check that power is connected and voltage is >36V while flashing.
+-If the board draws more than 100mA in idle, it's probably broken.
+-
+-If the motors do something, but don't rotate smooth and quietly, try to use an alternative phase mapping. Usually, color-correct mapping (blue to blue, green to green, yellow to yellow) works fine. However, some hoverboards have a different layout then others, and this might be the reason your motor isn't spinning.
+-
+-Nunchuk not working: Use the right one of the 2 types of nunchuks. Use i2c pullups.
+-
+-Nunchuk or PPM working bad: The i2c bus and PPM signal are very sensitive to emv distortions of the motor controller. They get stronger the faster you are. Keep cables short, use shielded cable, use ferrits, stabilize voltage in nunchuk or reviever, add i2c pullups. To many errors leads to very high accelerations which triggers the protection board within the battery to shut everything down.
+-
+-Recommendation: Nunchuk Breakout Board https://github.com/Jan--Henrik/hoverboard-breakout
+-
+-Most robust way for input is to use the ADC and potis. It works well even on 1m unshielded cable. Solder ~100k Ohm resistors between ADC-inputs and gnd directly on the mainboard. Use potis as pullups to 3.3V.
+-
+-
+----
+-## Diagnostics
+-The errors reported by the board are in the form of audible beeps:
+-- **1 beep  (low pitch)**: Motor error (see [possible causes](https://github.com/EmanuelFeru/bldc-motor-control-FOC#diagnostics))
+-- **2 beeps (low pitch)**: ADC timeout
+-- **3 beeps (low pitch)**: Serial communication timeout
+-- **4 beeps (low pitch)**: General timeout (PPM, PWM, Nunchuk)
+-- **5 beeps (low pitch)**: Mainboard temperature warning
+-- **1 beep slow (medium pitch)**: Low battery voltage < 36V
+-- **1 beep fast (medium pitch)**: Low battery voltage < 35V
+-- **1 beep fast (high pitch)**: Backward spinning motors
+-
+-For a more detailed troubleshooting connect an [FTDI Serial adapter](https://s.click.aliexpress.com/e/_AqPOBr) or a [Bluetooth module](https://s.click.aliexpress.com/e/_A4gkMD) to the DEBUG_SERIAL cable (Left or Right) and monitor the output data using the [Hoverboard Web Serial Control](https://candas1.github.io/Hoverboard-Web-Serial-Control/) tool developed by [Candas](https://github.com/Candas1/).
+-
+----
+-## Projects and Links
+-
+-- **Original firmware:** [https://github.com/NiklasFauth/hoverboard-firmware-hack](https://github.com/NiklasFauth/hoverboard-firmware-hack)
+-- **[Candas](https://github.com/Candas1/) Hoverboard Web Serial Control:** [https://github.com/Candas1/Hoverboard-Web-Serial-Control](https://github.com/Candas1/Hoverboard-Web-Serial-Control)
+-- **[RoboDurden's](https://github.com/RoboDurden) online compiler:** [https://pionierland.de/hoverhack/](https://pionierland.de/hoverhack/) 
+-- **Hoverboard hack for AT32F403RCT6 mainboards:** [https://github.com/cloidnerux/hoverboard-firmware-hack](https://github.com/cloidnerux/hoverboard-firmware-hack)
+-- **Hoverboard hack for split mainboards:** [https://github.com/flo199213/Hoverboard-Firmware-Hack-Gen2](https://github.com/flo199213/Hoverboard-Firmware-Hack-Gen2)
+-- **Hoverboard hack from BiPropellant:** [https://github.com/bipropellant](https://github.com/bipropellant)
+-- **Hoverboard breakout boards:** [https://github.com/Jan--Henrik/hoverboard-breakout](https://github.com/Jan--Henrik/hoverboard-breakout)
+-
+-<a/>
+-
+-- **Bobbycar** [https://github.com/larsmm/hoverboard-firmware-hack-bbcar](https://github.com/larsmm/hoverboard-firmware-hack-bbcar)
+-- **Wheel chair:** [https://github.com/Lahorde/steer_speed_ctrl](https://github.com/Lahorde/steer_speed_ctrl)
+-- **TranspOtterNG:** [https://github.com/Jan--Henrik/transpOtterNG](https://github.com/Jan--Henrik/transpOtterNG)
+-- **ST Community:** [Custom FOC motor control](https://community.st.com/s/question/0D50X0000B28qTDSQY/custom-foc-control-current-measurement-dma-timer-interrupt-needs-review)
+-
+-<a/>
+-
+-- **Telegram Community:** If you are an enthusiast join our [Hooover Telegram Group](https://t.me/joinchat/BHWO_RKu2LT5ZxEkvUB8uw)
+-
+-
+----
+-## Contributions
+-
+-Every contribution to this repository is highly appreciated! Feel free to create pull requests to improve this firmware as ultimately you are going to help everyone. 
+-
+-If you want to donate to keep this firmware updated, please use the link below:
+-
+-[![paypal](https://www.paypalobjects.com/en_US/NL/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=CU2SWN2XV9SCY&currency_code=EUR&source=url)
+-
+-
+----
+-
++# IMPORTANT — 2026-08-30 ADC / STOP / ALL-MODE SENSOR FIX
++
++This checkpoint includes the hardware-behavior fixes documented in
++`VALIDATION_ADC_STOP_SENSOR_FIX.md`: validated baseline ADC/DMA timing, synchronous
++zero-vector STOP, mode-4 soft current chopping without floating the current-sense
++front end, immediate host STOP, and mode-independent Hall/encoder RPM acquisition.
++
++# hoverboard-firmware-hack-FOC
++[![Build Status](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC.svg?branch=master)](https://travis-ci.com/EmanuelFeru/hoverboard-firmware-hack-FOC)
++[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
++[![paypal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_SM.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=CU2SWN2XV9SCY&currency_code=EUR&source=url)
++
++This repository implements Field Oriented Control (FOC) for stock hoverboards. Compared to the commutation method, this new FOC control method offers superior performance featuring:
++ - reduced noise and vibrations 	
++ - smooth torque output and improved motor efficiency. Thus, lower energy consumption
++ - field weakening to increase maximum speed range
++
++
++Table of Contents
++=======================
++
++* [Hardware](#hardware)
++* [FOC Firmware](#foc-firmware)
++* [Example Variants](#example-variants)
++* [Dual Inputs](#dual-inputs)
++* [Flashing](#flashing)
++* [Troubleshooting](#troubleshooting)
++* [Diagnostics](#diagnostics)
++* [Projects and Links](#projects-and-links)
++* [Contributions](#contributions)
++
++#### For the hoverboard sideboard firmware, see the following repositories:
++ - [hoverboard-sideboard-hack-GD](https://github.com/EmanuelFeru/hoverboard-sideboard-hack-GD)
++ - [hoverboard-sideboard-hack-STM](https://github.com/EmanuelFeru/hoverboard-sideboard-hack-STM)
++ 
++#### For the FOC controller design, see the following repository:
++ - [bldc-motor-control-FOC](https://github.com/EmanuelFeru/bldc-motor-control-FOC)
++
++#### Videos:
++<table>
++  <tr>
++    <td><a href="https://youtu.be/IgHCcj0NgWQ" title="Hovercar" rel="noopener"><img src="/docs/pictures/videos_preview/hovercar_intro.png"></a></td>
++    <td><a href="https://youtu.be/gtyqtc37r10" title="Cruise Control functionality" rel="noopener"><img src="/docs/pictures/videos_preview/cruise_control.png"></a></td>
++    <td><a href="https://youtu.be/jadD0M1VBoc" title="Hovercar pedal functionality" rel="noopener"><img src="/docs/pictures/videos_preview/hovercar_pedals.png"></a></td>
++  </tr>
++  <tr>
++    <td><a href="https://youtu.be/UnlbMrCkjnE" title="Commutation vs. FOC (constant speed)" rel="noopener"><img src="/docs/pictures/videos_preview/com_foc_const.png"></a></td> 
++    <td><a href="https://youtu.be/V-_L2w10wZk" title="Commutation vs. FOC (variable speed)" rel="noopener"><img src="/docs/pictures/videos_preview/com_foc_var.png"></a></td>       
++    <td><a href="https://youtu.be/tVj_lpsRirA" title="Reliable Serial Communication" rel="noopener"><img src="/docs/pictures/videos_preview/serial_com.png"></a></td>
++  </tr>
++</table>
++
++
++---
++## Hardware
++ 
++![mainboard_pinout](/docs/pictures/mainboard_pinout.png)
++
++The original Hardware supports two 4-pin cables that originally were connected to the two sideboards. They break out GND, 12/15V and USART2&3 of the Hoverboard mainboard. Both USART2&3 support UART, PWM, PPM, and iBUS input. Additionally, the USART2 can be used as 12bit ADC, while USART3 can be used for I2C. Note that while USART3 (right sideboard cable) is 5V tolerant, USART2 (left sideboard cable) is **not** 5V tolerant.
++
++Typically, the mainboard brain is an [STM32F103RCT6](/docs/literature/[10]_STM32F103xC_datasheet.pdf), however some mainboards feature a [GD32F103RCT6](/docs/literature/[11]_GD32F103xx-Datasheet-Rev-2.7.pdf) which is also supported by this firmware.
++
++For the reverse-engineered schematics of the mainboard, see [20150722_hoverboard_sch.pdf](/docs/20150722_hoverboard_sch.pdf)
++
++ 
++---
++## FOC Firmware
++ 
++In this firmware 3 control types are available:
++- Commutation
++- SIN (Sinusoidal)
++- FOC (Field Oriented Control) with the following 3 control modes:
++  - **VOLTAGE MODE**: in this mode the controller applies a constant Voltage to the motors. Recommended for robotics applications or applications where a fast motor response is required.
++  - **SPEED MODE**: in this mode a closed-loop controller realizes the input speed target by rejecting any of the disturbance (resistive load) applied to the motor. Recommended for robotics applications or constant speed applications.
++  - **TORQUE MODE**: in this mode the input torque target is realized. This mode enables motor "freewheeling" when the torque target is `0`. Recommended for most applications with a sitting human driver.
++  
++#### Comparison between different control methods
++
++|Control method| Complexity | Efficiency | Smoothness | Field Weakening | Freewheeling | Standstill hold |
++|--|--|--|--|--|--|--|
++|Commutation| - | - | ++ | n.a. | n.a. | + |
++|Sinusoidal| + | ++ | ++ | +++ | n.a. | + |
++|FOC VOLTAGE| ++ | +++ | ++ | ++ | n.a. | +<sup>(2)</sup> |
++|FOC SPEED| +++ | +++ | + | ++ | n.a. | +++ |
++|FOC TORQUE| +++ | +++ | +++ | ++ | +++<sup>(1)</sup> | n.a<sup>(2)</sup> |
++
++<sup>(1)</sup> By enabling `ELECTRIC_BRAKE_ENABLE` in `config.h`, the freewheeling amount can be adjusted using the `ELECTRIC_BRAKE_MAX` parameter.<br/>
++<sup>(2)</sup> The standstill hold functionality can be forced by enabling `STANDSTILL_HOLD_ENABLE` in `config.h`. 
++
++In all FOC control modes, the controller features maximum motor speed and maximum motor current protection. This brings great advantages to fulfil the needs of many robotic applications while maintaining safe operation.
++
++
++### Field Weakening / Phase Advance
++
++ - By default the Field weakening is disabled. You can enable it in config.h file by setting the FIELD_WEAK_ENA = 1 
++ - The Field Weakening is a linear interpolation from 0 to FIELD_WEAK_MAX or PHASE_ADV_MAX (depeding if FOC or SIN is selected, respectively)
++ - The Field Weakening starts engaging at FIELD_WEAK_LO and reaches the maximum value at FIELD_WEAK_HI
++ - The figure below shows different possible calibrations for Field Weakening / Phase Advance
++ ![Field Weakening](/docs/pictures/FieldWeakening.png) 
++ - If you re-calibrate the Field Weakening please take all the safety measures! The motors can spin very fast!
++
++
++### Parameters
++ - All the calibratable motor parameters can be found in the 'BLDC_controller_data.c'. I provided you with an already calibrated controller, but if you feel like fine tuning it feel free to do so 
++ - The parameters are represented in Fixed-point data type for a more efficient code execution
++ - For calibrating the fixed-point parameters use the [Fixed-Point Viewer](https://github.com/EmanuelFeru/FixedPointViewer) tool
++ - The controller parameters are given in [this table](https://github.com/EmanuelFeru/bldc-motor-control-FOC/blob/master/02_Figures/paramTable.png)
++
++
++---
++## Example Variants
++
++This firmware offers currently these variants (selectable in [platformio.ini](/platformio.ini) or [config.h](/Inc/config.h)):
++- **VARIANT_ADC**: The motors are controlled by two potentiometers connected to the Left sensor cable (long wired)
++- **VARIANT_USART**: The motors are controlled via serial protocol (e.g. on USART3 right sensor cable, the short wired cable). The commands can be sent from an Arduino. Check out the [hoverserial.ino](/Arduino/hoverserial) as an example sketch.
++- **VARIANT_NUNCHUK**: Wii Nunchuk offers one hand control for throttle, braking and steering. This was one of the first input device used for electric armchairs or bottle crates.
++- **VARIANT_PPM**: RC remote control with PPM Sum signal.
++- **VARIANT_PWM**: RC remote control with PWM signal.
++- **VARIANT_IBUS**: RC remote control with Flysky iBUS protocol connected to the Left sensor cable.
++- **VARIANT_HOVERCAR**: The motors are controlled by two pedals brake and throttle. Reverse is engaged by double tapping on the brake pedal at standstill. See [HOVERCAR wiki](https://github.com/EmanuelFeru/hoverboard-firmware-hack-FOC/wiki/Variant-HOVERCAR).
++- **VARIANT_HOVERBOARD**: The mainboard reads the two sideboards data. The sideboards need to be flashed with the hacked version. The balancing controller is **not** yet implemented.
++- **VARIANT_TRANSPOTTER**: This is for transpotter build, which is a hoverboard based transportation system. For more details on how to build it check [here](https://github.com/NiklasFauth/hoverboard-firmware-hack/wiki/Build-Instruction:-TranspOtter) and [here](https://hackaday.io/project/161891-transpotter-ng).
++- **VARIANT_SKATEBOARD**: This is for skateboard build, controlled using an RC remote with PWM signal connected to the right sensor cable.
++
++Of course the firmware can be further customized for other needs or projects.
++
++
++---
++## Dual Inputs
++
++The firmware supports the input to be provided from two different sources connected to the Left and Right cable, respectively. To enable dual-inputs functionality uncomment `#define DUAL_INPUTS` in config.h for the respective variant. Various dual-inputs combinations can be realized as illustrated in the following table:
++| Left | Right | Availability |
++| --- | --- | --- |
++| ADC<sup>(0)</sup> | UART<sup>(1)</sup> | VARIANT_ADC |
++| ADC<sup>(0)</sup> | {PPM,PWM,iBUS}<sup>(1)</sup> | VARIANT_{PPM,PWM,IBUS} |
++| ADC<sup>(0)</sup> | Sideboard<sup></sup><sup>(1*)</sup> | VARIANT_HOVERCAR |
++| UART<sup>(0)</sup> | Sideboard<sup>(1*)</sup> | VARIANT_UART |
++| UART<sup>(1)</sup> | Nunchuk<sup>(0)</sup> | VARIANT_NUNCHUK |
++
++<sup>(0)</sup> Primary input: this input is used when the Auxilliary input is not available or not connected.<br/>
++<sup>(1)</sup> Auxilliary input: this inputs is used when connected or enabled by a switch<sup>(*)</sup>. If the Auxilliary input is disconnected, the firmware will automatically switch to the Primary input. Timeout is reported **only** on the Primary input.
++
++With slight modifications in config.h, other dual-inputs combinations can be realized as:
++| Left | Right | Possibility |
++| --- | --- | --- |
++| Sideboard<sup>(1*)</sup> | UART<sup>(0)</sup> | VARIANT_UART |
++| UART<sup>(0)</sup> | {PPM,PWM,iBUS}<sup>(1)</sup> | VARIANT_{PPM,PWM,IBUS} |
++| {PPM,PWM,iBUS}<sup>(1)</sup> | Nunchuk<sup>(0)</sup> | VARIANT_{PPM,PWM,IBUS} |
++
++
++---
++## Flashing
++
++Right to the STM32, there is a debugging header with GND, 3V3, SWDIO and SWCLK. Connect GND, SWDIO and SWCLK to your SWD programmer, like the ST-Link found on many STM devboards.
++
++If you have never flashed your sideboard before, the MCU is probably locked. To unlock the flash, check-out the wiki page [How to Unlock MCU flash](https://github.com/EmanuelFeru/hoverboard-firmware-hack-FOC/wiki/How-to-Unlock-MCU-flash).
++
++Do not power the mainboard from the 3.3V of your programmer! This has already killed multiple mainboards.
++
++Make sure you hold the powerbutton or connect a jumper to the power button pins while flashing the firmware, as the STM might release the power latch and switches itself off during flashing. Battery > 36V have to be connected while flashing.
++
++To build and flash choose one of the following methods:
++
++### Method 1: Using Platformio IDE
++
++- open the folder in the IDE of choice (vscode or Atom)
++- press the 'PlatformIO:Build' or the 'PlatformIO:Upload' button (bottom left in vscode).
++
++### Method 2: Using Keil uVision
++
++- in [Keil uVision](https://www.keil.com/download/product/), open the [mainboard-hack.uvproj](/MDK-ARM/)
++- if you are asked to install missing packages, click Yes
++- click Build Target (or press F7) to build the firmware
++- click Load Code (or press F8) to flash the firmware.
++
++### Method 3: Using Linux CLI
++
++- prerequisites: install [ST-Flash utility](https://github.com/texane/stlink).
++- open a terminal in the repo check-out folder and if you have definded the variant in [config.h](/Inc/config.h) type:
++```
++make
++```
++or you can set the variant like this
++```
++make -e VARIANT=VARIANT_####
++```
++- flash the firmware by typing:
++```
++make flash
++```
++- or
++```
++openocd -f interface/stlink-v2.cfg -f target/stm32f1x.cfg -c flash "write_image erase build/hover.bin 0x8000000"
++```
++
++### Method 4: MacOS CLI
++- prerequisites:  first get brew https://brew.sh
++- then install stlink ST-Flash utility
++
++#### Using Make
++```
++brew install stlink
++```
++- open a terminal in the repo check-out folder and if you have definded the variant in [config.h](/Inc/config.h) type:
++```
++make
++```
++or you can set the variant like this
++```
++make -e VARIANT=VARIANT_####
++```
++If compiling fails because something is missing just install it with brew AND leave a comment to improve this howto or pull request ;-)
++
++- flash the firmware by typing:
++```
++make flash
++```
++- if unlock is needed
++```
++make unlock
++```
++
++#### Using platformio CLI
++
++```
++brew install platformio
++platformio run -e VARIANT_####
++platformio run –target upload -e VARIANT_####
++```
++If you have set default_envs in [platformio.ini](/platformio.ini) you can ommit -e parameter
++
++
++---
++## Troubleshooting
++First, check that power is connected and voltage is >36V while flashing.
++If the board draws more than 100mA in idle, it's probably broken.
++
++If the motors do something, but don't rotate smooth and quietly, try to use an alternative phase mapping. Usually, color-correct mapping (blue to blue, green to green, yellow to yellow) works fine. However, some hoverboards have a different layout then others, and this might be the reason your motor isn't spinning.
++
++Nunchuk not working: Use the right one of the 2 types of nunchuks. Use i2c pullups.
++
++Nunchuk or PPM working bad: The i2c bus and PPM signal are very sensitive to emv distortions of the motor controller. They get stronger the faster you are. Keep cables short, use shielded cable, use ferrits, stabilize voltage in nunchuk or reviever, add i2c pullups. To many errors leads to very high accelerations which triggers the protection board within the battery to shut everything down.
++
++Recommendation: Nunchuk Breakout Board https://github.com/Jan--Henrik/hoverboard-breakout
++
++Most robust way for input is to use the ADC and potis. It works well even on 1m unshielded cable. Solder ~100k Ohm resistors between ADC-inputs and gnd directly on the mainboard. Use potis as pullups to 3.3V.
++
++
++---
++## Diagnostics
++The errors reported by the board are in the form of audible beeps:
++- **1 beep  (low pitch)**: Motor error (see [possible causes](https://github.com/EmanuelFeru/bldc-motor-control-FOC#diagnostics))
++- **2 beeps (low pitch)**: ADC timeout
++- **3 beeps (low pitch)**: Serial communication timeout
++- **4 beeps (low pitch)**: General timeout (PPM, PWM, Nunchuk)
++- **5 beeps (low pitch)**: Mainboard temperature warning
++- **1 beep slow (medium pitch)**: Low battery voltage < 36V
++- **1 beep fast (medium pitch)**: Low battery voltage < 35V
++- **1 beep fast (high pitch)**: Backward spinning motors
++
++For a more detailed troubleshooting connect an [FTDI Serial adapter](https://s.click.aliexpress.com/e/_AqPOBr) or a [Bluetooth module](https://s.click.aliexpress.com/e/_A4gkMD) to the DEBUG_SERIAL cable (Left or Right) and monitor the output data using the [Hoverboard Web Serial Control](https://candas1.github.io/Hoverboard-Web-Serial-Control/) tool developed by [Candas](https://github.com/Candas1/).
++
++---
++## Projects and Links
++
++- **Original firmware:** [https://github.com/NiklasFauth/hoverboard-firmware-hack](https://github.com/NiklasFauth/hoverboard-firmware-hack)
++- **[Candas](https://github.com/Candas1/) Hoverboard Web Serial Control:** [https://github.com/Candas1/Hoverboard-Web-Serial-Control](https://github.com/Candas1/Hoverboard-Web-Serial-Control)
++- **[RoboDurden's](https://github.com/RoboDurden) online compiler:** [https://pionierland.de/hoverhack/](https://pionierland.de/hoverhack/) 
++- **Hoverboard hack for AT32F403RCT6 mainboards:** [https://github.com/cloidnerux/hoverboard-firmware-hack](https://github.com/cloidnerux/hoverboard-firmware-hack)
++- **Hoverboard hack for split mainboards:** [https://github.com/flo199213/Hoverboard-Firmware-Hack-Gen2](https://github.com/flo199213/Hoverboard-Firmware-Hack-Gen2)
++- **Hoverboard hack from BiPropellant:** [https://github.com/bipropellant](https://github.com/bipropellant)
++- **Hoverboard breakout boards:** [https://github.com/Jan--Henrik/hoverboard-breakout](https://github.com/Jan--Henrik/hoverboard-breakout)
++
++<a/>
++
++- **Bobbycar** [https://github.com/larsmm/hoverboard-firmware-hack-bbcar](https://github.com/larsmm/hoverboard-firmware-hack-bbcar)
++- **Wheel chair:** [https://github.com/Lahorde/steer_speed_ctrl](https://github.com/Lahorde/steer_speed_ctrl)
++- **TranspOtterNG:** [https://github.com/Jan--Henrik/transpOtterNG](https://github.com/Jan--Henrik/transpOtterNG)
++- **ST Community:** [Custom FOC motor control](https://community.st.com/s/question/0D50X0000B28qTDSQY/custom-foc-control-current-measurement-dma-timer-interrupt-needs-review)
++
++<a/>
++
++- **Telegram Community:** If you are an enthusiast join our [Hooover Telegram Group](https://t.me/joinchat/BHWO_RKu2LT5ZxEkvUB8uw)
++
++
++---
++## Contributions
++
++Every contribution to this repository is highly appreciated! Feel free to create pull requests to improve this firmware as ultimately you are going to help everyone. 
++
++If you want to donate to keep this firmware updated, please use the link below:
++
++[![paypal](https://www.paypalobjects.com/en_US/NL/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=CU2SWN2XV9SCY&currency_code=EUR&source=url)
++
++
++---
++
+--- /dev/null
++++ b/VALIDATION_ADC_STOP_SENSOR_FIX.md
+@@ -0,0 +1,173 @@
++# ADC / STOP / SENSOR FIX — validation checkpoint
++
++## Baseline used
++
++The hardware-behavior baseline is the user-provided archive:
++`hoverboard-firmware-hack-FOC yang sudah ok kalibrasi dan start stop nya.zip`.
++The three user captures were also compared:
++
++- `hover_20260830_180312_mode2.csv`
++- `hover_20260830_180438_mode4.csv`
++- `hover_20260830_180700 yang sudha ok kalibrasinya dan start stop nya.csv`
++
++## What the captures prove
++
++### Known-good capture
++At STOP, the known-good capture stays at the current-sense midpoint:
++
++- RLA ~1968
++- RLB ~1952
++- RRB ~1950
++- RRC ~1936
++
++and both Hall sensors traverse all six valid states during the run.
++
++### Broken mode-2 capture before this patch
++Before STOP, mode 2 is already around the expected midpoint (median RLA/RLB/RRB/RRC =
++1969/1968/1955/1933). The acquisition timing is therefore not globally shifted.
++Immediately after STOP the old VESC-style checkpoint changed `enabled` to 0 and phase
++ADC channels floated, e.g. ~4018/4014 and later ~4001/317. This is a bridge-state
++problem, not a calibration offset that should be numerically corrected.
++
++### Broken mode-4 capture before this patch
++Mode 4 shows median RLA/RLB/RRB/RRC ~2541/2535/2452/2437 while measured RPM remains
++zero and dq telemetry reaches roughly +/-20 A. This indicates a stalled/high-current
++open-loop state. The old hard phase-current chop cleared MOE, changing the current-sense
++common-mode and making subsequent phase samples unreliable. The fix below does not force
++real current samples back to 2000; it keeps the ADC operating point valid and current-limits
++mode 4 with a synchronous zero vector.
++
++## ADC timing / DMA audit
++
++The actual ADC/timer sequence in this checkpoint is kept identical to the known-good
++hardware baseline:
++
++- PWM = 16 kHz center aligned.
++- Right = TIM1, Left = TIM8.
++- TIM8 TRGO UPDATE triggers ADC1 regular conversion.
++- ADC1 + ADC2 = dual regular simultaneous.
++- ADC clock = 16 MHz (PCLK2/4).
++- phase-current channels = 7.5-cycle sampling.
++- first DC-current rank = 1.5-cycle sampling, exactly as baseline.
++- `LEFT_TIM->CNT = ADC_TOTAL_CONV_TIME = 80` timer ticks.
++- DMA1 Channel1 = 5 x 32-bit dual-ADC words, circular.
++- DMA buffer order remains exactly:
++  `dcr,dcl,rlA,rlB,rrB,rrC,batt1,PA2,temp,PA3`.
++
++`setup.c` now has `_Static_assert` checks for the complete DMA buffer byte offsets and for
++`ADC_TOTAL_CONV_TIME == 80`. A future refactor that silently reorders the ADC DMA ABI or
++changes this validated sampling offset will fail the target compile instead of silently
++producing wrong channels.
++
++## STOP fix
++
++Normal STOP is now distinct from a hard safety shutdown:
++
++1. Host zero is transmitted immediately by GUI/CLI.
++2. Firmware zero command bypasses the command rate limiter and LPF immediately.
++3. Outer speed/position state is reset.
++4. Both motor targets are forced to zero.
++5. FOC/SINE/COMM controllers return duty delta 0/0/0 and reset FOC target/integrators.
++6. SVPWM command zero returns duty delta 0/0/0.
++7. Normal STOP keeps MOE active at CCR=50/50/50: zero line-line voltage / synchronous zero vector.
++8. MOE is cleared only for a true hard inhibit (timeout/fault/calibration/power state or DC-input overcurrent).
++
++This restores the important behavior seen in the known-good closed-loop capture: STOP does
++not leave the phase-current amplifiers floating. It also provides electrical zero-vector
++braking instead of simply coasting with all MOSFET outputs disabled.
++
++## Mode-4 phase-current limiting fix
++
++For open-loop SVPWM only, phase-current over-limit no longer clears MOE. It now:
++
++- forces U/V/W duty delta to 0/0/0 (50/50/50 actual CCR),
++- keeps the bridge common-mode defined,
++- does not advance the open-loop electrical phase while current is being chopped,
++- resumes from the same electrical vector after current decays.
++
++Hard DC-link overcurrent still clears MOE.
++
++## Sensors in every mode
++
++Sensor acquisition happens before mode dispatch on every motor ISR:
++
++### `two_hall`
++- Left physical Hall code: always sampled.
++- Right physical Hall code: always sampled.
++- Left Hall RPM: always updated.
++- Right Hall RPM: always updated.
++- ADC raw current/DC/battery/temp/PA2/PA3: independent of control mode.
++
++### `enc_hall`
++- Left TIM4 AB encoder position/RPM/electrical angle: available in every mode.
++- Left `hallL` telemetry is a synthetic six-state Hall code derived from encoder angle because
++  PB6/PB7 are used by encoder AB in this profile.
++- Right physical Hall code/RPM: always sampled.
++- ADC raw channels: independent of control mode.
++
++Modes 1..7 no longer decide whether a physical speed sensor is acquired. In particular,
++mode 4 no longer deliberately reports RPM=0 just because SVPWM control itself is open loop.
++If a wheel physically rotates, its Hall/encoder speed remains visible.
++
++## ADC validity status
++
++The telemetry packet ABI and field order are unchanged. Extra status bits are used only
++inside the existing 16-bit `status` field:
++
++- bit 5: both phase-current ADC sides valid
++- bit 6: left phase-current ADC valid
++- bit 7: right phase-current ADC valid
++
++The Python tools show `ADC-OK` or side validity and add these derived columns to new CSVs.
++No telemetry field was inserted or reordered.
++
++## Validation run in this environment
++
++PASS with `gcc -std=gnu11 -Wall -Wextra -Werror -fsyntax-only` for both profiles on:
++
++- `BLDC_controller.c`
++- `BLDC_controller_data.c`
++- `advanced_control.c`
++- `bldc.c`
++- `main.c`
++- `util.c`
++- `comms.c`
++
++Host controller test PASS:
++
++- FOC STOP -> zero duties + zero iq/id targets + PI reset
++- SINE STOP -> zero duties
++- COMMUTATION STOP -> zero duties
++- controller disable -> zero duties/state
++
++Static integration checks PASS:
++
++- STOP bypasses smoothing
++- STOP forces both motor targets zero
++- neutral arm behavior restored
++- phase current trip does not clear MOE
++- left/right mode-4 soft chop uses zero vector
++- Hall/RPM acquisition is mode independent
++- SVPWM zero command returns zero vector
++
++Python GUI/CLI/parser files pass `py_compile`.
++
++`SerialFeedback` packed struct is byte-for-byte identical to the previous VESC-style
++checkpoint (same ABI). EEPROM `PARAMETER` table count/index layout is not changed by this fix.
++
++## Hardware acceptance test after flash
++
++1. Boot with wheels free and wait for calibration completion.
++2. At STOP after a valid serial connection, status should show `ADC-OK` and phase raw values
++   should remain near their calibrated board-specific midpoints (for the supplied board,
++   roughly 1.9k–2.0k). Do **not** require exactly 2000 on every board.
++3. Mode 2: run, press STOP. Command must become 0 immediately; motor torque command must be zero;
++   phase raw channels must not jump to ~0/~4k just because STOP was pressed.
++4. Mode 4: start with a small command. Hall/encoder telemetry must still be live. If rotor is
++   stalled, raw phase values may legitimately move away from 2k because real phase current is
++   flowing; the soft current limiter should periodically apply zero vector instead of creating
++   floating ADC samples.
++5. Test modes 1,2,3,4,5,6 (and 7 for enc_hall): rotate the wheel and confirm Hall/RPM or encoder
++   continues changing regardless of selected control algorithm.
++
++Use `python3 tools/check_capture.py <new.csv>` to summarize valid ADC samples and sensor activity.

@@ -7,39 +7,23 @@
 #include "config.h"
 #include "eeprom.h"
 #include "util.h"
-#include "BLDC_controller.h"
-#include "rtwtypes.h"
+#include "motor/mcpwm_foc.h"
 #include "comms.h"
-#include "advanced_control.h"
+#include "motor/mc_interface.h"
 
 extern UART_HandleTypeDef huart3;
-extern uint8_t buzzerCount;
-extern uint8_t buzzerFreq;
-extern uint8_t buzzerPattern;
-extern uint8_t enable;
+extern uint8_t m_buzzer_count;
+extern uint8_t m_buzzer_freq;
+extern uint8_t m_buzzer_pattern;
+extern uint8_t m_motor_enable;
 
-RT_MODEL rtM_Left_;
-RT_MODEL rtM_Right_;
-RT_MODEL *const rtM_Left = &rtM_Left_;
-RT_MODEL *const rtM_Right = &rtM_Right_;
-
-extern P rtP_Left;
-DW rtDW_Left;
-ExtU rtU_Left;
-ExtY rtY_Left;
-P rtP_Right;
-DW rtDW_Right;
-ExtU rtU_Right;
-ExtY rtY_Right;
-
+/* Motor/configuration instances are defined in motor/mcpwm_foc.c. */
 InputStruct input1[INPUTS_NR] = {{0, 0, 0, PRI_INPUT1}};
 InputStruct input2[INPUTS_NR] = {{0, 0, 0, PRI_INPUT2}};
 
 int16_t speedAvg = 0;
 int16_t speedAvgAbs = 0;
 uint8_t timeoutFlgSerial = 1;
-uint8_t ctrlModReqRaw = CTRL_MOD_REQ;
-uint8_t ctrlModReq = OPEN_MODE;
 
 uint16_t VirtAddVarTab[NB_OF_VAR];
 
@@ -64,44 +48,8 @@ int _write(int file, char *data, int len) {
 }
 #endif
 
-void BLDC_Init(void) {
-#ifdef HW_PROFILE_ENC_HALL
-  rtP_Left.b_angleMeasEna = 1;
-  rtP_Left.n_polePairs = (uint8_t)enc_pole_pairs;
-#else
-  rtP_Left.b_angleMeasEna = 0;
-#endif
-  rtP_Left.z_selPhaCurMeasABC = 0;
-  /* Runtime modes select COM/SIN/FOC inside the motor ISR. */
-  rtP_Left.z_ctrlTypSel = FOC_CTRL;
-  rtP_Left.b_diagEna = DIAG_ENA;
-  rtP_Left.i_max = (I_MOT_MAX * A2BIT_CONV) << 4;
-  rtP_Left.n_max = N_MOT_MAX << 4;
-  rtP_Left.b_fieldWeakEna = FIELD_WEAK_ENA;
-  rtP_Left.id_fieldWeakMax = (FIELD_WEAK_MAX * A2BIT_CONV) << 4;
-  rtP_Left.a_phaAdvMax = PHASE_ADV_MAX << 4;
-  rtP_Left.r_fieldWeakHi = FIELD_WEAK_HI << 4;
-  rtP_Left.r_fieldWeakLo = FIELD_WEAK_LO << 4;
-
-  rtP_Right = rtP_Left;
-  rtP_Right.b_angleMeasEna = 0;
-  rtP_Right.z_selPhaCurMeasABC = 1;
-
-  rtM_Left->defaultParam = &rtP_Left;
-  rtM_Left->dwork = &rtDW_Left;
-  rtM_Left->inputs = &rtU_Left;
-  rtM_Left->outputs = &rtY_Left;
-  rtM_Right->defaultParam = &rtP_Right;
-  rtM_Right->dwork = &rtDW_Right;
-  rtM_Right->inputs = &rtU_Right;
-  rtM_Right->outputs = &rtY_Right;
-
-  BLDC_controller_initialize(rtM_Left);
-  BLDC_controller_initialize(rtM_Right);
-}
-
 void Input_Lim_Init(void) {
-  if (rtP_Left.b_fieldWeakEna || rtP_Right.b_fieldWeakEna) {
+  if (m_mcconf_1.foc_fw_enable || m_mcconf_2.foc_fw_enable) {
     inputMax = MAX(1000, FIELD_WEAK_HI);
     inputMin = MIN(-1000, -FIELD_WEAK_HI);
   } else {
@@ -127,29 +75,30 @@ void Input_Init(void) {
 }
 
 void poweronMelody(void) {
-  buzzerCount = 0;
+  m_buzzer_count = 0;
   for (int i = 8; i >= 0; --i) {
-    buzzerFreq = (uint8_t)i;
+    m_buzzer_freq = (uint8_t)i;
     HAL_Delay(100);
   }
-  buzzerFreq = 0;
+  m_buzzer_freq = 0;
 }
 
 void beepCount(uint8_t cnt, uint8_t freq, uint8_t pattern) {
-  buzzerCount = cnt;
-  buzzerFreq = freq;
-  buzzerPattern = pattern;
+  m_buzzer_count = cnt;
+  m_buzzer_freq = freq;
+  m_buzzer_pattern = pattern;
 }
 
 void beepShort(uint8_t freq) {
-  buzzerCount = 0;
-  buzzerFreq = freq;
+  m_buzzer_count = 0;
+  m_buzzer_freq = freq;
   HAL_Delay(100);
-  buzzerFreq = 0;
+  m_buzzer_freq = 0;
 }
 
 void calcAvgSpeed(void) {
-  speedAvg = (rtY_Left.n_mot - rtY_Right.n_mot) / 2;
+  /* Sensor snapshots are refreshed regardless of the active control algorithm. */
+  speedAvg = (m_sensor_rpm_left - m_sensor_rpm_right) / 2;
   speedAvgAbs = abs(speedAvg);
 }
 
@@ -161,6 +110,7 @@ static void serialAcceptCommand(const uint8_t *frame) {
     serialCommand = candidate;
     serialTimeoutCount = 0;
     timeoutFlgSerial = 0;
+    if (candidate.cmdL != 0 || candidate.cmdR != 0) m_live_stream_enabled = 1u;
   }
 }
 
@@ -243,22 +193,19 @@ void readCommand(void) {
   if (timeoutFlgSerial) {
     input1[0].cmd = 0;
     input2[0].cmd = 0;
-    ctrlModReq = OPEN_MODE;
-  } else {
-    ctrlModReq = ctrlModReqRaw;
   }
 }
 
 void poweroff(void) {
-  enable = 0;
+  m_motor_enable = 0;
   printf("-- Motors disabled --\r\n");
-  buzzerCount = 0;
-  buzzerPattern = 0;
+  m_buzzer_count = 0;
+  m_buzzer_pattern = 0;
   for (uint8_t i = 0; i < 8; ++i) {
-    buzzerFreq = i;
+    m_buzzer_freq = i;
     HAL_Delay(100);
   }
-  buzzerFreq = 0;
+  m_buzzer_freq = 0;
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_RESET);
   while (1) { }
 }
@@ -266,7 +213,7 @@ void poweroff(void) {
 void poweroffPressCheck(void) {
   if (!HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) return;
   uint16_t pressedMs = 0;
-  enable = 0;
+  m_motor_enable = 0;
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) {
     HAL_Delay(10);
     if (pressedMs < 60000) pressedMs += 10;
