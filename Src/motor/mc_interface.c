@@ -229,7 +229,9 @@ void mc_interface_select_motor_thread(int motor) {
   if (motor == 1 || motor == 2) m_selected_motor = (uint8_t)motor;
 }
 
-static uint8_t selected_side(void) { return m_selected_motor == 2u ? 2u : 1u; }
+static uint8_t selected_side(void) { 
+  return m_selected_motor == 2u ? 2u : 1u; 
+}
 
 static void api_set(uint8_t control, int16_t command) {
   const uint8_t side = selected_side();
