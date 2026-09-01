@@ -1,180 +1,143 @@
 #ifndef MCPWM_FOC_H_
 #define MCPWM_FOC_H_
 
-#include <stdbool.h>
 #include <stdint.h>
-#include "config.h"
-#include "motor/foc_math.h"
-#include "motor/mcconf_default.h"
+#include <stdbool.h>
+#include "vesc/datatypes.h"
 
-/*
- * Compatibility shell around the hoverboard control pipeline, written with the
- * same state/configuration conventions used by VESC mcpwm_foc. The EEPROM
- * facing tuning fields intentionally remain integer/fixed-point so existing
- * addresses and serial SET/SAVE behavior do not change on STM32F103.
- */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum {
-  MC_STATE_OFF = 0,
-  MC_STATE_RUNNING
-} mc_state;
-
-typedef enum {
-  CONTROL_MODE_DUTY = 0,
-  CONTROL_MODE_SPEED,
-  CONTROL_MODE_CURRENT,
-  CONTROL_MODE_CURRENT_BRAKE,
-  CONTROL_MODE_POS,
-  CONTROL_MODE_NONE
-} mc_control_mode;
-
-typedef enum {
-  MOTOR_TYPE_COMMUTATION = COM_CTRL,
-  MOTOR_TYPE_SINE = SIN_CTRL,
-  MOTOR_TYPE_FOC = FOC_CTRL
-} mc_motor_type;
+    MCPWM_FOC_MOTOR_1 = 0,
+    MCPWM_FOC_MOTOR_2 = 1,
+    MCPWM_FOC_MOTOR_COUNT = 2
+} mcpwm_foc_motor_id_t;
 
 typedef struct {
-  /* Limits. Raw units are kept compatible with the existing EEPROM layer. */
-  int16_t l_current_max;                 /* current ADC counts * 16 (Q4) */
-  int16_t l_max_rpm;                     /* mechanical rpm * 16 */
+    mc_configuration m_conf;
+    mc_state m_state;
+    mc_control_mode m_control_mode;
+    mc_fault_code m_fault;
 
-  /* FOC current controller. Coefficients keep the proven fixed-point scaling. */
-  uint16_t foc_current_kp_q;
-  uint16_t foc_current_ki_q;
-  uint16_t foc_current_kp_d;
-  uint16_t foc_current_ki_d;
-  uint16_t foc_current_filter_const;
-  uint16_t foc_current_anti_windup;
-  uint16_t foc_current_i_limit;
+    /* VESC-style setpoints. Fixed-point values are authoritative in the ISR. */
+    volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
+    volatile int16_t m_iq_target_q4;    /* requested Iq reference */
+    volatile int16_t m_id_set_q4;
+    volatile int16_t m_speed_set_rpm;
+    volatile int16_t m_duty_set_permille;
 
-  /* Legacy speed coefficients remain persisted for EEPROM compatibility. */
-  uint16_t s_pid_kp;
-  uint16_t s_pid_ki;
-  uint16_t s_pid_i_limit;
+    /* Current state, same Q4 current-count unit as the legacy generated FOC. */
+    volatile int16_t m_i_alpha_q4;
+    volatile int16_t m_i_beta_q4;
+    volatile int16_t m_id_q4;
+    volatile int16_t m_iq_q4;
+    volatile int16_t m_vd;
+    volatile int16_t m_vq;
+    volatile int16_t m_current_in_counts;
+    volatile int16_t m_rpm;
+    volatile int16_t m_duty_now_permille;
 
-  /* Hall / FOC transition and field-weakening parameters. */
-  int16_t foc_comm_rpm_low;              /* rpm * 16 */
-  int16_t foc_comm_rpm_high;             /* rpm * 16 */
-  uint8_t foc_fw_enable;
-  int16_t foc_fw_current_max;            /* current ADC counts * 16 (Q4) */
-  int16_t foc_fw_phase_advance_max;      /* degree * 16 */
-  int16_t foc_fw_rpm_start;              /* rpm * 16 */
-  int16_t foc_fw_rpm_end;                /* rpm * 16 */
+    /* Electrical phase: 0..65535 = 0..360 degrees. */
+    volatile uint16_t m_phase;
+    volatile uint16_t m_phase_hall;
+    volatile uint16_t m_phase_openloop;
+    volatile uint8_t m_phase_override;
 
-  uint8_t si_motor_pole_pairs;
-  mc_motor_type motor_type;
-  uint8_t foc_current_sample_map;         /* 0: AB measured, 1: BC measured */
-  uint8_t foc_encoder_enable;
-  uint8_t sensor_mode;                  /* 1 open-loop, 2 Hall, 3 encoder AB (Left only) */
-  uint8_t comm_mode;                    /* 1 six-step, 2 sine PWM, 3 SVPWM/FOC */
-  uint8_t m_diag_enable;
-} mc_configuration;
+    /* Hall estimator and fixed point regulators. */
+    uint8_t m_hall_state;
+    uint8_t m_hall_pos;
+    uint8_t m_hall_pos_prev;
+    int8_t m_hall_direction;
+    uint16_t m_hall_ticks;
+    uint16_t m_hall_period;
+    uint16_t m_hall_period_hist[4];
+    uint8_t m_hall_hist_pos;
+    uint8_t m_hall_initialized;
+    uint8_t m_hall_interp_active;
+    uint32_t m_hall_invalid_transition_count;
 
-typedef struct {
-  bool enable;
-  mc_control_mode control_mode;
-  int16_t control_setpoint;
-  uint8_t hall_a;
-  uint8_t hall_b;
-  uint8_t hall_c;
-  int16_t current_adc_1;
-  int16_t current_adc_2;
-  int16_t current_input;
-  int16_t phase_encoder_deg_x16;
-  uint16_t phase_openloop_q16;
-  int16_t rpm_sensor;
-} motor_input_t;
+    int32_t m_iq_integrator;
+    int32_t m_iq_set_ramp_q16;
+    int32_t m_id_integrator;
+    int32_t m_speed_integrator;
+    uint8_t m_iq_sat_hold;
+    uint8_t m_id_sat_hold;
+    uint8_t m_speed_sat_hold;
+    int32_t m_current_lpf_q16[2];
 
-typedef struct {
-  int16_t duty_a;
-  int16_t duty_b;
-  int16_t duty_c;
-  uint8_t fault_code;
-  int16_t rpm;
-  int16_t phase_electrical_deg;
-  int16_t iq;
-  int16_t id;
-} motor_output_t;
+    uint32_t m_openloop_phase_acc_q32;
+    int32_t m_openloop_speed_q16;
+    uint16_t m_openloop_align_ticks;
+    int8_t m_openloop_direction;
+    uint8_t m_openloop_primed;
+    int16_t m_openloop_id_target_q4;
+    int32_t m_openloop_id_ramp_q16;
 
-typedef struct {
-  int32_t integrator;
-  bool saturated;
-} foc_pi_state_t;
+    /* PWM and diagnostics. */
+    volatile int16_t m_pwm_a;
+    volatile int16_t m_pwm_b;
+    volatile int16_t m_pwm_c;
+    volatile uint16_t m_ccr_a;
+    volatile uint16_t m_ccr_b;
+    volatile uint16_t m_ccr_c;
+    volatile uint32_t m_isr_count;
+    volatile uint32_t m_overrun_count;
+    volatile uint32_t m_current_trip_count;
+} mcpwm_foc_motor_t;
 
-typedef struct {
-  int32_t iq_filter_state;
-  int32_t id_filter_state;
-  int16_t iq;
-  int16_t id;
-  int16_t iq_target;
-  int16_t id_target;
-  int16_t vq;
-  int16_t vd;
-} foc_state_t;
+extern mcpwm_foc_motor_t m_motor_1;
+extern mcpwm_foc_motor_t m_motor_2;
 
-typedef struct {
-  bool initialized;
-  int8_t sector;
-  int8_t direction;
-  uint16_t ticks;
-  uint16_t period;
-} hall_state_t;
+void mcpwm_foc_init(void);
+mcpwm_foc_motor_t *mcpwm_foc_get_motor(bool is_second_motor);
+const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool is_second_motor);
 
-typedef struct {
-  mc_configuration *m_conf;
-  mc_state m_state;
-  mc_control_mode m_control_mode;
-  motor_input_t m_input;
-  motor_output_t m_output;
-  foc_state_t m_motor_state;
-  foc_pi_state_t m_iq_pi;
-  foc_pi_state_t m_id_pi;
-  foc_pi_state_t m_speed_pi;
-  hall_state_t m_hall;
-  int16_t m_speed_est_fast;
-  uint16_t m_phase_now;
-  uint8_t m_last_motor_type;
-} motor_all_state_t;
+void mcpwm_foc_set_configuration(const mc_configuration *conf, bool is_second_motor);
+const volatile mc_configuration *mcpwm_foc_get_configuration(bool is_second_motor);
 
-extern motor_all_state_t m_motor_1;
-extern motor_all_state_t m_motor_2;
-extern mc_configuration m_mcconf_1;
-extern mc_configuration m_mcconf_2;
+void mcpwm_foc_set_duty(float duty, bool is_second_motor);
+void mcpwm_foc_set_pid_speed(float rpm, bool is_second_motor);
+void mcpwm_foc_set_current(float current, bool is_second_motor);
+void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
+void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
+void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
+void mcpwm_foc_release_motor(bool is_second_motor);
+void mcpwm_foc_vesc_override_touch(bool is_second_motor);
+bool mcpwm_foc_vesc_override_active(bool is_second_motor);
+bool mcpwm_foc_vesc_override_active_any(void);
 
-extern const int8_t m_hall_to_sector[8];
-extern const int8_t m_commutation_map[18];
-extern const int16_t m_sine_phase_a_q14[181];
-extern const int16_t m_sine_phase_b_q14[181];
-extern const int16_t m_sine_phase_c_q14[181];
-extern const int16_t m_sin_q15[256];
+/* Integer API used by the bare-metal command layer. */
+void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
+                                uint16_t openloop_rpm, bool is_second_motor);
 
-void mcpwm_foc_init_defaults(void);
-void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2);
-void mcpwm_foc_reset(motor_all_state_t *motor);
-void mcpwm_foc_control(motor_all_state_t *motor);
-/* Hardware/ISR telemetry. DMA1_Channel1_IRQHandler is implemented in mcpwm_foc.c
- * and keeps the validated ADC/DMA ordering from the proven firmware. */
-extern volatile uint32_t m_foc_isr_cycles;
-extern volatile uint32_t m_foc_isr_cycles_max;
-extern volatile int16_t m_foc_iq_left_q4;
-extern volatile int16_t m_foc_iq_right_q4;
-extern volatile int16_t m_foc_id_left_q4;
-extern volatile int16_t m_foc_id_right_q4;
-extern volatile uint16_t m_sensor_hall_left;
-extern volatile uint16_t m_sensor_hall_right;
-extern volatile int16_t m_sensor_rpm_left;
-extern volatile int16_t m_sensor_rpm_right;
-extern volatile uint8_t m_adc_current_valid;
-extern volatile uint8_t m_adc_current_valid_left;
-extern volatile uint8_t m_adc_current_valid_right;
+float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
+float mcpwm_foc_get_tot_current_in_motor(bool is_second_motor);
+float mcpwm_foc_get_rpm_motor(bool is_second_motor); /* mechanical RPM */
+float mcpwm_foc_get_erpm_motor(bool is_second_motor);  /* VESC electrical RPM */
+float mcpwm_foc_get_duty_cycle_motor(bool is_second_motor);
+float mcpwm_foc_get_id_motor(bool is_second_motor);
+float mcpwm_foc_get_iq_motor(bool is_second_motor);
+float mcpwm_foc_get_vd_motor(bool is_second_motor);
+float mcpwm_foc_get_vq_motor(bool is_second_motor);
+float mcpwm_foc_get_phase_motor(bool is_second_motor);
+mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
+mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
+void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
 
-void currentCalibrationStart(void);
-uint8_t currentCalibrationActive(void);
-uint16_t currentCalibrationProgressPermille(void);
-uint8_t currentCalibrationResetPending(void);
-void currentCalibrationFinalizeReset(void);
-void mcpwm_foc_sensor_state_reset(uint8_t is_second_motor);
+/* Hardware calibration / ISR diagnostics. */
+bool mcpwm_foc_dc_cal_done(void);
+void mcpwm_foc_get_current_offsets(int16_t *pha0, int16_t *pha1, int16_t *dc,
+                                   bool is_second_motor);
+uint32_t mcpwm_foc_get_isr_cycles(void);
+uint32_t mcpwm_foc_get_isr_cycles_max(void);
 
+/* Called from the original DMA1_Channel1_IRQHandler after ADC frame acquisition. */
+void mcpwm_foc_adc_int_handler(void);
 
-#endif /* MCPWM_FOC_H_ */
+#ifdef __cplusplus
+}
+#endif
+
+#endif

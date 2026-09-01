@@ -1,44 +1,47 @@
 #ifndef MCCONF_DEFAULT_H_
 #define MCCONF_DEFAULT_H_
 
-/* Runtime selection values exposed by the USART3 CLI. */
-#define MCCONF_SENSOR_OPENLOOP          1u
-#define MCCONF_SENSOR_HALL              2u
-#define MCCONF_SENSOR_ENCODER_AB        3u
+#include "config.h"
+#include "vesc/datatypes.h"
 
-#define MCCONF_COMM_SIX_STEP            1u
-#define MCCONF_COMM_SINE_PWM            2u
-#define MCCONF_COMM_SVPWM               3u
-
-#define MCCONF_CONTROL_PWM               1u
-#define MCCONF_CONTROL_CURRENT           2u
-#define MCCONF_CONTROL_SPEED             3u
-#define MCCONF_CONTROL_POSITION          4u
-
-/* One firmware image: both motors start on Hall + SVPWM + current control. */
-#define MCCONF_DEFAULT_SENSOR_LEFT       MCCONF_SENSOR_HALL
-#define MCCONF_DEFAULT_SENSOR_RIGHT      MCCONF_SENSOR_HALL
-#define MCCONF_DEFAULT_COMM_LEFT         MCCONF_COMM_SVPWM
-#define MCCONF_DEFAULT_COMM_RIGHT        MCCONF_COMM_SVPWM
-#define MCCONF_DEFAULT_CONTROL_LEFT      MCCONF_CONTROL_CURRENT
-#define MCCONF_DEFAULT_CONTROL_RIGHT     MCCONF_CONTROL_CURRENT
-
-/* VESC-style speed loop defaults. Engineering units are command/rpm x1000.
- * The integration update is Ki * error * dt exactly once; do not multiply dt
- * by another 1000. 100 RPM is intentionally allowed (no VESC 900-RPM floor). */
-#define MCCONF_S_PID_KP_X1000            500
-#define MCCONF_S_PID_KI_X1000            100
-#define MCCONF_S_PID_KD_X1000            0
-#define MCCONF_S_PID_I_LIMIT             400
-#define MCCONF_S_PID_OUTPUT_LIMIT        700
-#define MCCONF_S_PID_D_FILTER_X1000      850
-#define MCCONF_S_PID_MIN_RPM             5
-
-#define MCCONF_P_PID_KP_X1000            20
-#define MCCONF_P_PID_KI_X1000            0
-#define MCCONF_P_PID_KD_X1000            0
-#define MCCONF_P_PID_I_LIMIT_RPM         150
-#define MCCONF_P_PID_SPEED_LIMIT_RPM     250
-#define MCCONF_P_PID_DEADBAND_COUNTS     4
+/* VESC-style configuration names, values inherited from the proven fixed-point
+ * EFeru/hoverboard controller. Runtime FOC math remains integer/fixed-point. */
+#define MCCONF_L_CURRENT_MAX                 15.0f
+#define MCCONF_L_CURRENT_MIN                -15.0f
+#define MCCONF_L_IN_CURRENT_MAX              17.0f
+#define MCCONF_L_IN_CURRENT_MIN             -17.0f
+#define MCCONF_L_MAX_ERPM                 15000.0f
+#define MCCONF_L_MIN_ERPM                -15000.0f
+#define MCCONF_FOC_SENSOR_MODE      FOC_SENSOR_MODE_HALL
+#define MCCONF_FOC_CURRENT_KP_Q11           1229u
+#define MCCONF_FOC_CURRENT_KI_Q16           1229u
+#define MCCONF_FOC_ID_KP_Q11                 819u
+#define MCCONF_FOC_ID_KI_Q16                 737u
+#define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
+#define MCCONF_SPEED_KP_Q11                  4833u
+#define MCCONF_SPEED_KI_Q16                   251u
+#define MCCONF_FOC_VOLTAGE_MAX              14400
+/* Closed-loop current/speed headroom for the hoverboard two-shunt ADC.
+ * V9 logs stay clean below ~80% duty and become noisy around 83..90%.
+ * Mode 1 keeps the proven 14400 direct-voltage ceiling. */
+#define MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX   12800
+#define MCCONF_CURRENT_SLEW_A_PER_S              10u
+#define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
+#define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
+#define MCCONF_POLE_PAIRS_LEFT               15u
+#define MCCONF_POLE_PAIRS_RIGHT              15u
+#define MCCONF_HALL_INTERP_ENABLE              1u
+#define MCCONF_HALL_INTERP_ON_RPM              30
+#define MCCONF_HALL_INTERP_OFF_RPM             15
+#define MCCONF_FOC_CONTROL_DIV                  3u
+#define MCCONF_HALL_TIMEOUT_TICKS            2000u
+#define MCCONF_TRQ_STOP_BRAKE_CA      TRQ_STOP_BRAKE_CA
+#define MCCONF_TRQ_STOP_RPM_DEADBAND  TRQ_STOP_RPM_DEADBAND
+#define MCCONF_OPENLOOP_RPM_DEFAULT   SVPWM_OPENLOOP_RPM_DEFAULT
+#define MCCONF_OPENLOOP_RPM_MAX       SVPWM_OPENLOOP_RPM_MAX
+#define MCCONF_OPENLOOP_ACCEL_RPM_S   SVPWM_ACCEL_RPM_PER_S
+#define MCCONF_OPENLOOP_ALIGN_MS       SVPWM_ALIGN_MS
+#define MCCONF_OPENLOOP_ID_SLEW_A_S    SVPWM_ID_SLEW_A_PER_S
+#define MCCONF_VESC_TIMEOUT_MS               500u
 
 #endif

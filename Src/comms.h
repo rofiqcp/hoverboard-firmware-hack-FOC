@@ -24,7 +24,7 @@
 #include "stm32f1xx_hal.h"
 
 
-enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,INT,FLOAT};
+enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,FLOAT};
 #define typename(x) _Generic((x), \
     uint8_t:    UINT8_T, \
     uint16_t:   UINT16_T, \
@@ -34,8 +34,8 @@ enum types {UINT8_T,UINT16_T,UINT32_T,INT8_T,INT16_T,INT32_T,INT,FLOAT};
     int32_t:    INT32_T, \
     float:      FLOAT)
 
-#define PARAM_SIZE(param) sizeof(param) / sizeof(parameter_entry)
-#define COMMAND_SIZE(command) sizeof(command) / sizeof(command_entry)
+#define PARAM_SIZE(param) ((int)(sizeof(param) / sizeof(parameter_entry)))
+#define COMMAND_SIZE(command) ((int)(sizeof(command) / sizeof(command_entry)))
 
 #define ADD_PARAM(var) typename(var),&var
 
@@ -50,7 +50,6 @@ int32_t getParamValExt(uint8_t index);
 int8_t initParamVal(uint8_t index);
 
 int8_t saveAllParamVal();
-void loadAllParamVal(void);
 int16_t getParamInitInt(uint8_t index);
 int32_t getParamInitExt(uint8_t index);
 int8_t printCommandHelp(uint8_t index);

@@ -1,4 +1,2 @@
 pyserial>=3.5
 prompt_toolkit>=3.0
-PyQt5>=5.15
-pyqtgraph>=0.13

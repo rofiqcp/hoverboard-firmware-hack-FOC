@@ -22,6 +22,7 @@ typedef struct {
   int16_t dband;
 } InputStruct;
 
+void BLDC_Init(void);
 void Input_Lim_Init(void);
 void Input_Init(void);
 void UART_DisableRxErrors(UART_HandleTypeDef *huart);

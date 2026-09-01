@@ -8,24 +8,26 @@
 #include "eeprom.h"
 #include "util.h"
 #include "motor/mcpwm_foc.h"
-#include "comms.h"
 #include "motor/mc_interface.h"
+#include "vesc/vesc_protocol.h"
+#include "comms.h"
 
 extern UART_HandleTypeDef huart3;
-extern uint8_t m_buzzer_count;
-extern uint8_t m_buzzer_freq;
-extern uint8_t m_buzzer_pattern;
-extern uint8_t m_motor_enable;
+extern uint8_t buzzerCount;
+extern uint8_t buzzerFreq;
+extern uint8_t buzzerPattern;
+extern uint8_t enable;
 
-/* Motor/configuration instances are defined in motor/mcpwm_foc.c. */
 InputStruct input1[INPUTS_NR] = {{0, 0, 0, PRI_INPUT1}};
 InputStruct input2[INPUTS_NR] = {{0, 0, 0, PRI_INPUT2}};
 
 int16_t speedAvg = 0;
 int16_t speedAvgAbs = 0;
 uint8_t timeoutFlgSerial = 1;
+uint8_t ctrlModReqRaw = CTRL_MOD_REQ;
+uint8_t ctrlModReq = OPEN_MODE;
 
-uint16_t VirtAddVarTab[NB_OF_VAR];
+uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002};
 
 static int16_t inputMax = 1000;
 static int16_t inputMin = -1000;
@@ -48,14 +50,13 @@ int _write(int file, char *data, int len) {
 }
 #endif
 
+void BLDC_Init(void) {
+  mc_interface_init(true);
+}
+
 void Input_Lim_Init(void) {
-  if (m_mcconf_1.foc_fw_enable || m_mcconf_2.foc_fw_enable) {
-    inputMax = MAX(1000, FIELD_WEAK_HI);
-    inputMin = MIN(-1000, -FIELD_WEAK_HI);
-  } else {
-    inputMax = 1000;
-    inputMin = -1000;
-  }
+  inputMax = 1500;
+  inputMin = -1500;
 }
 
 void UART_DisableRxErrors(UART_HandleTypeDef *huart) {
@@ -65,40 +66,52 @@ void UART_DisableRxErrors(UART_HandleTypeDef *huart) {
 
 void Input_Init(void) {
   UART3_Init();
+  vesc_protocol_init();
   HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
   UART_DisableRxErrors(&huart3);
 
-  for (uint16_t i = 0; i < NB_OF_VAR; ++i) VirtAddVarTab[i] = (uint16_t)(1000u + i);
+  uint16_t writeCheck = 0;
+  uint16_t value = 0;
   HAL_FLASH_Unlock();
   EE_Init();
+  if (EE_ReadVariable(VirtAddVarTab[0], &writeCheck) == 0 && writeCheck == FLASH_WRITE_KEY) {
+    if (EE_ReadVariable(VirtAddVarTab[1], &value) == 0) {
+      if (value >= 1 && value <= 40) {
+        m_motor_1.m_conf.l_current_max = m_motor_2.m_conf.l_current_max = (float)value;
+        m_motor_1.m_conf.l_current_min = m_motor_2.m_conf.l_current_min = -(float)value;
+      }
+    }
+    if (EE_ReadVariable(VirtAddVarTab[2], &value) == 0) { (void)value; /* N_MOT_MAX kept compile-time in fixed speed PI. */ }
+  }
   HAL_FLASH_Lock();
 }
 
 void poweronMelody(void) {
-  m_buzzer_count = 0;
+  buzzerCount = 0;
   for (int i = 8; i >= 0; --i) {
-    m_buzzer_freq = (uint8_t)i;
+    buzzerFreq = (uint8_t)i;
     HAL_Delay(100);
   }
-  m_buzzer_freq = 0;
+  buzzerFreq = 0;
 }
 
 void beepCount(uint8_t cnt, uint8_t freq, uint8_t pattern) {
-  m_buzzer_count = cnt;
-  m_buzzer_freq = freq;
-  m_buzzer_pattern = pattern;
+  buzzerCount = cnt;
+  buzzerFreq = freq;
+  buzzerPattern = pattern;
 }
 
 void beepShort(uint8_t freq) {
-  m_buzzer_count = 0;
-  m_buzzer_freq = freq;
+  buzzerCount = 0;
+  buzzerFreq = freq;
   HAL_Delay(100);
-  m_buzzer_freq = 0;
+  buzzerFreq = 0;
 }
 
 void calcAvgSpeed(void) {
-  /* Sensor snapshots are refreshed regardless of the active control algorithm. */
-  speedAvg = (m_sensor_rpm_left - m_sensor_rpm_right) / 2;
+  const int16_t rpmL = mcpwm_foc_get_motor_const(false)->m_rpm;
+  const int16_t rpmR = mcpwm_foc_get_motor_const(true)->m_rpm;
+  speedAvg = (rpmL - rpmR) / 2;
   speedAvgAbs = abs(speedAvg);
 }
 
@@ -110,7 +123,6 @@ static void serialAcceptCommand(const uint8_t *frame) {
     serialCommand = candidate;
     serialTimeoutCount = 0;
     timeoutFlgSerial = 0;
-    if (candidate.cmdL != 0 || candidate.cmdR != 0) m_live_stream_enabled = 1u;
   }
 }
 
@@ -133,7 +145,7 @@ static void debugAcceptByte(uint8_t byte) {
   }
 }
 
-static void serialAcceptByte(uint8_t byte) {
+static void serialAcceptLegacyByte(uint8_t byte) {
   const uint8_t startLo = (uint8_t)(SERIAL_START_FRAME & 0xffu);
   const uint8_t startHi = (uint8_t)(SERIAL_START_FRAME >> 8);
 
@@ -152,7 +164,7 @@ static void serialAcceptByte(uint8_t byte) {
     } else {
       debugAcceptByte(frameBuffer[0]);
       frameIndex = 0;
-      serialAcceptByte(byte);
+      serialAcceptLegacyByte(byte);
     }
     return;
   }
@@ -162,6 +174,17 @@ static void serialAcceptByte(uint8_t byte) {
     serialAcceptCommand(frameBuffer);
     frameIndex = 0;
   }
+}
+
+static void serialAcceptByte(uint8_t byte) {
+  /* VESC packets use binary start markers 2/3/4. Never steal bytes that are
+   * already inside the legacy 0xABCD command frame. Once a VESC packet has
+   * started, all bytes go to its parser until the frame is complete/reset. */
+  if (frameIndex == 0u && (vesc_protocol_rx_in_progress() || byte == 2u || byte == 3u || byte == 4u)) {
+    (void)vesc_protocol_rx_byte(byte);
+    return;
+  }
+  serialAcceptLegacyByte(byte);
 }
 
 void usart3_rx_check(void) {
@@ -193,19 +216,22 @@ void readCommand(void) {
   if (timeoutFlgSerial) {
     input1[0].cmd = 0;
     input2[0].cmd = 0;
+    ctrlModReq = OPEN_MODE;
+  } else {
+    ctrlModReq = ctrlModReqRaw;
   }
 }
 
 void poweroff(void) {
-  m_motor_enable = 0;
+  enable = 0;
   printf("-- Motors disabled --\r\n");
-  m_buzzer_count = 0;
-  m_buzzer_pattern = 0;
+  buzzerCount = 0;
+  buzzerPattern = 0;
   for (uint8_t i = 0; i < 8; ++i) {
-    m_buzzer_freq = i;
+    buzzerFreq = i;
     HAL_Delay(100);
   }
-  m_buzzer_freq = 0;
+  buzzerFreq = 0;
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_RESET);
   while (1) { }
 }
@@ -213,7 +239,7 @@ void poweroff(void) {
 void poweroffPressCheck(void) {
   if (!HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) return;
   uint16_t pressedMs = 0;
-  m_motor_enable = 0;
+  enable = 0;
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) {
     HAL_Delay(10);
     if (pressedMs < 60000) pressedMs += 10;

@@ -38,35 +38,16 @@ pb10 usart3 dma1 channel2/3
 #include "defines.h"
 #include "config.h"
 #include "setup.h"
-#include <stddef.h>
-
-/* DMA1 CH1 reads five 32-bit ADC1/ADC2 dual-mode words. The field order below
- * is therefore a hardware ABI, not an ordinary C struct that may be reordered.
- * Keep this locked to the proven baseline so a refactor cannot silently map a
- * phase-current sample onto the wrong ADC channel. */
-_Static_assert(sizeof(adc_buf_t) == 10u * sizeof(uint16_t), "adc_buf_t dual-ADC DMA size changed");
-_Static_assert(offsetof(adc_buf_t, dcr) == 0u,  "ADC word0 ADC1 mapping changed");
-_Static_assert(offsetof(adc_buf_t, dcl) == 2u,  "ADC word0 ADC2 mapping changed");
-_Static_assert(offsetof(adc_buf_t, rlA) == 4u,  "ADC word1 ADC1 mapping changed");
-_Static_assert(offsetof(adc_buf_t, rlB) == 6u,  "ADC word1 ADC2 mapping changed");
-_Static_assert(offsetof(adc_buf_t, rrB) == 8u,  "ADC word2 ADC1 mapping changed");
-_Static_assert(offsetof(adc_buf_t, rrC) == 10u, "ADC word2 ADC2 mapping changed");
-_Static_assert(offsetof(adc_buf_t, batt1) == 12u, "ADC word3 ADC1 mapping changed");
-_Static_assert(offsetof(adc_buf_t, adc2_spare4) == 14u, "ADC word3 ADC2 mapping changed");
-_Static_assert(offsetof(adc_buf_t, temp) == 16u, "ADC word4 ADC1 mapping changed");
-_Static_assert(offsetof(adc_buf_t, adc2_spare5) == 18u, "ADC word4 ADC2 mapping changed");
-_Static_assert(ADC_TOTAL_CONV_TIME == 80u, "ADC trigger phase no longer matches validated 16 MHz/7.5-cycle timing");
 
 TIM_HandleTypeDef htim_right;
 TIM_HandleTypeDef htim_left;
-TIM_HandleTypeDef htim_encoder_left;
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 UART_HandleTypeDef huart3;
 
 DMA_HandleTypeDef hdma_usart3_rx;
 DMA_HandleTypeDef hdma_usart3_tx;
-volatile adc_buf_t m_adc_buffer;
+volatile adc_buf_t adc_buffer;
 
 
 
@@ -195,14 +176,12 @@ void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 
-  /* One runtime image: PB5/PB6/PB7 boot as Hall inputs. Sensor re-init in
-   * mc_interface switches PB6/PB7 to encoder pull-ups only when Encoder AB is
-   * selected. Keeping the boot state identical to the proven Hall firmware
-   * avoids changing current-ADC/PWM timing. */
   GPIO_InitStruct.Pin = LEFT_HALL_U_PIN;
   HAL_GPIO_Init(LEFT_HALL_U_PORT, &GPIO_InitStruct);
+
   GPIO_InitStruct.Pin = LEFT_HALL_V_PIN;
   HAL_GPIO_Init(LEFT_HALL_V_PORT, &GPIO_InitStruct);
+
   GPIO_InitStruct.Pin = LEFT_HALL_W_PIN;
   HAL_GPIO_Init(LEFT_HALL_W_PORT, &GPIO_InitStruct);
 
@@ -409,27 +388,6 @@ void MX_TIM_Init(void) {
 
   htim_left.Instance->RCR = 1;
 
-  /* TIM4 is initialized once but started/stopped at runtime by mc_interface.
-   * This does not touch TIM1/TIM8 ADC-trigger timing. */
-  __HAL_RCC_TIM4_CLK_ENABLE();
-  TIM_Encoder_InitTypeDef sEncoder = {0};
-  htim_encoder_left.Instance = TIM4;
-  htim_encoder_left.Init.Prescaler = 0;
-  htim_encoder_left.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim_encoder_left.Init.Period = 0xFFFFu;
-  htim_encoder_left.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim_encoder_left.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sEncoder.EncoderMode = TIM_ENCODERMODE_TI12;
-  sEncoder.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sEncoder.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sEncoder.IC1Prescaler = TIM_ICPSC_DIV1;
-  sEncoder.IC1Filter = 4;
-  sEncoder.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sEncoder.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sEncoder.IC2Prescaler = TIM_ICPSC_DIV1;
-  sEncoder.IC2Filter = 4;
-  HAL_TIM_Encoder_Init(&htim_encoder_left, &sEncoder);
-
   __HAL_TIM_ENABLE(&htim_right);
 }
 
@@ -491,7 +449,7 @@ void MX_ADC1_Init(void) {
   DMA1_Channel1->CCR   = 0;
   DMA1_Channel1->CNDTR = 5;
   DMA1_Channel1->CPAR  = (uint32_t) & (ADC1->DR);
-  DMA1_Channel1->CMAR  = (uint32_t)&m_adc_buffer;
+  DMA1_Channel1->CMAR  = (uint32_t)&adc_buffer;
   DMA1_Channel1->CCR   = DMA_CCR_MSIZE_1 | DMA_CCR_PSIZE_1 | DMA_CCR_MINC | DMA_CCR_CIRC | DMA_CCR_TCIE;
   DMA1_Channel1->CCR |= DMA_CCR_EN;
 

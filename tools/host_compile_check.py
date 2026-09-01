@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import subprocess, tempfile, shutil, sys
+ROOT=Path(__file__).resolve().parents[1]
+compilers=[c for c in ('gcc','clang') if shutil.which(c)]
+if not compilers:
+    raise SystemExit('No host C compiler')
+HAL=r'''#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+typedef struct { volatile uint32_t IDR, ODR; } GPIO_TypeDef;
+typedef struct { volatile uint32_t CR1,CR2,SMCR,DIER,SR,EGR,CCMR1,CCMR2,CCER,CNT,PSC,ARR,RCR,CCR1,CCR2,CCR3,CCR4,BDTR,DCR,DMAR; } TIM_TypeDef;
+typedef struct { volatile uint32_t ISR,IFCR; } DMA_TypeDef;
+typedef struct { volatile uint32_t CTRL,CYCCNT,CPICNT,EXCCNT,SLEEPCNT,LSUCNT,FOLDCNT,PCSR; } DWT_Type;
+typedef struct { volatile uint32_t CR1,CR2,CR3,BRR,DR,SR; } USART_TypeDef;
+typedef struct { volatile uint32_t CNDTR; } DMA_Channel_TypeDef;
+typedef struct { DMA_Channel_TypeDef *Instance; } DMA_HandleTypeDef;
+typedef struct { DMA_HandleTypeDef *hdmatx; DMA_HandleTypeDef *hdmarx; USART_TypeDef *Instance; uint32_t gState; } UART_HandleTypeDef;
+typedef struct { int dummy; } ADC_HandleTypeDef;
+typedef int GPIO_PinState;
+#define GPIO_PIN_RESET 0
+#define GPIO_PIN_SET 1
+extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern DMA_TypeDef _DMA1; extern DWT_Type _DWT;
+#define GPIOA (&_GPIOA)
+#define GPIOB (&_GPIOB)
+#define GPIOC (&_GPIOC)
+#define TIM1 (&_TIM1)
+#define TIM8 (&_TIM8)
+#define DMA1 (&_DMA1)
+#define DWT (&_DWT)
+#define DMA_IFCR_CTCIF1 (1u<<1)
+#define TIM_BDTR_MOE (1u<<15)
+#define GPIO_PIN_0 (1u<<0)
+#define GPIO_PIN_1 (1u<<1)
+#define GPIO_PIN_2 (1u<<2)
+#define GPIO_PIN_3 (1u<<3)
+#define GPIO_PIN_4 (1u<<4)
+#define GPIO_PIN_5 (1u<<5)
+#define GPIO_PIN_6 (1u<<6)
+#define GPIO_PIN_7 (1u<<7)
+#define GPIO_PIN_8 (1u<<8)
+#define GPIO_PIN_9 (1u<<9)
+#define GPIO_PIN_10 (1u<<10)
+#define GPIO_PIN_11 (1u<<11)
+#define GPIO_PIN_12 (1u<<12)
+#define GPIO_PIN_13 (1u<<13)
+#define GPIO_PIN_14 (1u<<14)
+#define GPIO_PIN_15 (1u<<15)
+#define UART_WORDLENGTH_8B 0
+#define HAL_OK 0
+#define HAL_UART_STATE_READY 0u
+#define USART_CR1_PEIE (1u<<8)
+#define USART_CR3_EIE (1u<<0)
+#define CLEAR_BIT(REG,BIT) ((REG)&=~(BIT))
+#define __HAL_DMA_GET_COUNTER(H) ((H) && (H)->Instance ? (H)->Instance->CNDTR : 0u)
+#define FLASH_TYPEPROGRAM_HALFWORD 0u
+#define FLASH_PAGE_SIZE 1024u
+#define HAL_MAX_DELAY 0xffffffffu
+
+typedef struct { uint32_t PLLState, PLLSource, PLLMUL; } RCC_PLLInitTypeDef;
+typedef struct { uint32_t OscillatorType, HSIState, HSICalibrationValue; RCC_PLLInitTypeDef PLL; } RCC_OscInitTypeDef;
+typedef struct { uint32_t ClockType, SYSCLKSource, AHBCLKDivider, APB1CLKDivider, APB2CLKDivider; } RCC_ClkInitTypeDef;
+typedef struct { uint32_t PeriphClockSelection, AdcClockSelection; } RCC_PeriphCLKInitTypeDef;
+typedef struct { volatile uint32_t DHCSR,DCRSR,DCRDR,DEMCR; } CoreDebug_Type;
+extern CoreDebug_Type _CoreDebug;
+#define CoreDebug (&_CoreDebug)
+#define CoreDebug_DEMCR_TRCENA_Msk (1u<<24)
+#define DWT_CTRL_CYCCNTENA_Msk 1u
+#define NVIC_PRIORITYGROUP_4 0u
+#define MemoryManagement_IRQn 0
+#define BusFault_IRQn 1
+#define UsageFault_IRQn 2
+#define SVCall_IRQn 3
+#define DebugMonitor_IRQn 4
+#define PendSV_IRQn 5
+#define SysTick_IRQn 6
+#define RCC_OSCILLATORTYPE_HSI 1u
+#define RCC_HSI_ON 1u
+#define RCC_PLL_ON 1u
+#define RCC_PLLSOURCE_HSI_DIV2 1u
+#define RCC_PLL_MUL16 16u
+#define RCC_CLOCKTYPE_HCLK 1u
+#define RCC_CLOCKTYPE_SYSCLK 2u
+#define RCC_CLOCKTYPE_PCLK1 4u
+#define RCC_CLOCKTYPE_PCLK2 8u
+#define RCC_SYSCLKSOURCE_PLLCLK 1u
+#define RCC_SYSCLK_DIV1 1u
+#define RCC_HCLK_DIV1 1u
+#define RCC_HCLK_DIV2 2u
+#define RCC_PERIPHCLK_ADC 1u
+#define RCC_ADCPCLK2_DIV4 4u
+#define RCC_ADCPCLK2_DIV8 8u
+#define FLASH_LATENCY_2 2u
+#define SYSTICK_CLKSOURCE_HCLK 1u
+#define __HAL_RCC_AFIO_CLK_ENABLE() ((void)0)
+#define __HAL_RCC_DMA1_CLK_DISABLE() ((void)0)
+static inline void HAL_Init(void){}
+static inline void HAL_NVIC_SetPriorityGrouping(uint32_t g){(void)g;}
+static inline void HAL_NVIC_SetPriority(int i,uint32_t p,uint32_t s){(void)i;(void)p;(void)s;}
+static inline int HAL_RCC_OscConfig(RCC_OscInitTypeDef *x){(void)x;return HAL_OK;}
+static inline int HAL_RCC_ClockConfig(RCC_ClkInitTypeDef *x,uint32_t f){(void)x;(void)f;return HAL_OK;}
+static inline int HAL_RCCEx_PeriphCLKConfig(RCC_PeriphCLKInitTypeDef *x){(void)x;return HAL_OK;}
+static inline uint32_t HAL_RCC_GetHCLKFreq(void){return 64000000u;}
+static inline int HAL_SYSTICK_Config(uint32_t x){(void)x;return HAL_OK;}
+static inline void HAL_SYSTICK_CLKSourceConfig(uint32_t x){(void)x;}
+static inline int HAL_ADC_Start(ADC_HandleTypeDef *h){(void)h;return HAL_OK;}
+
+static inline uint32_t HAL_GetTick(void){return 0u;}
+static inline void __disable_irq(void){}
+static inline void __enable_irq(void){}
+static inline void HAL_GPIO_TogglePin(GPIO_TypeDef *p, uint16_t pin){(void)p;(void)pin;}
+static inline void HAL_GPIO_WritePin(GPIO_TypeDef *p, uint16_t pin, GPIO_PinState s){(void)p;(void)pin;(void)s;}
+static inline GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p,uint16_t pin){(void)p;(void)pin;return GPIO_PIN_RESET;}
+static inline int HAL_UART_Transmit(UART_HandleTypeDef *h,uint8_t*d,uint16_t n,uint32_t t){(void)h;(void)d;(void)n;(void)t;return HAL_OK;}
+static inline int HAL_UART_Transmit_DMA(UART_HandleTypeDef *h,uint8_t*d,uint16_t n){(void)h;(void)d;(void)n;return HAL_OK;}
+static inline int HAL_UART_Receive_DMA(UART_HandleTypeDef *h,uint8_t*d,uint16_t n){(void)h;(void)d;(void)n;return HAL_OK;}
+static inline int HAL_FLASH_Unlock(void){return HAL_OK;}
+static inline int HAL_FLASH_Lock(void){return HAL_OK;}
+static inline int HAL_FLASH_Program(uint32_t type,uint32_t addr,uint64_t data){(void)type;(void)addr;(void)data;return HAL_OK;}
+static inline void HAL_Delay(uint32_t ms){(void)ms;}
+'''
+# Only changed/ported files; untouched board setup is inherited from the previously compiling V5.1 skeleton.
+sources=[
+# Compile the actual implementation files under Src/motor and Src/vesc directly.
+# No port_*.c wrapper translation units are used.
+'Src/motor/foc_math.c','Src/motor/mc_interface.c','Src/motor/mcpwm_foc.c',
+'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c','Src/vesc/vesc_protocol.c',
+'Src/comms.c','Src/util.c','Src/main.c'
+]
+with tempfile.TemporaryDirectory(prefix='vesc-final-host-') as td:
+    td=Path(td); (td/'stm32f1xx_hal.h').write_text(HAL)
+    for cc in compilers:
+        base=[cc,'-std=c11','-O0','-Wall','-Wextra','-Werror',f'-I{ROOT}',f'-I{ROOT/"Src"}',f'-I{ROOT/"Src/vesc"}',f'-I{td}']
+        for src in sources:
+            out=td/(Path(src).stem+'_'+cc+'.o')
+            cmd=base+['-c',str(ROOT/src),'-o',str(out)]
+            r=subprocess.run(cmd,text=True,capture_output=True)
+            if r.returncode:
+                print('FAIL',cc,src)
+                print(r.stdout+r.stderr)
+                sys.exit(r.returncode)
+            print('PASS',cc,'-Werror',src)
+print('HOST_COMPILE_CHANGED_SOURCES_PASS')

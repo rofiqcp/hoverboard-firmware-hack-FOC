@@ -11,7 +11,7 @@
 #define PWM_FREQ                 16000
 #define DEAD_TIME                48
 #define DELAY_IN_MAIN_LOOP       5
-#define A2BIT_CONV               50
+#define A2BIT_CONV               50  /* EFeru ADC current scaling: 50 count/A */
 #define ADC_CONV_TIME_7C5        20
 #define ADC_CONV_CLOCK_CYCLES    ADC_CONV_TIME_7C5
 #define ADC_CLOCK_DIV            4
@@ -40,23 +40,44 @@
 #define COM_CTRL                 0
 #define SIN_CTRL                 1
 #define FOC_CTRL                 2
+#define OPEN_MODE                0
+#define VLT_MODE                 1
+#define SPD_MODE                 2
+#define TRQ_MODE                 3
+#define SVPWM_MODE               4
 #define MOTOR_LEFT_ENA
 #define MOTOR_RIGHT_ENA
-/* One image. Runtime sensor/comm/control selection lives in mc_interface. */
-#define HW_PROFILE_ID            3u
-#define ADC_CALIBRATION_SAMPLES  2000u
-#define TELEMETRY_HZ             50u
-#define MAIN_LOOP_HZ              (1000u / DELAY_IN_MAIN_LOOP)
-#if (MAIN_LOOP_HZ % TELEMETRY_HZ) != 0
-#error "TELEMETRY_HZ must divide MAIN_LOOP_HZ exactly"
-#endif
+#define CTRL_TYP_SEL             FOC_CTRL
+#define CTRL_MOD_REQ             SPD_MODE
 
-/* Sensorless open-loop SVPWM (mode 4). Command keeps the same -1000..+1000 scale.
- * With N_MOT_MAX=1000 and 15 pole pairs, command 1000 corresponds to ~250 Hz electrical.
- * Modulation uses a small low-speed boost and then a linear V/f-style ramp. */
-#define SVPWM_POLE_PAIRS         15u
-#define SVPWM_MIN_MOD_PERMILLE   120u
-#define SVPWM_MAX_MOD_PERMILLE   850u
+/* Mode 4: VESC-style sensorless open-loop PHASE with closed current PI.
+ *
+ * Host command semantics are intentionally different from modes 1/2/3:
+ *   mode 4: |cmd| = Id target in ampere, sign = rotation direction.
+ *           Example: start 2,2 -> Id_ref = +2 A on both motors, Iq_ref = 0 A.
+ * The electrical angle is generated internally (no Hall/encoder feedback) and
+ * fed to the SAME generated Clarke/Park + Id/Iq PI + centered SVPWM path used
+ * by normal FOC. Hall remains sampled only for telemetry/RPM diagnostics.
+ *
+ * This follows the VESC open-loop-phase convention: Id=current, Iq=0, with a
+ * phase override. We add a slow phase rotation after alignment so the motor can
+ * spin sensorlessly while the current loop regulates the requested Id. */
+#define SVPWM_POLE_PAIRS                 15u
+#define SVPWM_ALIGN_MS                  600u
+#define SVPWM_ALIGN_PHASE             49152u   /* 3*pi/2 on uint16 electrical angle */
+#define SVPWM_OPENLOOP_RPM_DEFAULT       10u   /* mechanical RPM, sign comes from command */
+#define SVPWM_OPENLOOP_RPM_MAX          300u
+#define SVPWM_ACCEL_RPM_PER_S            20u
+#define SVPWM_ID_SLEW_A_PER_S             4u
+#define SVPWM_MAX_ID_A                   6u   /* sensorless detect/open-loop safety ceiling */
+#define SVPWM_PHASE_LIMIT_A               8u   /* fast phase-current chop threshold */
+#define SVPWM_DC_LIMIT_A                  8u   /* DC-link chop threshold during mode 4 */
+
+/* Torque/current mode uses direct centiampere command semantics:
+ *   cmd 50 = 0.50 A, cmd 100 = 1.00 A, cmd 1500 = 15.00 A.
+ * STOP braking is therefore also specified in centiamperes. */
+#define TRQ_STOP_BRAKE_CA               120    /* 1.20 A controlled brake current */
+#define TRQ_STOP_RPM_DEADBAND             5
 #define DIAG_ENA                 1
 #define I_MOT_MAX                15
 #define I_DC_MAX                 17
@@ -72,9 +93,11 @@
 #define RATE                     480
 #define FILTER                   6553
 
-/* Independent signed motor commands over USART3: cmdL, cmdR = -1000 .. +1000. */
-#define PRI_INPUT1               2, -1000, 0, 1000, 0
-#define PRI_INPUT2               2, -1000, 0, 1000, 0
+/* Independent signed motor commands over USART3. Mode 3 needs +/-1500 cA
+ * to represent the full +/-15 A range; modes 1/2 are still saturated by their
+ * own generated-controller limits, while mode 4 clamps to +/-I_MOT_MAX A. */
+#define PRI_INPUT1               2, -1500, 0, 1500, 0
+#define PRI_INPUT2               2, -1500, 0, 1500, 0
 #define INPUTS_NR                1
 #define FLASH_WRITE_KEY          0x1002
 
@@ -84,7 +107,7 @@
 #define DEBUG_SERIAL_USART3
 #define DEBUG_SERIAL_PROTOCOL
 #define SERIAL_START_FRAME       0xABCD
-#define SERIAL_BUFFER_SIZE       128
+#define SERIAL_BUFFER_SIZE       768
 #define SERIAL_DEBUG_LINE_SIZE   96
 #define SERIAL_TIMEOUT           160
 #define USART3_BAUD              115200
@@ -94,9 +117,5 @@
 #define SERIAL_STATUS_TIMEOUT    (1u << 1)
 #define SERIAL_STATUS_LEFT_FAULT (1u << 2)
 #define SERIAL_STATUS_RIGHT_FAULT (1u << 3)
-#define SERIAL_STATUS_CALIBRATING (1u << 4)
-#define SERIAL_STATUS_ADC_CURRENT_VALID (1u << 5)
-#define SERIAL_STATUS_ADC_LEFT_VALID    (1u << 6)
-#define SERIAL_STATUS_ADC_RIGHT_VALID   (1u << 7)
 
 #endif

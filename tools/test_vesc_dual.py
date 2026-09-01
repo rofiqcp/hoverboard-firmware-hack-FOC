@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+import importlib.util, pathlib, struct, sys
+p=pathlib.Path(__file__).with_name('vesc_dual.py')
+spec=importlib.util.spec_from_file_location('vd',p);vd=importlib.util.module_from_spec(spec);sys.modules['vd']=vd;spec.loader.exec_module(vd)
+pl=bytes([vd.COMM_SET_CURRENT])+struct.pack('>i',2500)
+f=vd.frame(pl)
+assert f[0]==2 and f[1]==len(pl) and f[-1]==3
+assert ((f[-3]<<8)|f[-2])==vd.crc16(pl)
+d=vd.PacketDecoder(); out=[]
+for chunk in (f[:2],f[2:5],f[5:]): out.extend(d.feed(chunk))
+assert out==[pl]
+fw=vd.VescDual.fwd(bytes([vd.COMM_FW_VERSION]))
+assert fw==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_FW_VERSION])
+mask=vd.VALUE_MASK
+payload=bytearray([vd.COMM_GET_VALUES_SELECTIVE])+bytearray(struct.pack('>I',mask))
+# bits 2,3,4,5
+for x in (150,-20,200,0): payload += struct.pack('>i',x)
+# bit6 duty, bit7 rpm, bit8 vin
+payload += struct.pack('>h',123)+struct.pack('>i',321)+struct.pack('>h',481)
+# bit15 fault, bit17 id
+payload += bytes([0,2])
+# bit19 vd, bit20 vq
+payload += struct.pack('>i',1200)+struct.pack('>i',-5000)
+v=vd.parse_selective(bytes(payload))
+assert abs(v.current_motor-1.5)<1e-9 and v.vesc_id==2 and v.rpm==321 and abs(v.vq+5)<1e-9
+print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id}')

@@ -1,248 +1,724 @@
 #!/usr/bin/env python3
-"""Interactive Arduino-monitor-like terminal for hoverboard USART3 control."""
+"""Interactive USART3 terminal for VESC-style baremetal dual-motor hoverboard firmware.
+
+The same USART3 link carries:
+- binary independent Left/Right motor commands (host -> STM32)
+- binary telemetry (STM32 -> host)
+- ASCII firmware debug commands (GET/SET/WATCH/INIT/SAVE/HELP)
+
+Normal workflow:
+    mode 1
+    start 50,50
+    drive 100,100
+    stop
+
+`start` begins CSV logging and starts the motors. `stop` commands 0,0, waits
+for the firmware rate limiter to reach an applied cmdL=0/cmdR=0, then closes
+and saves the CSV automatically.
+"""
 from __future__ import annotations
 
 import argparse
-import shlex
+import csv
+import struct
+import sys
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError as exc:
+    raise SystemExit(
+        "pyserial is required. Install with: python -m pip install -r tools/requirements.txt"
+    ) from exc
 
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.patch_stdout import patch_stdout
 except ImportError as exc:
-    raise SystemExit("Install: python3 -m pip install -r tools/requirements.txt") from exc
+    raise SystemExit(
+        "prompt_toolkit is required so telemetry does not overwrite typed commands. "
+        "Install with: python -m pip install -r tools/requirements.txt"
+    ) from exc
 
-from hoverlink import (
-    FB, SENSOR_NAMES, COMM_NAMES, CONTROL_NAMES, TELEMETRY_HZ,
-    CsvLogger, HoverLink, Telemetry, available_ports, clamp_cmd,
-)
+START = 0xABCD
+START_BYTES = struct.pack("<H", START)
+
+# Command: start, cmdL, cmdR, checksum
+CMD = struct.Struct("<HhhH")
+
+# Feedback V2 must match Src/main.c SerialFeedback exactly.  The field names
+# intentionally mirror VESC mc_values semantics while transport stays the proven
+# baremetal USART3 framing used by this board.
+# H,H = start, version
+# 20h = cmdL/R, rpmL/R, dutyL/R, currentMotorL/R, currentInL/R,
+#       idL/R, iqL/R, vdL/R, vqL/R, vIn, boardTemp
+# 11H = hallL/R, faultL/R, six raw ADC values, status
+# I,H = foc_isr_cycles, checksum
+FB = struct.Struct("<HH20h11HIH")
+
+CPU_HZ = 64_000_000
+FOC_HZ = 16_000
+FOC_BUDGET_CYCLES = CPU_HZ // FOC_HZ
+CMD_MIN = -1500
+CMD_MAX = 1500
+
+MODE_NAMES = {
+    1: "VLT",
+    2: "SPD",
+    3: "TRQ current (command in cA)",
+    4: "SVPWM sensorless Id-current PI (command magnitude in A)",
+}
 
 
-def parse_lr(tokens: list[str]) -> tuple[int, int]:
-    if len(tokens) == 1 and "," in tokens[0]:
-        a, b = tokens[0].split(",", 1)
-    elif len(tokens) == 2:
-        a, b = tokens
+def clamp_cmd(value: int, mode: int | None = None) -> int:
+    value = int(value)
+    if mode == 4:
+        # Mode 4 command magnitude is Id target in whole amperes.
+        limit = 15
+    elif mode == 3:
+        # Mode 3 command is centiamperes: +/-1500 = +/-15.00 A.
+        limit = 1500
     else:
-        raise ValueError("expected: L,R  or  L R")
-    return clamp_cmd(int(a)), clamp_cmd(int(b))
+        # Voltage/speed retain the established normalized +/-1000 range.
+        limit = 1000
+    return max(-limit, min(limit, value))
 
 
-class TerminalApp:
-    def __init__(self, port: str, baud: int, display_hz: float):
-        self.link = HoverLink(port, baud)
-        self.logger = CsvLogger(Path(__file__).resolve().parent / "logs")
-        self.target_l = 0
-        self.target_r = 0
-        self.latest: Telemetry | None = None
-        self.display_period = 1.0 / max(1.0, display_hz)
-        self.last_display = 0.0
-        self.stop_pending = False
-        self.stop_zero_frames = 0
+def xor16(words) -> int:
+    value = 0
+    for word in words:
+        value ^= int(word) & 0xFFFF
+    return value & 0xFFFF
+
+
+def make_command(cmd_l: int, cmd_r: int) -> bytes:
+    # Values are already mode-clamped by the interactive layer. Keep only the
+    # protocol int16 safety bound here so mode 3 can legally transmit +/-1500.
+    cmd_l = max(-32768, min(32767, int(cmd_l)))
+    cmd_r = max(-32768, min(32767, int(cmd_r)))
+    return CMD.pack(START, cmd_l, cmd_r, xor16((START, cmd_l, cmd_r)))
+
+
+def format_amp_centi(value_cA: int) -> str:
+    """Compact ampere display: 200 cA -> '2', 235 cA -> '2.35'."""
+    text = f"{value_cA / 100.0:.2f}".rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+@dataclass(frozen=True)
+class Telemetry:
+    """VESC-style user-facing telemetry over the existing baremetal frame.
+
+    Right rpm/iq/currentMotor are normalized by firmware so positive follows the
+    same forward/positive-wheel-torque convention as cmdR.  Id, Hall and raw ADC
+    stay in the physical controller convention for diagnostics.
+    """
+    version: int
+    cmd_l: int
+    cmd_r: int
+    rpm_l: int
+    rpm_r: int
+    duty_l_x1000: int
+    duty_r_x1000: int
+    current_motor_l_cA: int
+    current_motor_r_cA: int
+    current_in_l_cA: int
+    current_in_r_cA: int
+    id_l_cA: int
+    id_r_cA: int
+    iq_l_cA: int
+    iq_r_cA: int
+    vd_l_cV: int
+    vd_r_cV: int
+    vq_l_cV: int
+    vq_r_cV: int
+    battery_x100: int
+    temp_x10: int
+    hall_l: int
+    hall_r: int
+    fault_l: int
+    fault_r: int
+    adc_dcl: int
+    adc_rla: int
+    adc_rlb: int
+    adc_dcr: int
+    adc_rrb: int
+    adc_rrc: int
+    status: int
+    foc_cycles: int
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.status & 0x01)
+
+    @property
+    def timeout(self) -> bool:
+        return bool(self.status & 0x02)
+
+    @property
+    def stopped(self) -> bool:
+        return self.cmd_l == 0 and self.cmd_r == 0
+
+    def summary(self) -> str:
+        return (
+            f"cmd={self.cmd_l},{self.cmd_r} "
+            f"rpm={self.rpm_l},{self.rpm_r} "
+            f"duty={self.duty_l_x1000/10:.1f}%,{self.duty_r_x1000/10:.1f}% "
+            f"iq={format_amp_centi(self.iq_l_cA)},{format_amp_centi(self.iq_r_cA)} "
+            f"id={format_amp_centi(self.id_l_cA)},{format_amp_centi(self.id_r_cA)} "
+            f"iin={format_amp_centi(self.current_in_l_cA)},{format_amp_centi(self.current_in_r_cA)} "
+            f"vd={self.vd_l_cV/100:.2f},{self.vd_r_cV/100:.2f} "
+            f"vq={self.vq_l_cV/100:.2f},{self.vq_r_cV/100:.2f} "
+            f"fault={self.fault_l},{self.fault_r} "
+            f"hall={self.hall_l & 0x7:03b},{self.hall_r & 0x7:03b} "
+            f"dcl={self.adc_dcl} rla={self.adc_rla} rlb={self.adc_rlb} "
+            f"dcr={self.adc_dcr} rrb={self.adc_rrb} rrc={self.adc_rrc} "
+            f"cycle={self.foc_cycles}"
+        )
+
+
+def decode_feedback(packet: bytes) -> Telemetry | None:
+    if len(packet) != FB.size:
+        return None
+    fields = FB.unpack(packet)
+    if fields[0] != START or fields[1] != 2:
+        return None
+
+    # XOR all 16-bit words before checksum.  The 32-bit ISR cycle counter
+    # contributes its low and high words exactly as firmware feedbackChecksum().
+    words = list(fields[:33])
+    cycles = fields[33]
+    words.extend((cycles & 0xFFFF, (cycles >> 16) & 0xFFFF))
+    expected = xor16(words)
+    if fields[34] != expected:
+        return None
+
+    return Telemetry(*fields[1:34])
+
+
+class CsvLogger:
+    FIELDNAMES = [
+        "host_time", "elapsed_s", "telemetry_version",
+        "cmdL", "cmdR", "rpmL", "rpmR", "dutyL_pct", "dutyR_pct",
+        "currentMotorL_A", "currentMotorR_A", "currentInL_A", "currentInR_A",
+        "idL_A", "idR_A", "iqL_A", "iqR_A",
+        "vdL_V", "vdR_V", "vqL_V", "vqR_V",
+        "hallL", "hallR", "faultL", "faultR",
+        "dcl_raw", "rla_raw", "rlb_raw", "dcr_raw", "rrb_raw", "rrc_raw",
+        "battery_V", "temperature_C", "foc_isr_cycles", "foc_isr_us",
+        "foc_isr_load_pct", "status",
+    ]
+
+    def __init__(self, directory: Path):
+        self.directory = directory
         self._lock = threading.Lock()
-        self._run = True
-        self.link.on_telemetry = self.on_telemetry
-        self.link.on_debug = lambda line: print(f"[DBG] {line}")
-        self.link.on_error = lambda err: print(f"[SERIAL ERROR] {err}")
-        self.tx = threading.Thread(target=self.tx_loop, daemon=True)
-        self.tx.start()
+        self._fp = None
+        self._writer = None
+        self._path: Path | None = None
+        self._started_mono = 0.0
+        self._rows = 0
 
-    def tx_loop(self) -> None:
-        period = 1.0 / TELEMETRY_HZ
-        deadline = time.monotonic()
-        while self._run:
-            with self._lock: l, r = self.target_l, self.target_r
-            try: self.link.send_command(l, r)
-            except Exception as exc:
-                print(f"[TX ERROR] {exc}"); return
-            deadline += period
-            time.sleep(max(0.0, deadline - time.monotonic()))
-
-    def on_telemetry(self, t: Telemetry) -> None:
-        self.latest = t
-        if self.logger.active:
-            self.logger.write(t)  # every valid firmware frame = 50 Hz
-        now = time.monotonic()
-        if now - self.last_display >= self.display_period:
-            print(t.summary())
-            self.last_display = now
-
-        if self.stop_pending:
-            if t.stopped:
-                self.stop_zero_frames += 1
-            else:
-                self.stop_zero_frames = 0
-            if self.stop_zero_frames >= 3:
-                self.stop_pending = False
-                path, rows, missed = self.logger.stop()
-                print("[STOP] cmdL=0 cmdR=0 confirmed")
-                if path:
-                    print(f"[CSV] saved {rows} rows @50Hz -> {path} (missed_seq={missed})")
-
-    def set_target(self, l: int, r: int) -> None:
+    @property
+    def active(self) -> bool:
         with self._lock:
-            self.target_l, self.target_r = clamp_cmd(l), clamp_cmd(r)
+            return self._fp is not None
 
-    def fully_stopped(self) -> bool:
-        with self._lock: target_zero = self.target_l == 0 and self.target_r == 0
-        return bool(target_zero and self.latest and self.latest.stopped and abs(self.latest.rpm_l) <= 5 and abs(self.latest.rpm_r) <= 5 and not self.stop_pending)
+    @property
+    def path(self) -> Path | None:
+        with self._lock:
+            return self._path
 
-    def cmd_mode(self, kind: str, side: str | None, value: int) -> None:
-        kind = kind.lower()
-        if kind == "controll":
-            kind = "control"
-        if kind not in ("sensor", "comm", "control"):
-            raise ValueError("mode type must be sensor|comm|control")
-        side_l = side.lower() if side else None
-        if side_l not in (None, "left", "right", "l", "r"):
-            raise ValueError("side must be left or right")
-        limits = {"sensor": (1, 3), "comm": (1, 3), "control": (1, 4)}
-        lo, hi = limits[kind]
-        if not lo <= value <= hi:
-            raise ValueError(f"{kind} must be {lo}..{hi}")
-        if kind == "sensor" and value == 3 and side_l in (None, "right", "r"):
-            raise ValueError("encoder AB (sensor 3) is Left-only")
-        if kind == "control" and value == 4 and side_l not in ("left", "l"):
-            raise ValueError("position control (control 4) requires explicit Left + encoder AB")
-        if not self.fully_stopped():
-            print("[MODE] rejected: STOP and wait until cmd=0,0 and |rpm|<=5 first"); return
-        cmd = f"mode {kind}"
-        if side_l: cmd += " " + ("left" if side_l in ("left","l") else "right")
-        cmd += f" {value}"
-        self.link.send_debug(cmd)
-        print(f"[MODE] requested: {cmd}")
+    def start(self, mode: int | None) -> Path:
+        with self._lock:
+            if self._fp is not None:
+                raise RuntimeError("CSV logging is already active")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix = f"_mode{mode}" if mode in MODE_NAMES else ""
+            path = self.directory / f"hover_{stamp}{suffix}.csv"
+            self._fp = path.open("w", newline="", encoding="utf-8")
+            self._writer = csv.DictWriter(self._fp, fieldnames=self.FIELDNAMES)
+            self._writer.writeheader()
+            self._fp.flush()
+            self._path = path
+            self._started_mono = time.monotonic()
+            self._rows = 0
+            return path
 
-    def cmd_live(self, enabled: bool) -> None:
-        self.link.send_debug("live on" if enabled else "live off")
-        print(f"[LIVE] {'ON' if enabled else 'OFF'}")
+    def write(self, tel: Telemetry) -> None:
+        with self._lock:
+            if self._fp is None or self._writer is None:
+                return
+            now = datetime.now().isoformat(timespec="milliseconds")
+            elapsed = time.monotonic() - self._started_mono
+            self._writer.writerow(
+                {
+                    "host_time": now, "elapsed_s": f"{elapsed:.3f}",
+                    "telemetry_version": tel.version,
+                    "cmdL": tel.cmd_l, "cmdR": tel.cmd_r,
+                    "rpmL": tel.rpm_l, "rpmR": tel.rpm_r,
+                    "dutyL_pct": f"{tel.duty_l_x1000 / 10.0:.1f}",
+                    "dutyR_pct": f"{tel.duty_r_x1000 / 10.0:.1f}",
+                    "currentMotorL_A": f"{tel.current_motor_l_cA / 100.0:.2f}",
+                    "currentMotorR_A": f"{tel.current_motor_r_cA / 100.0:.2f}",
+                    "currentInL_A": f"{tel.current_in_l_cA / 100.0:.2f}",
+                    "currentInR_A": f"{tel.current_in_r_cA / 100.0:.2f}",
+                    "idL_A": f"{tel.id_l_cA / 100.0:.2f}",
+                    "idR_A": f"{tel.id_r_cA / 100.0:.2f}",
+                    "iqL_A": f"{tel.iq_l_cA / 100.0:.2f}",
+                    "iqR_A": f"{tel.iq_r_cA / 100.0:.2f}",
+                    "vdL_V": f"{tel.vd_l_cV / 100.0:.2f}",
+                    "vdR_V": f"{tel.vd_r_cV / 100.0:.2f}",
+                    "vqL_V": f"{tel.vq_l_cV / 100.0:.2f}",
+                    "vqR_V": f"{tel.vq_r_cV / 100.0:.2f}",
+                    "hallL": f"{tel.hall_l & 0x7:03b}", "hallR": f"{tel.hall_r & 0x7:03b}",
+                    "faultL": tel.fault_l, "faultR": tel.fault_r,
+                    "dcl_raw": tel.adc_dcl, "rla_raw": tel.adc_rla, "rlb_raw": tel.adc_rlb,
+                    "dcr_raw": tel.adc_dcr, "rrb_raw": tel.adc_rrb, "rrc_raw": tel.adc_rrc,
+                    "battery_V": f"{tel.battery_x100 / 100.0:.2f}",
+                    "temperature_C": f"{tel.temp_x10 / 10.0:.1f}",
+                    "foc_isr_cycles": tel.foc_cycles,
+                    "foc_isr_us": f"{tel.foc_cycles * 1_000_000.0 / CPU_HZ:.3f}",
+                    "foc_isr_load_pct": f"{tel.foc_cycles * 100.0 / FOC_BUDGET_CYCLES:.2f}",
+                    "status": tel.status,
+                }
+            )
+            self._rows += 1
+            if (self._rows % 20) == 0:
+                self._fp.flush()
 
-    def cmd_start(self, l: int, r: int) -> None:
-        if not self.latest:
-            print("[START] no telemetry yet"); return
-        if self.latest.calibrating:
-            print("[START] rejected: ADC calibration still active"); return
-        if not self.fully_stopped():
-            print("[START] rejected: controller is not at full STOP"); return
-        self.link.send_debug("live on")
-        path = self.logger.start(self.latest.mode)
-        self.set_target(l, r)
-        print(f"[CSV] recording every telemetry frame (50 Hz) -> {path}")
-        print(f"[START] cmdL={l} cmdR={r}")
+    def stop(self) -> tuple[Path | None, int]:
+        with self._lock:
+            path = self._path
+            rows = self._rows
+            if self._fp is not None:
+                self._fp.flush()
+                self._fp.close()
+            self._fp = None
+            self._writer = None
+            self._path = None
+            self._rows = 0
+            return path, rows
 
-    def cmd_drive(self, l: int, r: int) -> None:
-        if self.stop_pending:
-            print("[DRIVE] wait for STOP ramp-down to finish"); return
-        self.set_target(l, r)
-        print(f"[DRIVE] target cmdL={l} cmdR={r}")
 
-    def cmd_stop(self) -> None:
-        self.set_target(0, 0)
-        self.stop_pending = True
-        self.stop_zero_frames = 0
-        # Send zero immediately as well as through the periodic keepalive loop.
-        self.link.send_command(0, 0)
-        print("[STOP] immediate target=0,0; firmware zero-vector STOP requested")
+class HoverSerial:
+    def __init__(self, port: str, baud: int, logger: CsvLogger, print_hz: float = 10.0):
+        self.ser = serial.Serial(port, baud, timeout=0.05, write_timeout=0.5)
+        self.logger = logger
+        self.stop_event = threading.Event()
+        self.buffer = bytearray()
+        self.write_lock = threading.Lock()
+        self.telemetry_lock = threading.Lock()
+        self.latest: Telemetry | None = None
+        self.telemetry_seq = 0
+        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self.last_print = 0.0
+        self.print_period = 1.0 / max(1.0, print_hz)
 
-    def cmd_calibrate(self) -> None:
-        if not self.fully_stopped():
-            print("[CAL] rejected: STOP and wait until cmd=0,0 first"); return
-        if self.logger.active:
-            print("[CAL] rejected: finish/save the current CSV run first"); return
-        self.link.send_debug("CALIBRATE")
-        print("[CAL] requested: six current ADC offsets: bridge OFF + proven 2000-sample recursive convergence (~125 ms) + controller state reset")
-
-    def help(self) -> None:
-        print("""
-Commands
-  mode sensor [left|right] N   N=1 openloop, 2 Hall, 3 encoder AB (Left only)
-  mode comm [left|right] N     N=1 six-step, 2 sine PWM, 3 SVPWM
-  mode control [left|right] N  N=1 PWM, 2 current, 3 speed, 4 position (Left encoder)
-                               omit side => apply both (except sensor 3)
-  live on | live off           enable/disable binary telemetry stream
-  start L,R                    start target + LIVE ON + begin 50-Hz CSV
-  drive L,R                    change Left/Right target while running
-  stop                         immediate authoritative 0,0 + save CSV after confirmed stop
-  calibrate                    current-ADC calibration (STOP only)
-  status                       latest telemetry
-  GET/SET/WATCH/SAVE ...       raw debug command
-  quit                         stop, save CSV, close
-Examples
-  mode sensor 2
-  mode comm 3
-  mode control 3
-  start 100,100
-  stop
-  mode sensor left 3
-""".strip())
-
-    def run(self) -> None:
-        print(f"Connected {self.link.port} @ {self.link.baud}; feedback={FB.size} bytes; telemetry={TELEMETRY_HZ} Hz")
-        print("Left/Right independent control over USART3")
-        print("runtime modes: sensor 1/2/(3 Left), comm 1/2/3, control 1/2/3/(4 Left encoder)")
-        print("type 'help' for commands")
-        session = PromptSession("hover> ")
-        with patch_stdout(raw=True):
-            while self._run:
-                try:
-                    line = session.prompt().strip()
-                except (EOFError, KeyboardInterrupt):
-                    line = "quit"
-                if not line: continue
-                try:
-                    tok = shlex.split(line)
-                    cmd = tok[0].lower()
-                    args = tok[1:]
-                    if cmd == "help": self.help()
-                    elif cmd == "mode":
-                        if len(args) == 2: self.cmd_mode(args[0], None, int(args[1]))
-                        elif len(args) == 3: self.cmd_mode(args[0], args[1], int(args[2]))
-                        else: raise ValueError("mode <sensor|comm|control> [left|right] N")
-                    elif cmd == "live":
-                        if len(args) != 1 or args[0].lower() not in ("on","off"): raise ValueError("live on|off")
-                        self.cmd_live(args[0].lower() == "on")
-                    elif cmd == "start": self.cmd_start(*parse_lr(args))
-                    elif cmd == "drive": self.cmd_drive(*parse_lr(args))
-                    elif cmd == "stop": self.cmd_stop()
-                    elif cmd in ("cal", "calib", "calibrate"): self.cmd_calibrate()
-                    elif cmd == "status": print(self.latest.summary() if self.latest else "no telemetry")
-                    elif cmd in ("quit", "exit"):
-                        self.cmd_stop()
-                        deadline = time.monotonic() + 8.0
-                        while self.stop_pending and time.monotonic() < deadline: time.sleep(0.02)
-                        break
-                    elif cmd.upper() in ("GET", "SET", "WATCH", "SAVE", "INIT", "HELP"):
-                        self.link.send_debug(line)
-                    else:
-                        print("unknown command; type 'help'")
-                except (ValueError, IndexError) as exc:
-                    print(f"[INPUT] {exc}")
-        self.close()
+    def start_reader(self) -> None:
+        self.ser.reset_input_buffer()
+        self.reader.start()
 
     def close(self) -> None:
-        self._run = False
-        self.set_target(0, 0)
-        if self.logger.active:
-            path, rows, missed = self.logger.stop()
-            print(f"[CSV] closed {rows} rows -> {path} (missed_seq={missed})")
-        try: self.link.send_command(0, 0)
-        except Exception: pass
-        self.link.close()
+        self.stop_event.set()
+        self.reader.join(timeout=0.5)
+        if self.ser.is_open:
+            self.ser.close()
+
+    def send_drive(self, cmd_l: int, cmd_r: int) -> None:
+        with self.write_lock:
+            self.ser.write(make_command(cmd_l, cmd_r))
+
+    def debug(self, command: str) -> None:
+        command = command.strip()
+        if not command:
+            return
+        with self.write_lock:
+            self.ser.write((command + "\n").encode("ascii", "strict"))
+
+    def snapshot(self) -> tuple[int, Telemetry | None]:
+        with self.telemetry_lock:
+            return self.telemetry_seq, self.latest
+
+    def _print_ascii(self, data: bytes) -> None:
+        if not data:
+            return
+        text = data.decode("ascii", "ignore")
+        for line in text.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if line:
+                print(f"[DBG] {line}")
+
+    def _consume(self) -> None:
+        while self.buffer:
+            idx = self.buffer.find(START_BYTES)
+            if idx < 0:
+                # Keep one byte in case it is the first byte of the start marker.
+                if len(self.buffer) > 1:
+                    self._print_ascii(bytes(self.buffer[:-1]))
+                    del self.buffer[:-1]
+                return
+
+            if idx > 0:
+                self._print_ascii(bytes(self.buffer[:idx]))
+                del self.buffer[:idx]
+
+            if len(self.buffer) < FB.size:
+                return
+
+            packet = bytes(self.buffer[: FB.size])
+            telemetry = decode_feedback(packet)
+            if telemetry is None:
+                self._print_ascii(bytes(self.buffer[:1]))
+                del self.buffer[:1]
+                continue
+
+            del self.buffer[: FB.size]
+            with self.telemetry_lock:
+                self.latest = telemetry
+                self.telemetry_seq += 1
+
+            # Log every valid feedback frame, even though display is rate-limited.
+            self.logger.write(telemetry)
+
+            now = time.monotonic()
+            if now - self.last_print >= self.print_period:
+                print(telemetry.summary())
+                self.last_print = now
+
+    def _reader_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.ser.read(self.ser.in_waiting or 1)
+            except serial.SerialException as exc:
+                print(f"[ERR] serial read: {exc}", file=sys.stderr)
+                self.stop_event.set()
+                return
+            if chunk:
+                self.buffer.extend(chunk)
+                self._consume()
+
+
+def print_ports() -> None:
+    ports = list(list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+        return
+    for port in ports:
+        print(f"{port.device:12s} {port.description} {port.hwid}")
+
+
+def parse_pair(parts: list[str], mode: int | None) -> tuple[int, int]:
+    """Accept `50,50` or `50 50` after start/drive."""
+    if len(parts) == 2 and "," in parts[1]:
+        values = parts[1].split(",", 1)
+    elif len(parts) == 3:
+        values = parts[1:3]
+    else:
+        raise ValueError("expected two motor commands, e.g. 50,50")
+    return clamp_cmd(int(values[0].strip()), mode), clamp_cmd(int(values[1].strip()), mode)
+
+
+def print_local_help() -> None:
+    print("Commands:")
+    print("  mode 1|2|3|4       change mode only while fully stopped")
+    print("                     1=VLT 2=SPD 3=TRQ current 4=SVPWM sensorless Id-current PI")
+    print("  mode 3 scaling     50=0.50A, 100=1.00A, 1500=15.00A (Iq_ref, Id_ref=0)")
+    print("  mode 4 scaling     start 2,2 => Id_ref=2A, Iq_ref=0; sign selects rotation direction")
+    print("                     SET SVPWM_RPM 10 is the safe default; change it explicitly if needed")
+    print("  start L,R          start CSV + command Left/Right motors")
+    print("  drive L,R          change independent Left/Right command")
+    print("  stop               ramp to zero; TRQ then controlled-brakes and resets PI")
+    print("  status             print latest telemetry once")
+    print("  get/set/watch/...   pass firmware debug command over USART3")
+    print("  quit                safe ramp-down, save CSV, exit")
+
+
+def wait_until_fully_stopped(link: HoverSerial, timeout_s: float) -> bool:
+    """Wait for post-command feedback confirming applied cmdL=cmdR=0."""
+    start_seq, _ = link.snapshot()
+    deadline = time.monotonic() + timeout_s
+    zero_frames = 0
+    last_seq = start_seq
+
+    while time.monotonic() < deadline and not link.stop_event.is_set():
+        seq, tel = link.snapshot()
+        if seq != last_seq:
+            last_seq = seq
+            if seq > start_seq and tel is not None and tel.stopped:
+                zero_frames += 1
+                if zero_frames >= 3:
+                    return True
+            else:
+                zero_frames = 0
+        time.sleep(0.01)
+    return False
+
+
+
+def wait_until_motion_stopped(link: HoverSerial, timeout_s: float, rpm_deadband: int = 5) -> bool:
+    """Wait for both measured Hall speeds to settle near zero for 3 frames."""
+    deadline = time.monotonic() + timeout_s
+    start_seq, _ = link.snapshot()
+    zero_frames = 0
+    while time.monotonic() < deadline and not link.stop_event.is_set():
+        seq, tel = link.snapshot()
+        if seq > start_seq and tel is not None:
+            if abs(tel.rpm_l) <= rpm_deadband and abs(tel.rpm_r) <= rpm_deadband:
+                zero_frames += 1
+                if zero_frames >= 3:
+                    return True
+            else:
+                zero_frames = 0
+        time.sleep(0.01)
+    return False
+
+def interactive(
+    link: HoverSerial,
+    logger: CsvLogger,
+    rate_hz: float,
+    stop_timeout_s: float,
+) -> None:
+    state_lock = threading.Lock()
+    target = [0, 0]
+    tx_stop = threading.Event()
+    selected_mode: int | None = None
+
+    def set_target(cmd_l: int, cmd_r: int) -> None:
+        with state_lock:
+            target[0] = clamp_cmd(cmd_l, selected_mode)
+            target[1] = clamp_cmd(cmd_r, selected_mode)
+
+    def get_target() -> tuple[int, int]:
+        with state_lock:
+            return target[0], target[1]
+
+    def tx_loop() -> None:
+        period = 1.0 / max(1.0, rate_hz)
+        next_tx = time.monotonic()
+        while not tx_stop.is_set() and not link.stop_event.is_set():
+            cmd_l, cmd_r = get_target()
+            try:
+                link.send_drive(cmd_l, cmd_r)
+            except serial.SerialException as exc:
+                print(f"[ERR] serial write: {exc}", file=sys.stderr)
+                link.stop_event.set()
+                return
+            next_tx += period
+            delay = next_tx - time.monotonic()
+            if delay > 0:
+                tx_stop.wait(delay)
+            else:
+                next_tx = time.monotonic()
+
+    def save_csv() -> None:
+        path, rows = logger.stop()
+        if path is not None:
+            print(f"[CSV] saved {rows} rows -> {path}")
+
+    def safe_stop() -> bool:
+        # The host target becomes zero immediately, but firmware cmdL/cmdR ramp
+        # through RATE/FILTER. Keep TX alive until telemetry confirms zero.
+        set_target(0, 0)
+        print("[STOP] target=0,0; waiting for rate-limited cmdL/cmdR to reach 0,0 ...")
+        stopped = wait_until_fully_stopped(link, stop_timeout_s)
+        if stopped:
+            print("[STOP] cmdL=0 cmdR=0 confirmed")
+            # A zero current target in torque mode means coast. Tell firmware
+            # this is an explicit STOP so it applies a bounded opposite-current
+            # brake, then enters zero-voltage and resets the torque PI.
+            link.debug("SET MOT_RUN 0")
+            if selected_mode == 3:
+                print("[STOP] TRQ controlled brake-to-zero active ...")
+                motion_stopped = wait_until_motion_stopped(link, stop_timeout_s)
+                if motion_stopped:
+                    print("[STOP] TRQ rpmL/rpmR near zero confirmed")
+                else:
+                    print(
+                        "[WARN] TRQ stop command is active, but Hall RPM did not "
+                        f"settle within {stop_timeout_s:.1f}s"
+                    )
+        else:
+            print(
+                "[WARN] zero target is still being transmitted, but telemetry did not "
+                f"confirm cmdL=0/cmdR=0 within {stop_timeout_s:.1f}s"
+            )
+        save_csv()
+        return stopped
+
+    tx = threading.Thread(target=tx_loop, daemon=True)
+    tx.start()
+
+    # Allow the first valid 0,0 command/telemetry frames to settle.
+    print("Left/Right independent control over USART3")
+    print("mode: 1=VLT 2=SPD 3=TRQ(cA) 4=SVPWM sensorless Id-current PI (A)")
+    print("example: mode 1 -> start 50,50 -> drive 100,100 -> stop")
+    print("type 'help' for commands")
+
+    session = PromptSession()
+
+    try:
+        # patch_stdout redraws the prompt and partially typed text after each
+        # telemetry/debug print, preventing the old overlapping-terminal issue.
+        with patch_stdout(raw=True):
+            while not link.stop_event.is_set():
+                try:
+                    line = session.prompt("hover> ").strip()
+                except EOFError:
+                    break
+                if not line:
+                    continue
+
+                parts = line.split()
+                op = parts[0].lower()
+
+                try:
+                    if op == "mode":
+                        if len(parts) != 2 or not parts[1].isdigit():
+                            raise ValueError("usage: mode 1|2|3|4")
+                        mode = int(parts[1])
+                        if mode not in MODE_NAMES:
+                            raise ValueError("mode must be 1, 2, 3, or 4")
+                        if logger.active:
+                            print("[ERR] stop the active run before changing mode")
+                            continue
+                        if get_target() != (0, 0):
+                            print("[ERR] mode can change only with target 0,0")
+                            continue
+                        _, tel = link.snapshot()
+                        if tel is None or not tel.stopped:
+                            print("[ERR] mode can change only after telemetry confirms cmdL=0 cmdR=0")
+                            continue
+                        link.debug(f"SET CTRL_MOD {mode}")
+                        selected_mode = mode
+                        print(f"[MODE] requested {mode}={MODE_NAMES[mode]}")
+
+                    elif op == "start":
+                        cmd_l, cmd_r = parse_pair(parts, selected_mode)
+                        if logger.active:
+                            print("[ERR] run already active; use drive L,R or stop")
+                            continue
+                        _, tel = link.snapshot()
+                        if get_target() != (0, 0) or tel is None or not tel.stopped:
+                            print("[ERR] start is allowed only from fully stopped cmdL=0 cmdR=0")
+                            continue
+                        # Clear any explicit TRQ-stop latch before a new run.
+                        # In modes 1/2/4 this parameter is intentionally ignored.
+                        link.debug("SET MOT_RUN 1")
+                        path = logger.start(selected_mode)
+                        print(f"[CSV] recording -> {path}")
+                        set_target(cmd_l, cmd_r)
+                        print(f"[START] cmdL={cmd_l} cmdR={cmd_r}")
+
+                    elif op == "drive":
+                        cmd_l, cmd_r = parse_pair(parts, selected_mode)
+                        if not logger.active:
+                            print("[ERR] no active run; use start L,R first")
+                            continue
+                        set_target(cmd_l, cmd_r)
+                        print(f"[DRIVE] cmdL={cmd_l} cmdR={cmd_r}")
+
+                    elif op == "stop":
+                        safe_stop()
+
+                    elif op == "status":
+                        _, tel = link.snapshot()
+                        print(tel.summary() if tel is not None else "[STATUS] no telemetry yet")
+
+                    elif op == "help":
+                        print_local_help()
+
+                    elif op in {"get", "set", "watch", "save", "init"}:
+                        # Keep legacy firmware debug terminal access on USART3.
+                        link.debug(line.upper())
+
+                    elif op in {"fwhelp", "fw-help"}:
+                        link.debug("HELP")
+
+                    elif op in {"quit", "exit", "q"}:
+                        break
+
+                    else:
+                        print("[ERR] unknown command; type 'help'")
+
+                except ValueError as exc:
+                    print(f"[ERR] {exc}")
+
+    finally:
+        # Always use the same gradual firmware rate limiter on normal exit.
+        if get_target() != (0, 0) or logger.active:
+            safe_stop()
+        else:
+            set_target(0, 0)
+            save_csv()
+        # Give the TX loop one final chance to send 0,0 before closing.
+        try:
+            link.send_drive(0, 0)
+        except serial.SerialException:
+            pass
+        time.sleep(0.03)
+        tx_stop.set()
+        tx.join(timeout=0.5)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", help="USART3 USB-UART port; auto-selects first port if omitted")
-    ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--display-hz", type=float, default=10.0, help="terminal redraw/print rate; CSV remains 50 Hz")
-    ns = ap.parse_args()
-    port = ns.port
-    if not port:
-        ports = available_ports()
-        if not ports: raise SystemExit("No serial port found. Use --port /dev/ttyUSB0")
-        port = "/dev/ttyUSB0" if "/dev/ttyUSB0" in ports else ports[0]
-    TerminalApp(port, ns.baud, ns.display_hz).run()
+    parser = argparse.ArgumentParser(
+        description="Interactive Left/Right hoverboard USART3 terminal"
+    )
+    parser.add_argument("--port", default="/dev/ttyUSB0", help="e.g. COM3 or /dev/ttyUSB0")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--list-ports", action="store_true")
+    parser.add_argument("--rate", type=float, default=20.0, help="binary command TX rate Hz")
+    parser.add_argument("--print-rate", type=float, default=10.0, help="telemetry display rate Hz")
+    parser.add_argument(
+        "--stop-timeout",
+        type=float,
+        default=5.0,
+        help="seconds to wait for rate-limited cmdL/cmdR to reach zero",
+    )
+    parser.add_argument(
+        "--csv-dir",
+        default=str(Path(__file__).resolve().parent / "logs"),
+        help="directory for automatic CSV files",
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="telemetry/debug monitor only; do not transmit motor commands",
+    )
+    args = parser.parse_args()
+
+    if args.list_ports:
+        print_ports()
+        if not args.port:
+            return
+
+    logger = CsvLogger(Path(args.csv_dir))
+    link = HoverSerial(args.port, args.baud, logger=logger, print_hz=args.print_rate)
+    link.start_reader()
+    print(
+        f"Connected {args.port} @ {args.baud}; feedback={FB.size} bytes; "
+        f"FOC budget={FOC_BUDGET_CYCLES} cycles"
+    )
+
+    try:
+        if args.monitor:
+            while not link.stop_event.is_set():
+                time.sleep(0.2)
+        else:
+            interactive(link, logger, args.rate, args.stop_timeout)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        path, rows = logger.stop()
+        if path is not None:
+            print(f"[CSV] saved {rows} rows -> {path}")
+        link.close()
 
 
 if __name__ == "__main__":
