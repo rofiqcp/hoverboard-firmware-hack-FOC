@@ -23,10 +23,10 @@ assert 'mcpwm_foc_set_position_user_limits(positionMinUser, positionMaxUser, fal
 assert 'mcpwm_foc_set_position_user_limits(positionMinUser, positionMaxUser, true)' in com
 assert 'user_position_to_internal' in mc and 'positionCommandR' in mc
 assert 'CONTROL_MODE_POS' in mc and 'm_position_target_counts' in mc
-assert 'm->m_iq_target_q4=pid_run_state' in mc, 'position PID must feed Iq target'
+assert 'position_pid_iq_target_step' in mc, 'position PID must feed Iq target'
 assert 'm->m_kpq_q11,m->m_kiq_q16' in mc and 'm->m_kpd_q11,m->m_kid_q16' in mc
 assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
-assert 'm->m_kpp_q11,m->m_kip_q16,m->m_kdp_q11' in mc
+assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
 assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main, 'automatic 50 Hz legacy telemetry missing'
 assert 'no user-controlled live telemetry switch' in main, 'live-removal rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp

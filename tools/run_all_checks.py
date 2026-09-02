@@ -91,16 +91,20 @@ def check_static():
     assert 'appconf6_append_balance_placeholder' in serc and 'appconf6_skip_balance_placeholder' in serc, 'VESC 6.00 balance wire block adapter missing'
     assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp, 'virtual CAN routing missing'
     assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'
     eeh=(ROOT/'Src/eeprom.h').read_text()
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
-    assert '0x0803F800u' in eeh and '0x0803FC00u' in eeh, 'EEPROM must use physical flash pages 254/255'
+    assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
+    assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
     assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x30\)', eeh), 'EEPROM virtual variable count mismatch'
-    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*254K', lds), 'linker must reserve final 2 KiB for EEPROM'
+    assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
+    eec=(ROOT/'Src/eeprom.c').read_text()
+    assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'
+    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*252K', lds), 'linker must reserve final 4 KiB for two EEPROM pages'
     mainc=(ROOT/'Src/main.c').read_text()
     assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
     assert 'feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);' in mainc, 'custom telemetry right Vq sign not normalized'

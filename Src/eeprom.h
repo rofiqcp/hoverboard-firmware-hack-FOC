@@ -174,27 +174,31 @@
 #define ADDR_FLASH_PAGE_126   ((uint32_t)0x0801F800) /* Base @ of Page 126, 1 Kbytes */
 #define ADDR_FLASH_PAGE_127   ((uint32_t)0x0801FC00) /* Base @ of Page 127, 1 Kbytes */
 
-/* Define the size of the sectors to be used */
-#define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
+/* STM32F103RCT6 is an STM32F103xE high-density part. Its physical Flash
+ * erase page is 2 KiB (0x800), not 1 KiB. EEPROM emulation requires TWO
+ * distinct erase pages; placing them 0x400 apart makes both aliases land in
+ * one physical erase page and silently destroys persistence. */
+#define PAGE_SIZE               ((uint32_t)FLASH_PAGE_SIZE)
+#if FLASH_PAGE_SIZE != 0x800U
+#error "STM32F103RCT6 EEPROM layout requires 2-KiB high-density Flash pages"
+#endif
 
-/* EEPROM emulation uses the last two 1-KiB pages of the 256-KiB
- * STM32F103RCT6 flash. The linker script reserves these pages by exposing
- * only 254 KiB to application code, so configuration writes can never erase
- * executable firmware. */
-#define EEPROM_START_ADDRESS  ((uint32_t)0x0803F800u) /* physical page 254 */
+/* Reserve the final 4 KiB of the 256-KiB Flash for two real 2-KiB pages.
+ * Application Flash therefore ends at 0x0803EFFF (252 KiB used by linker). */
+#define EEPROM_START_ADDRESS  ((uint32_t)0x0803F000u) /* physical 2-KiB page 126 */
 
-/* Pages 0 and 1 base and end addresses */
-#define PAGE0_BASE_ADDRESS    ((uint32_t)0x0803F800u)
+/* Pages 0 and 1 base and end addresses. */
+#define PAGE0_BASE_ADDRESS    ((uint32_t)0x0803F000u)
 #define PAGE0_END_ADDRESS     ((uint32_t)(PAGE0_BASE_ADDRESS + (PAGE_SIZE - 1u)))
 #define PAGE0_ID              PAGE0_BASE_ADDRESS
 
-#define PAGE1_BASE_ADDRESS    ((uint32_t)0x0803FC00u) /* physical page 255 */
+#define PAGE1_BASE_ADDRESS    ((uint32_t)0x0803F800u) /* physical 2-KiB page 127 */
 #define PAGE1_END_ADDRESS     ((uint32_t)(PAGE1_BASE_ADDRESS + (PAGE_SIZE - 1u)))
 #define PAGE1_ID              PAGE1_BASE_ADDRESS
 
 /* Used Flash pages for EEPROM emulation */
 #define PAGE0                 ((uint16_t)0x0000)
-#define PAGE1                 ((uint16_t)0x0040)
+#define PAGE1                 ((uint16_t)0x0001)
 
 /* No valid page define */
 #define NO_VALID_PAGE         ((uint16_t)0x00AB)

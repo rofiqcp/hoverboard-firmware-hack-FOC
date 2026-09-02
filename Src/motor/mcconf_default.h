@@ -21,12 +21,18 @@
 /* VESC 6.x speed PID defaults are Kp=0.004, Ki=0.004, Kd=0.
  * These legacy-named integer fields are the persisted gain*1000 representation,
  * not direct Vq-controller coefficients. */
-#define MCCONF_SPEED_KP_Q11                     4u
-#define MCCONF_SPEED_KI_Q16                     4u
+#define MCCONF_SPEED_KP_Q11                     2u
+#define MCCONF_SPEED_KI_Q16                     1u
 #define MCCONF_SPEED_KD_Q11                     0u
-#define MCCONF_POSITION_KP_Q11                8192u
+#define MCCONF_POSITION_KP_Q11                   8u
 #define MCCONF_POSITION_KI_Q16                   0u
 #define MCCONF_POSITION_KD_Q11                   0u
+/* Hall-count position safety/tuning. Position PID follows VESC normalized
+ * current-output architecture, but this low-resolution steering actuator gets a
+ * hard current cap and velocity damping so one-sector commands cannot run away. */
+#define MCCONF_POSITION_CURRENT_MAX_MA          600u
+#define MCCONF_POSITION_SETTLE_CURRENT_MA        150u
+#define MCCONF_POSITION_SETTLE_MS                120u
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
  * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
 #define MCCONF_SPEED_RAMP_ERPMS_S             1500u

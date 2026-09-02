@@ -86,12 +86,19 @@ typedef struct {
     int32_t m_position_integrator;
     int16_t m_position_prev_error;
     uint8_t m_position_sat_hold;
+    int8_t m_position_drive_direction;
+    uint16_t m_position_settle_ticks;
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
     uint16_t m_speed_release_rpm;
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
+    /* Brake direction is latched on entry: +1 means rotor was moving positive
+     * and brake must apply negative Iq, -1 vice versa. Once the rotor reaches
+     * the stop deadband it is cleared to 0 and cannot reverse torque until a
+     * new brake-mode entry. */
+    int8_t m_brake_direction;
     int32_t m_current_lpf_q16[2];
 
     uint32_t m_openloop_phase_acc_q32;

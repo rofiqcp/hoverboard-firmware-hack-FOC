@@ -56,9 +56,9 @@ assert 'standard VESC position must be 0..360 degrees' in dual
 assert 'def set_position_limits(' in dual and 'def set_position_counts(' in dual
 
 # Complete hardware diagnostic tool includes 3A, 50 ERPM, Hall, RT 50Hz and position tests.
-for token in ('current --motor left --amps 3','rpm --motor left --erpm 50','rt --motor both --hz 50',
+for token in ('0.2 A / 0.3 s','+750 ERPM / 2 s','rt --motor both --hz 50',
               'hall --motor left --amps 1.0','pos-limits','pos-count','CURRENT_COMMAND_PATH_PASS',
               'RESULT: PASS realtime polling'):
     assert token in dbg, token
 assert 'DEFAULT_HZ = 50.0' in dbg
-print('V15_FEATURE_STATIC_PASS current3A=1 rpm50_fractional=1 speed_iq_cascade=1 rt50=1 hall_isr_sweep=1 pos_int32=1 live_toggle=removed fw600_exact=1')
+print('V15_FEATURE_STATIC_PASS safe_current=1 rpm750=1 speed_iq_cascade=1 rt50=1 hall_isr_sweep=1 pos_int32=1 live_toggle=removed fw600_exact=1')

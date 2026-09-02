@@ -75,8 +75,9 @@
 
 /* Torque/current mode uses direct centiampere command semantics:
  *   cmd 50 = 0.50 A, cmd 100 = 1.00 A, cmd 1500 = 15.00 A.
- * STOP braking is therefore also specified in centiamperes. */
-#define TRQ_STOP_RPM_DEADBAND             5
+ * STOP braking is therefore also specified in centiamperes.
+ * 10 mechanical RPM prevents Hall-boundary brake hunting near zero speed. */
+#define TRQ_STOP_RPM_DEADBAND            10
 #define DIAG_ENA                 1
 #define I_MOT_MAX                15
 #define I_DC_MAX                 17

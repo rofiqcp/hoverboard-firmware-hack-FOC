@@ -84,7 +84,9 @@ enum {
     EE_L_SPEED_REL = 41, EE_R_SPEED_REL,
     EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44
 };
-#define EE_CFG_SIGNATURE_VALUE 0x600Fu
+#define EE_CFG_SIGNATURE_VALUE 0x6011u
+#define EE_CFG_SIGNATURE_V18   0x6010u
+#define EE_CFG_SIGNATURE_V17   0x600Fu
 #define EE_CFG_SIGNATURE_V16   0x600Eu
 
 extern uint16_t VirtAddVarTab[NB_OF_VAR];
@@ -146,10 +148,12 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||
         !ee_read_slot(sig_slot, &sig) ||
-        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V16)) {
+        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V18 &&
+         sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
         return false;
     }
-    const bool migrate_v16_speed_pid = (sig == EE_CFG_SIGNATURE_V16);
+    const bool migrate_speed_pid = (sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
+    const bool migrate_position_pid = (sig != EE_CFG_SIGNATURE_VALUE);
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
@@ -178,10 +182,14 @@ bool mc_interface_load_configuration_motor(bool second) {
     };
     for (uint8_t i = 0u; i < 10u; ++i) {
         if (ee_read_slot((uint8_t)(gain_base + i), &v)) {
-            /* V16 indices 4..6 were EFeru direct-Vq speed gains (4.833/0.251).
-             * They are dimensionally incompatible with VESC speed-PID -> Iq.
-             * Keep all other persisted tuning and migrate only speed PID gains. */
-            if (!(migrate_v16_speed_pid && i >= 4u && i <= 6u)) *gain_dst[i] = v;
+            /* V16 used EFeru direct-Vq speed gains; V17 used the first
+             * cascade defaults (0.004/0.004). Both are superseded by the
+             * hardware-tested hoverboard cascade defaults. Preserve every
+             * other persisted field and migrate only speed PID gains. */
+            if (!(migrate_speed_pid && i >= 4u && i <= 6u) &&
+                !(migrate_position_pid && i >= 7u && i <= 9u)) {
+                *gain_dst[i] = v;
+            }
         }
     }
     if (ee_read_slot(ramp_slot, &v) && v > 0u) {
@@ -200,7 +208,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     mcpwm_foc_sync_tuning_to_conf(second);
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
     m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);
-    if (migrate_v16_speed_pid) {
+    if (migrate_speed_pid || migrate_position_pid) {
         /* Rewrite only after a complete successful load; signature is written last. */
         (void)mc_interface_store_configuration_motor(second);
     }

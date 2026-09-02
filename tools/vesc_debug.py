@@ -61,10 +61,22 @@ def send_one(link: VescDual, motor: str, cmd: int, raw: int) -> None:
 
 
 def release_one(link: VescDual, motor: str) -> None:
-    # 0 A lalu berhenti refresh. Firmware melepas bridge setelah timeout ownership.
+    # Kirim zero-current beberapa kali, lalu BERHENTI refresh agar ownership
+    # VESC benar-benar timeout. Tunggu konfirmasi diagnostic sebelum test berikut.
+    is_right = motor == "right"
     for _ in range(3):
         send_one(link, motor, COMM_SET_CURRENT, 0)
         time.sleep(0.02)
+    deadline = time.monotonic() + 1.2
+    while time.monotonic() < deadline:
+        try:
+            d = link.diag(is_right)
+            if not d.override and d.state == 0:
+                return
+        except Exception:
+            pass
+        time.sleep(0.05)
+    print(f"[WARN] {motor} ownership belum release setelah 1.2 s")
 
 
 class Refresher:
@@ -299,6 +311,14 @@ def run_motion_test(args, link: VescDual, motor: str, cmd: int, raw: int, label:
                 if now >= next_sample:
                     v = link.values(is_right)
                     samples.append((now - start, v, latest_diag))
+                    # Hardware safety envelope. A low-energy diagnostic must never
+                    # silently become an unloaded high-speed run.
+                    speed_limit = 2000.0
+                    if cmd == COMM_SET_RPM:
+                        speed_limit = max(1500.0, abs(float(raw)) * 1.8)
+                    if v.fault or abs(v.rpm) > speed_limit or abs(v.current_motor) > 5.0:
+                        print(f"MOTION_SAFETY_ABORT fault={v.fault} erpm={v.rpm:.0f} Imotor={v.current_motor:.2f}A")
+                        return 2
                     next_sample += 0.05
                 time.sleep(0.002)
             print(f"setpoint refresh count={ref.count} errors={len(ref.errors)}")
@@ -328,13 +348,13 @@ def cmd_current(args, link: VescDual) -> int:
     motor = "right" if right else "left"
     raw = round(args.amps * 1000.0)
     rc = run_motion_test(args, link, motor, COMM_SET_CURRENT, raw, f"CURRENT {args.amps:.3f}A")
-    # Jalur command dianggap PASS bila firmware benar-benar menerima target 3A, terlepas beban mekanik.
-    d = link.diag(right)
-    # setelah release target bisa nol; ambil validasi dari test via run output. Lakukan pulse singkat tanpa menunggu sample.
+    # Verifikasi jalur command saat paket masih direfresh. Satu paket 30 ms
+    # setelah release terlalu singkat dan menghasilkan false-negative pada DMA/queue.
     require_arm(args)
-    send_one(link, motor, COMM_SET_CURRENT, raw)
-    time.sleep(0.03)
-    active = link.diag(right)
+    sender = lambda: send_one(link, motor, COMM_SET_CURRENT, raw)
+    with Refresher(sender, 50.0):
+        time.sleep(0.12)
+        active = link.diag(right)
     release_one(link, motor)
     print(f"COMMAND_PATH Iq_target={active.iq_target_a:.3f}A expected={args.amps:.3f}A mode={active.control_mode} ownership={active.override}")
     if abs(active.iq_target_a - args.amps) > 0.06 or not active.override:
@@ -411,8 +431,16 @@ def cmd_pos_count(args, link: VescDual) -> int:
                 st = link.position_state(is_right)
                 d = link.diag(is_right)
                 print(f"{motor}: current={st.current} target={st.target} limits=[{st.minimum},{st.maximum}] Iq={d.iq_a:.3f}A")
+                if d.fault or abs(d.iq_a) > 0.90 or abs(st.current - st.target) > 4:
+                    print(f"POSITION_SAFETY_ABORT fault={d.fault} Iq={d.iq_a:.3f} error={st.target-st.current}")
+                    return 2
                 time.sleep(0.20)
             print(f"refresh count={ref.count} errors={len(ref.errors)}")
+            final = link.position_state(is_right)
+            if final.current != final.target:
+                print(f"POSITION_NOT_SETTLED current={final.current} target={final.target}")
+                return 2
+            print("POSITION_SETTLED_PASS")
     finally:
         release_one(link, motor)
     return 0
@@ -429,20 +457,30 @@ def cmd_all(args, link: VescDual) -> int:
     print("=== POSITION API ===")
     print("L", link.position_state(False)); print("R", link.position_state(True))
     if args.arm:
-        print("=== HALL DETECT LEFT 1.0 A ===")
+        print("=== HALL DETECT BOTH 1.0 A ===")
         class H: pass
-        h=H(); h.arm=True; h.motor="left"; h.amps=1.0
+        h=H(); h.arm=True; h.motor="both"; h.amps=1.0
         rc |= cmd_hall(h, link)
-        print("=== CURRENT LEFT 1.0 A ===")
-        class C: pass
-        c=C(); c.arm=True;c.motor="left";c.amps=1.0;c.seconds=2.0;c.hz=50.0
-        rc |= cmd_current(c, link)
-        print("=== RPM LEFT 50 ERPM ===")
-        class R: pass
-        r=R();r.arm=True;r.motor="left";r.erpm=50.0;r.mech_rpm=None;r.seconds=4.0;r.hz=50.0
-        rc |= cmd_rpm(r, link)
+        for motor in ("left", "right"):
+            print(f"=== CURRENT {motor.upper()} 0.2 A / 0.3 s ===")
+            class C: pass
+            c=C(); c.arm=True;c.motor=motor;c.amps=0.2;c.seconds=0.3;c.hz=50.0
+            rc |= cmd_current(c, link)
+            print(f"=== RPM {motor.upper()} +750 ERPM / 2 s ===")
+            class R: pass
+            r=R();r.arm=True;r.motor=motor;r.erpm=750.0;r.mech_rpm=None;r.seconds=2.0;r.hz=50.0
+            rc |= cmd_rpm(r, link)
+        print("=== POSITION +/-1 COUNT BOTH ===")
+        link.reset_position(False); link.reset_position(True)
+        link.set_position_limits(-20,20,False); link.set_position_limits(-20,20,True)
+        for motor,is_right in (("left",False),("right",True)):
+            for target in (1,-1):
+                link.reset_position(is_right)
+                class P: pass
+                p=P();p.arm=True;p.motor=motor;p.count=target;p.seconds=1.5;p.hz=30.0
+                rc |= cmd_pos_count(p, link)
     else:
-        print("Motor-moving tests dilewati; tambahkan --arm untuk Hall/current/RPM.")
+        print("Motor-moving tests dilewati; tambahkan --arm untuk Hall/current/RPM/position.")
     print("ALL_TESTS_RESULT:", "PASS" if rc == 0 else f"CHECK rc={rc}")
     return rc
 

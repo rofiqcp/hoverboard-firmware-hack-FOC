@@ -48,7 +48,7 @@ extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern
 #define CLEAR_BIT(REG,BIT) ((REG)&=~(BIT))
 #define __HAL_DMA_GET_COUNTER(H) ((H) && (H)->Instance ? (H)->Instance->CNDTR : 0u)
 #define FLASH_TYPEPROGRAM_HALFWORD 0u
-#define FLASH_PAGE_SIZE 1024u
+#define FLASH_PAGE_SIZE 2048u
 #define HAL_MAX_DELAY 0xffffffffu
 
 typedef struct { uint32_t PLLState, PLLSource, PLLMUL; } RCC_PLLInitTypeDef;

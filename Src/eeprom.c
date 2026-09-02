@@ -325,9 +325,12 @@ uint16_t EE_VerifyPageFullyErased(uint32_t Address)
 {
   uint32_t readstatus = 1;
   uint16_t addressvalue = 0x5555;
+  const uint32_t endAddress = Address + PAGE_SIZE - 1u;
 
-  /* Check each active page address starting from end */
-  while (Address <= PAGE0_END_ADDRESS)
+  /* Check the complete physical page passed by the caller. The original
+   * STM32 example hard-coded PAGE0_END_ADDRESS here, which silently skipped
+   * verification of PAGE1. */
+  while (Address <= endAddress)
   {
     /* Get the current location content to be compared with virtual address */
     addressvalue = (*(__IO uint16_t*)Address);

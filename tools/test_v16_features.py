@@ -23,10 +23,13 @@ assert 'rate-limits corrected Hall phase' in mc
 assert 'm_hall_reject_counted_state' in mch and 'm->m_hall_reject_counted_state != h' in mc
 assert 'one chatter/outlier edge into' in mc
 assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
+speed_block=mc[mc.index('if (m->m_control_mode==CONTROL_MODE_SPEED) {'):mc.index('} else {', mc.index('if (m->m_control_mode==CONTROL_MODE_SPEED) {'))]
+assert 'iq_setpoint_slew_step(m);' not in speed_block and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in speed_block
 assert 'speed PID\n     * produces an Iq/current request' in mc
+assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
 assert 'speed PI drives Vq directly' not in mc
 mi=(R/'Src/motor/mc_interface.c').read_text()
-assert 'EE_CFG_SIGNATURE_V16' in mi and 'migrate_v16_speed_pid' in mi
+assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrate_speed_pid' in mi
 
 # VESC-like detector: 1s current ramp, 3 forward + 3 reverse complete 1-degree sweeps.
 assert 'k < 1000u' in mc and 'HAL_Delay(1u)' in mc
@@ -54,3 +57,12 @@ assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'rx fifo burst' in host and 'request/reply only' in host
 
 print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo4=1 vesc_request_reply=1')
+
+assert 'm_brake_direction' in mch and 'const bool entering = m->m_control_mode != CONTROL_MODE_CURRENT_BRAKE' in mc
+assert 'COMM_SET_CURRENT_BRAKE is a stop request, not a reverse-speed command' in mc
+
+assert 'MCCONF_POSITION_CURRENT_MAX_MA' in mc or 'MCCONF_POSITION_CURRENT_MAX_MA' in mcc
+assert 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mc or 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mcc
+assert 'MCCONF_POSITION_SETTLE_MS' in mc or 'MCCONF_POSITION_SETTLE_MS' in mcc
+
+assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not reject direction reversals'
