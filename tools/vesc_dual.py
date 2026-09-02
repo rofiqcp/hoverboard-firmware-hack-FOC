@@ -346,8 +346,18 @@ class VescDual:
 
     def values(self, right=False) -> Values:
         req = bytes((COMM_GET_VALUES_SELECTIVE,)) + struct.pack(">I", VALUE_MASK)
-        p = self.transact(self.fwd(req) if right else req, COMM_GET_VALUES_SELECTIVE)
-        return parse_selective(p)
+        expected_id = RIGHT_ID if right else 1
+        deadline = time.monotonic() + self.timeout
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"no selective values reply from VESC ID {expected_id}")
+                p = self.recv(COMM_GET_VALUES_SELECTIVE, remaining)
+                v = parse_selective(p)
+                if v.vesc_id == expected_id:
+                    return v
 
     def detect_hall(self, current_a: float = 1.0, right: bool = False):
         if current_a <= 0.0:

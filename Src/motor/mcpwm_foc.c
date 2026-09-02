@@ -196,6 +196,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
         if (m->m_speed_release_rpm == 0u) m->m_speed_release_rpm = 1u;
     }
     m->m_hall_pos_prev = 0;
+    m->m_hall_reject_counted_state = 0xffu;
     m->m_hall_period = MCCONF_HALL_TIMEOUT_TICKS;
     for (int i=0;i<4;i++) m->m_hall_period_hist[i] = MCCONF_HALL_TIMEOUT_TICKS;
     m->m_phase_openloop = SVPWM_ALIGN_PHASE;
@@ -554,6 +555,7 @@ static void hall_estimator_reset(mcpwm_foc_motor_t *m) {
     for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = MCCONF_HALL_TIMEOUT_TICKS;
     m->m_hall_hist_pos = 0u;
     m->m_hall_interp_active = 0u;
+    m->m_hall_reject_counted_state = 0xffu;
     m->m_phase_hall_target = m->m_phase_hall;
     m->m_rpm = 0;
 }
@@ -607,8 +609,17 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                      m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS &&
                      ((uint32_t)period * MCCONF_HALL_PERIOD_OUTLIER_RATIO) < m->m_hall_period);
                 if (period_outlier) {
-                    m->m_hall_invalid_transition_count++;
+                    /* Keep re-evaluating a persistent candidate as m_hall_ticks
+                     * grows, but count this raw edge only once. The old code
+                     * incremented this counter on every 16-kHz ISR until the
+                     * hold time elapsed, turning one chatter/outlier edge into
+                     * hundreds of reported invalid transitions. */
+                    if (m->m_hall_reject_counted_state != h) {
+                        m->m_hall_invalid_transition_count++;
+                        m->m_hall_reject_counted_state = h;
+                    }
                 } else {
+                    m->m_hall_reject_counted_state = 0xffu;
                     if (m->m_hall_direction == 0 || m->m_hall_direction != dir ||
                         m->m_hall_period_hist[0] == MCCONF_HALL_TIMEOUT_TICKS) {
                         for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = period;
@@ -633,8 +644,15 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                     m->m_hall_pos_prev = angle;
                 }
             } else {
-                m->m_hall_invalid_transition_count++;
+                if (m->m_hall_reject_counted_state != h) {
+                    m->m_hall_invalid_transition_count++;
+                    m->m_hall_reject_counted_state = h;
+                }
             }
+        } else {
+            /* Returned to the last accepted Hall sector. A later departure is
+             * a new transition attempt and may be counted once again. */
+            m->m_hall_reject_counted_state = 0xffu;
         }
     }
 
@@ -777,6 +795,66 @@ static int16_t pid_run_state(int16_t err,uint16_t kp,uint16_t ki,uint16_t kd,int
     int16_t base=pi_run_state(err,kp,ki,max,min,integ,hold);int32_t de=(int32_t)err-*prev;*prev=err;return(int16_t)CLAMP((int32_t)base+((de*(int32_t)kd)>>11),min,max);
 }
 
+static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
+    /* Match vedderb/bldc foc_run_pid_control_speed architecture: speed PID
+     * produces an Iq/current request, then the inner FOC current PI produces Vq.
+     * Upstream scales speed PID by 1/20 and clamps it to +/- current limit.
+     * Keep that behavior in integer math: gains are stored as gain*1000, speed
+     * error is ERPM Q16, and m_speed_integrator is Iq(q4) Q16. */
+    const int32_t pp = (int32_t)motor_pole_pairs(second);
+    const int32_t limit_q4 = m->m_current_limit_q4 > 0 ?
+                             m->m_current_limit_q4 : MCCONF_MOTOR_CURRENT_MAX_Q4;
+    int64_t target64 = (int64_t)m->m_speed_set_ramp_q16 * pp;
+    int64_t measured64 = (int64_t)measured_mech_rpm_q16(m, second) * pp;
+    int64_t error64 = target64 - measured64;
+    if (error64 > INT32_MAX) error64 = INT32_MAX;
+    if (error64 < INT32_MIN) error64 = INT32_MIN;
+    const int32_t error_q16 = (int32_t)error64;
+
+    const int64_t p_num = (int64_t)error_q16 * (int32_t)m->m_kps_q11 * limit_q4;
+    int32_t p_q4 = (int32_t)(p_num / (65536LL * 1000LL * 20LL));
+
+    const int64_t i_step =
+        ((int64_t)error_q16 * (int32_t)m->m_kis_q16 * limit_q4 *
+         (int32_t)MCCONF_FOC_CONTROL_DIV) /
+        (1000LL * 20LL * (int32_t)PWM_FREQ);
+    const int64_t i_lim = (int64_t)limit_q4 << 16;
+    int64_t i_candidate = (int64_t)m->m_speed_integrator + i_step;
+    if (i_candidate > i_lim) i_candidate = i_lim;
+    if (i_candidate < -i_lim) i_candidate = -i_lim;
+
+    int32_t d_q4 = 0;
+    if (m->m_kds_q11 != 0u) {
+        const int64_t de_q16 = (int64_t)error_q16 - m->m_speed_prev_error;
+        const int64_t d_num = de_q16 * (int32_t)PWM_FREQ *
+                              (int32_t)m->m_kds_q11 * limit_q4;
+        d_q4 = (int32_t)(d_num /
+               (65536LL * (int32_t)MCCONF_FOC_CONTROL_DIV * 1000LL * 20LL));
+    }
+
+    int32_t out_q4 = p_q4 + (int32_t)(i_candidate >> 16) + d_q4;
+    const bool sat_hi = out_q4 > limit_q4;
+    const bool sat_lo = out_q4 < -limit_q4;
+    /* Conditional integration: when saturated, only integrate an error that
+     * moves the output back toward the linear region. */
+    if ((sat_hi && i_step > 0) || (sat_lo && i_step < 0)) {
+        i_candidate = m->m_speed_integrator;
+        out_q4 = p_q4 + (int32_t)(i_candidate >> 16) + d_q4;
+        m->m_speed_sat_hold = 1u;
+    } else {
+        m->m_speed_integrator = (int32_t)i_candidate;
+        m->m_speed_sat_hold = 0u;
+    }
+    m->m_speed_prev_error = error_q16;
+
+    if (!m->m_conf.s_pid_allow_braking) {
+        const int64_t erpm20_q16 = 20LL << 16;
+        if (measured64 > erpm20_q16 && out_q4 < 0) out_q4 = 0;
+        if (measured64 < -erpm20_q16 && out_q4 > 0) out_q4 = 0;
+    }
+    return (int16_t)CLAMP(out_q4, -limit_q4, limit_q4);
+}
+
 static int16_t phase_current_counts_to_q4(int16_t counts) {
     int32_t q4=(int32_t)counts<<4;
     /* Exact generated input saturation before Clarke/Park. */
@@ -872,20 +950,12 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
             }
 
             if (m->m_control_mode==CONTROL_MODE_SPEED) {
-                /* Bit-compatible architecture with the original EFeru model:
-                 * speed PI drives Vq directly. Do not cascade the old speed
-                 * gains into an Iq PI; those gains were never tuned for that. */
-                const int32_t measured_q16 = measured_mech_rpm_q16(m, second);
-                const int32_t e_q4_raw=(m->m_speed_set_ramp_q16-measured_q16)>>12;
-                const int16_t e_q4=(int16_t)CLAMP(e_q4_raw,-32768,32767);
-                m->m_iq_target_q4=0;
-                m->m_iq_set_q4=0;
-                m->m_iq_set_ramp_q16=0;
-                v.q=pid_run_state(e_q4,m->m_kps_q11,m->m_kis_q16,m->m_kds_q11,q_lim,(int16_t)-q_lim,&m->m_speed_integrator,&m->m_speed_sat_hold,&m->m_speed_prev_error);
-                /* Speed mode bypasses the Iq regulator, but the Id regulator
-                 * still holds Id=0, so keep its integrator alive. */
-                m->m_iq_integrator=0;
-                m->m_iq_sat_hold=0;
+                m->m_iq_target_q4 = speed_pid_iq_target_step(m, second);
+                iq_setpoint_slew_step(m);
+                const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
+                v.q=pi_run_state(eq,m->m_kpq_q11,m->m_kiq_q16,
+                                 q_lim,(int16_t)-q_lim,
+                                 &m->m_iq_integrator,&m->m_iq_sat_hold);
             } else {
                 if(m->m_control_mode==CONTROL_MODE_POS){
                     int64_t e64=(int64_t)m->m_position_target_counts-(int64_t)m->m_position_counts;int16_t ep=(int16_t)CLAMP(e64,-32768,32767);int16_t il=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;

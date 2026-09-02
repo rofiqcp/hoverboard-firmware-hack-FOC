@@ -44,7 +44,7 @@ assert 'coast_brake_level' not in serialc and 'coast_brake_ramp_time' not in ser
 # Independent left/right persistence with Hall table.
 assert 'EE_L_HALL0 = 3, EE_R_HALL0 = 11' in mci
 assert 'EE_L_KPQ = 19' in mci and 'EE_R_KPQ = 29' in mci
-assert 'EE_CFG_SIGNATURE_VALUE 0x600Eu' in mci
+assert 'EE_CFG_SIGNATURE_VALUE 0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci
 assert 'mc_interface_store_configuration_motor(bool second)' in mci
 assert 'mc_interface_load_configuration_motor(bool second)' in mci
 # EEPROM must never overlap executable flash.

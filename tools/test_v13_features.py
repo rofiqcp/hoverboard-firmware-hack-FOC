@@ -25,7 +25,7 @@ assert 'user_position_to_internal' in mc and 'positionCommandR' in mc
 assert 'CONTROL_MODE_POS' in mc and 'm_position_target_counts' in mc
 assert 'm->m_iq_target_q4=pid_run_state' in mc, 'position PID must feed Iq target'
 assert 'm->m_kpq_q11,m->m_kiq_q16' in mc and 'm->m_kpd_q11,m->m_kid_q16' in mc
-assert 'm->m_kps_q11,m->m_kis_q16,m->m_kds_q11' in mc
+assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
 assert 'm->m_kpp_q11,m->m_kip_q16,m->m_kdp_q11' in mc
 assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main, 'automatic 50 Hz legacy telemetry missing'
 assert 'no user-controlled live telemetry switch' in main, 'live-removal rationale missing'
@@ -37,4 +37,4 @@ assert 'COMM_SET_POS = 9' in dual and 'def set_pos(' in dual and 'RIGHT_ID = 2' 
 # vesc/datatypes.h must remain exact reference, never custom-extended for these parameters.
 h=hashlib.sha256((R/'Src/vesc/datatypes.h').read_bytes()).hexdigest()
 assert h=='4ecae1f31c12c1ab415d47dd997396d0792e94249203cbeb877ada75f76d5340', h
-print('V13_FEATURE_STATIC_PASS full_int32=1 live_toggle=removed auto50hz=1 pos=1 separate_dq=1 can2=1 datatypes_exact=1')
+print('V13_FEATURE_STATIC_PASS full_int32=1 live_toggle=removed host_polling=1 pos=1 separate_dq=1 can2=1 datatypes_exact=1')

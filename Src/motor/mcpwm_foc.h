@@ -69,13 +69,20 @@ typedef struct {
     uint8_t m_hall_hist_pos;
     uint8_t m_hall_initialized;
     uint8_t m_hall_interp_active;
+    /* Raw Hall state whose current rejection has already been counted.
+     * 0xff means no pending/rejected edge is latched. This prevents a single
+     * rejected edge from incrementing the diagnostic counter at 16 kHz while
+     * still allowing the same persistent edge to be re-evaluated after its
+     * debounce/outlier hold time has elapsed. */
+    uint8_t m_hall_reject_counted_state;
     uint32_t m_hall_invalid_transition_count;
 
     int32_t m_iq_integrator;
     int32_t m_iq_set_ramp_q16;
     int32_t m_id_integrator;
+    /* Speed integrator is Iq(q4) Q16; previous error is ERPM Q16. */
     int32_t m_speed_integrator;
-    int16_t m_speed_prev_error;
+    int32_t m_speed_prev_error;
     int32_t m_position_integrator;
     int16_t m_position_prev_error;
     uint8_t m_position_sat_hold;

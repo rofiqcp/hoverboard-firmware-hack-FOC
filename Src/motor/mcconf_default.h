@@ -18,9 +18,12 @@
 #define MCCONF_FOC_ID_KP_Q11                 819u
 #define MCCONF_FOC_ID_KI_Q16                 737u
 #define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
-#define MCCONF_SPEED_KP_Q11                  4833u
-#define MCCONF_SPEED_KI_Q16                   251u
-#define MCCONF_SPEED_KD_Q11                      0u
+/* VESC 6.x speed PID defaults are Kp=0.004, Ki=0.004, Kd=0.
+ * These legacy-named integer fields are the persisted gain*1000 representation,
+ * not direct Vq-controller coefficients. */
+#define MCCONF_SPEED_KP_Q11                     4u
+#define MCCONF_SPEED_KI_Q16                     4u
+#define MCCONF_SPEED_KD_Q11                     0u
 #define MCCONF_POSITION_KP_Q11                8192u
 #define MCCONF_POSITION_KI_Q16                   0u
 #define MCCONF_POSITION_KD_Q11                   0u

@@ -163,11 +163,15 @@ int main(void) {
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) HAL_Delay(10);
 
   while (1) {
+    /* Service VESC request/reply traffic as soon as DMA/IDLE has queued it.
+     * Keeping this outside the ~5 ms housekeeping gate avoids adding one full
+     * control-loop period of latency to every UART transaction. FOC itself
+     * remains interrupt-driven and is not moved into this path. */
+    vesc_protocol_process_pending();
+
     if ((buzzerTimer - buzzerTimerPrev) <= (16u * DELAY_IN_MAIN_LOOP)) continue;
 
     readCommand();
-    vesc_protocol_process_pending();
-    vesc_protocol_periodic();
     const bool vescLinkActive = vesc_protocol_link_active();
     calcAvgSpeed();
 

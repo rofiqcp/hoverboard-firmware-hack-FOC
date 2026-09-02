@@ -49,8 +49,10 @@ def check_static():
     mathc=(ROOT/'Src/motor/foc_math.c').read_text()
     mcc=(ROOT/'Src/motor/mcconf_default.h').read_text()
     assert re.search(r'#define\s+MCCONF_FOC_CONTROL_DIV\s+3u',mcc), 'FOC scheduler must match generated 1-of-3 cadence'
-    assert 'e_q4_raw=(m->m_speed_set_ramp_q16-measured_q16)>>12' in mc, 'speed PI error must preserve fractional mechanical RPM in Q4'
-    assert 'speed PI drives Vq directly' in mc and 'm->m_iq_set_q4=pi_run_state' not in mc, 'mode2 must use proven speed-PI-to-Vq architecture'
+    assert 'speed_pid_iq_target_step' in mc and 'error_q16' in mc, 'VESC speed PID fixed-point ERPM path missing'
+    assert 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc, 'mode2 speed PID must command Iq'
+    assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
+    assert 'v.q=pi_run_state(eq,m->m_kpq_q11,m->m_kiq_q16' in mc, 'mode2 must close inner Iq PI before Vq'
     assert 'speed_setpoint_slew_step' in mc and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp missing'
     assert 'MCCONF_SPEED_STOP_VOLTAGE_MAX' in mc, 'mode2 gentle stop voltage ceiling missing'
     assert 'mcpwm_foc_release_motor(second)' in mc and 'stop_reached' in mc, 'mode2 low-speed release missing'
@@ -89,7 +91,7 @@ def check_static():
     assert 'appconf6_append_balance_placeholder' in serc and 'appconf6_skip_balance_placeholder' in serc, 'VESC 6.00 balance wire block adapter missing'
     assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM motor config persistence missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp, 'virtual CAN routing missing'
     assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()

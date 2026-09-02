@@ -188,20 +188,15 @@ int main(void){
     }
 
     uint8_t gv[]={COMM_GET_VALUES}; if(!transact(gv,sizeof(gv),r,&rn) || check_values_reply(r,rn,false)) return 1;
-    /* The same standard GET_VALUES response is repeated at exactly 20 ms when
-     * realtime is armed, providing 50-Hz data without legacy bytes. */
-    tx_capture_len=0u; tick_ms=1019u; vesc_protocol_periodic();
-    if(tx_capture_len!=0u)return fail("rt sent before 20ms");
-    tick_ms=1020u; vesc_protocol_periodic();
-    if(!decode_tx(r,&rn)||check_values_reply(r,rn,false))return fail("rt 50hz periodic");
+    /* Upstream VESC GET_VALUES is request/reply only. The host owns the polling
+     * cadence; firmware must not inject unsolicited packets that can be
+     * mistaken for replies from another virtual motor. */
 
-    /* VESC Tool can use the SETUP flavor for its dashboard. It must also arm
-     * the same 50-Hz standard packet stream and preserve the packet ID. */
+    /* VESC Tool can use the SETUP flavor for its dashboard; it is likewise
+     * exactly one request -> one reply. */
     {
         uint8_t gvs[]={COMM_GET_VALUES_SETUP};
         if(!transact(gvs,sizeof(gvs),r,&rn)||rn<2u||r[0]!=COMM_GET_VALUES_SETUP)return fail("setup values immediate");
-        tx_capture_len=0u; tick_ms+=20u; vesc_protocol_periodic();
-        if(!decode_tx(r,&rn)||rn<2u||r[0]!=COMM_GET_VALUES_SETUP)return fail("setup values 50hz periodic");
     }
 
     uint8_t gvr[]={COMM_FORWARD_CAN,2u,COMM_GET_VALUES}; if(!transact(gvr,sizeof(gvr),r,&rn) || check_values_reply(r,rn,true)) return 1;

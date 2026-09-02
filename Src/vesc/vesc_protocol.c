@@ -17,7 +17,6 @@
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
 #define VESC_RX_QUEUE_DEPTH          4u
-#define VESC_RT_PERIOD_MS           20u
 
 /* Project-specific extensions are transported inside standard
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
@@ -55,17 +54,6 @@ static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
 static app_configuration s_app_local;
 static app_configuration s_app_right;
 
-typedef struct {
-    uint8_t active;
-    uint8_t second;
-    uint8_t selective;
-    uint8_t setup;
-    uint32_t mask;
-    uint32_t last_tx_ms;
-} vesc_rt_stream_t;
-
-static vesc_rt_stream_t s_rt_stream = {0u, 0u, 0u, 0u, 0xffffffffu, 0u};
-
 static void rx_reset(void) {
     s_rx_active = 0u;
     s_rx_index = 0u;
@@ -92,12 +80,6 @@ void vesc_protocol_init(void) {
     s_pending_head = s_pending_tail = s_pending_count = 0u;
     memset((void *)s_pending_len, 0, sizeof(s_pending_len));
     s_rx_queue_drop = 0u;
-    s_rt_stream.active = 0u;
-    s_rt_stream.second = 0u;
-    s_rt_stream.selective = 0u;
-    s_rt_stream.setup = 0u;
-    s_rt_stream.mask = 0xffffffffu;
-    s_rt_stream.last_tx_ms = 0u;
     s_link_last_ms = 0u;
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
@@ -326,16 +308,8 @@ static void reply_values(bool second, bool selective, const uint8_t *data, uint1
     }
     send_values_packet(second, selective, mask);
 
-    /* A valid realtime request arms a standard VESC packet stream. Polling
-     * VESC Tool still receives its immediate request/reply response; if the
-     * host pauses between requests, periodic() continues the same packet type
-     * at 20 ms (50 Hz), never mixing legacy telemetry into the VESC stream. */
-    s_rt_stream.active = 1u;
-    s_rt_stream.second = second ? 1u : 0u;
-    s_rt_stream.selective = selective ? 1u : 0u;
-    s_rt_stream.setup = 0u;
-    s_rt_stream.mask = mask;
-    s_rt_stream.last_tx_ms = HAL_GetTick();
+    /* Stock VESC semantics are strict request/reply: the host (VESC Tool)
+     * chooses the polling rate. Never arm an unsolicited values stream here. */
 }
 
 static void send_values_setup_packet(bool second, bool selective, uint32_t mask) {
@@ -380,12 +354,7 @@ static void reply_values_setup(bool second, bool selective, const uint8_t *data,
         mask = buffer_get_uint32(data, &r);
     }
     send_values_setup_packet(second, selective, mask);
-    s_rt_stream.active = 1u;
-    s_rt_stream.second = second ? 1u : 0u;
-    s_rt_stream.selective = selective ? 1u : 0u;
-    s_rt_stream.setup = 1u;
-    s_rt_stream.mask = mask;
-    s_rt_stream.last_tx_ms = HAL_GetTick();
+    /* GET_VALUES_SETUP is also one request -> one reply, matching upstream VESC. */
 }
 
 static float right_sign(bool second, float value) { return second ? -value : value; }
@@ -704,17 +673,4 @@ void vesc_protocol_process_pending(void) {
         s_link_last_ms = HAL_GetTick();
         process_top_packet(s_process_payload, n);
     }
-}
-
-void vesc_protocol_periodic(void) {
-    if (!s_rt_stream.active) return;
-    if (!vesc_protocol_link_active()) { s_rt_stream.active = 0u; return; }
-    const uint32_t now = HAL_GetTick();
-    if ((uint32_t)(now - s_rt_stream.last_tx_ms) < VESC_RT_PERIOD_MS) return;
-    if (s_rt_stream.setup) {
-        send_values_setup_packet(s_rt_stream.second != 0u, s_rt_stream.selective != 0u, s_rt_stream.mask);
-    } else {
-        send_values_packet(s_rt_stream.second != 0u, s_rt_stream.selective != 0u, s_rt_stream.mask);
-    }
-    s_rt_stream.last_tx_ms = now;
 }
