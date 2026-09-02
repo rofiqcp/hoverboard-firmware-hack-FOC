@@ -59,6 +59,14 @@
 /* Reject an impossible Hall edge that is >4x faster than the previous valid
  * sector period. This suppresses contact/boundary chatter near zero speed. */
 #define MCCONF_HALL_PERIOD_OUTLIER_RATIO         4u
+/* Require a new GPIO Hall code to persist for three 16-kHz samples (~125 us
+ * from first to third sample). This filters switching-edge/metastability
+ * glitches without materially shifting a 60-deg sector at steering speeds. */
+#define MCCONF_HALL_DEBOUNCE_SAMPLES              3u
+/* After start or a real direction reversal, accept five valid adjacent edges
+ * before enabling the period-outlier test. This fully refreshes the four-edge
+ * period history so acceleration from near-zero is not mistaken for chatter. */
+#define MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES     5u
 #define MCCONF_TRQ_STOP_RPM_DEADBAND  TRQ_STOP_RPM_DEADBAND
 #define MCCONF_OPENLOOP_RPM_DEFAULT   SVPWM_OPENLOOP_RPM_DEFAULT
 #define MCCONF_OPENLOOP_RPM_MAX       SVPWM_OPENLOOP_RPM_MAX

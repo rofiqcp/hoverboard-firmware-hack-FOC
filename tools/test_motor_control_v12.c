@@ -178,7 +178,7 @@ int main(void){
     mcpwm_foc_init(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
     for(int i=0;i<100;i++)mcpwm_foc_adc_int_handler();
     set_halls(2u,2u);
-    mcpwm_foc_adc_int_handler();
+    for(uint8_t i=0u;i<MCCONF_HALL_DEBOUNCE_SAMPLES;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_2.m_hall_direction!=-1)return fail("right reverse Hall direction");
     for(uint32_t i=0u;i<MCCONF_HALL_TIMEOUT_TICKS+100u;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_2.m_hall_interp_active!=0u)return fail("Hall interpolation low-speed disable");

@@ -509,7 +509,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[96];
+        uint8_t b[128];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         float erpm_f = mcpwm_foc_get_erpm_motor(second);
@@ -547,6 +547,24 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_uint32(b, s_rx_ok, &i);
         buffer_append_uint32(b, s_rx_crc_err, &i);
         for (uint8_t h = 0u; h < 8u; ++h) b[i++] = (uint8_t)m->m_conf.foc_hall_table[h];
+        /* Extended Hall/phase diagnostics. Values are raw fixed-point so the
+         * host can prove table->electrical-angle->FOC-phase mapping while the
+         * bridge is active. Backward-compatible: legacy parsers may stop at 78. */
+        b[i++] = (uint8_t)m->m_conf.foc_hall_table[m->m_hall_state & 7u];
+        b[i++] = m->m_hall_pos;
+        b[i++] = m->m_hall_pos_prev;
+        b[i++] = (uint8_t)m->m_hall_direction;
+        b[i++] = m->m_hall_interp_active;
+        b[i++] = m->m_hall_last_reject_reason;
+        b[i++] = m->m_hall_last_reject_from;
+        b[i++] = m->m_hall_last_reject_to;
+        buffer_append_uint16(b, m->m_phase, &i);
+        buffer_append_uint16(b, m->m_phase_hall, &i);
+        buffer_append_uint16(b, m->m_phase_hall_target, &i);
+        buffer_append_uint16(b, m->m_hall_period, &i);
+        buffer_append_uint16(b, m->m_hall_ticks, &i);
+        buffer_append_uint32(b, m->m_hall_period_reject_count, &i);
+        buffer_append_uint32(b, m->m_hall_sequence_reject_count, &i);
         uart_send_payload(b, (uint16_t)i);
     }
 }

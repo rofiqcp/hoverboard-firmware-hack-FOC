@@ -100,11 +100,23 @@ static bool ee_write_slot(uint8_t idx, uint16_t v) {
 
 static bool hall_table_sane(const uint8_t t[8]) {
     if (t[0] != 255u || t[7] != 255u) return false;
-    uint8_t valid = 0u;
+    uint8_t sorted[6];
     for (uint8_t h = 1u; h <= 6u; ++h) {
-        if (t[h] < 200u) valid++;
+        if (t[h] >= 200u) return false;
+        sorted[h - 1u] = t[h];
     }
-    return valid == 6u;
+    for (uint8_t i = 0u; i < 5u; ++i) {
+        for (uint8_t j = (uint8_t)(i + 1u); j < 6u; ++j) {
+            if (sorted[j] < sorted[i]) { uint8_t x=sorted[i]; sorted[i]=sorted[j]; sorted[j]=x; }
+        }
+    }
+    for (uint8_t i = 0u; i < 6u; ++i) {
+        const uint16_t a=sorted[i];
+        const uint16_t b=(i==5u)?(uint16_t)sorted[0]+200u:sorted[i+1u];
+        const uint16_t gap=b-a;
+        if (gap < 18u || gap > 48u) return false;
+    }
+    return true;
 }
 
 bool mc_interface_store_configuration_motor(bool second) {

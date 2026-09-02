@@ -4,6 +4,7 @@ import re
 R=Path(__file__).resolve().parents[1]
 mc=(R/'Src/motor/mcpwm_foc.c').read_text()
 mch=(R/'Src/motor/mcpwm_foc.h').read_text()
+mcc=(R/'Src/motor/mcconf_default.h').read_text()
 vp=(R/'Src/vesc/vesc_protocol.c').read_text()
 main=(R/'Src/main.c').read_text()
 dual=(R/'tools/vesc_dual.py').read_text()
@@ -56,8 +57,9 @@ assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'rx fifo burst' in host and 'request/reply only' in host
 
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo4=1 vesc_request_reply=1')
 
+assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'
+assert 'MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES' in mcc and 'm_hall_direction_stable_edges' in mc, 'Hall reversal/acceleration warmup missing'
 assert 'm_brake_direction' in mch and 'const bool entering = m->m_control_mode != CONTROL_MODE_CURRENT_BRAKE' in mc
 assert 'COMM_SET_CURRENT_BRAKE is a stop request, not a reverse-speed command' in mc
 
@@ -66,3 +68,8 @@ assert 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mc or 'MCCONF_POSITION_SETTLE_CURR
 assert 'MCCONF_POSITION_SETTLE_MS' in mc or 'MCCONF_POSITION_SETTLE_MS' in mcc
 
 assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not reject direction reversals'
+assert 'hall_table_runtime_sane' in mc and 'Preserve the last known-good table' in mc, 'runtime Hall-table validation missing'
+assert 'motor_pole_pairs(second)*4294967296ULL' in mc, 'right openloop must use per-motor pole pairs'
+assert 'hall-phase' in (R/'tools/vesc_debug.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_debug.py').read_text(), 'active Hall phase-check utility missing'
+
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo4=1 vesc_request_reply=1 brake_latch=1 position_cap=1')

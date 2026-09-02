@@ -172,6 +172,21 @@ class Diag:
     rx_ok: int
     rx_crc_errors: int
     hall_table: list[int]
+    hall_angle200: int | None = None
+    hall_edge200: int | None = None
+    hall_center200: int | None = None
+    hall_direction: int | None = None
+    hall_interp: bool | None = None
+    hall_last_reject_reason: int | None = None
+    hall_last_reject_from: int | None = None
+    hall_last_reject_to: int | None = None
+    phase_raw: int | None = None
+    phase_hall_raw: int | None = None
+    phase_target_raw: int | None = None
+    hall_period: int | None = None
+    hall_ticks: int | None = None
+    hall_period_rejects: int | None = None
+    hall_sequence_rejects: int | None = None
 
     def short(self) -> str:
         return (
@@ -210,6 +225,19 @@ def parse_diag(payload: bytes) -> Diag:
     vals = struct.unpack_from(">10i", payload, 14)
     hall_invalid, trips, rx_ok, rx_crc = struct.unpack_from(">4I", payload, 54)
     table = list(payload[70:78])
+    ext = {}
+    if len(payload) >= 104:
+        (ang200, edge200, center200, direction_u8, interp, rej_reason, rej_from, rej_to) = struct.unpack_from(">8B", payload, 78)
+        phase_raw, phase_hall_raw, phase_target_raw, hall_period, hall_ticks = struct.unpack_from(">5H", payload, 86)
+        period_rej, sequence_rej = struct.unpack_from(">2I", payload, 96)
+        direction = direction_u8 - 256 if direction_u8 >= 128 else direction_u8
+        ext = dict(hall_angle200=ang200, hall_edge200=edge200, hall_center200=center200,
+                   hall_direction=direction, hall_interp=bool(interp),
+                   hall_last_reject_reason=rej_reason, hall_last_reject_from=rej_from,
+                   hall_last_reject_to=rej_to, phase_raw=phase_raw,
+                   phase_hall_raw=phase_hall_raw, phase_target_raw=phase_target_raw,
+                   hall_period=hall_period, hall_ticks=hall_ticks,
+                   hall_period_rejects=period_rej, hall_sequence_rejects=sequence_rej)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),
@@ -219,7 +247,7 @@ def parse_diag(payload: bytes) -> Diag:
         position=vals[6], position_target=vals[7],
         position_min=vals[8], position_max=vals[9],
         hall_invalid=hall_invalid, current_trips=trips,
-        rx_ok=rx_ok, rx_crc_errors=rx_crc, hall_table=table,
+        rx_ok=rx_ok, rx_crc_errors=rx_crc, hall_table=table, **ext,
     )
 
 def _i16(data: bytes, i: int, scale: float):

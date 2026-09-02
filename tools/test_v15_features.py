@@ -23,7 +23,7 @@ assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 # Hall detect fixed phase must not be overwritten by rotating mode-4 updater.
 assert 'm->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE' in mc
 phase_branch=mc[mc.index('if (m->m_control_mode==CONTROL_MODE_OPENLOOP)'):mc.index('/* Hall estimator needs')]
-assert 'openloop_update(m);' in phase_branch and 'openloop_current_ramp_update(m);' in phase_branch
+assert 'openloop_update(m, second);' in phase_branch and 'openloop_current_ramp_update(m);' in phase_branch
 assert 'otherwise it overwrites m_phase_openloop' in phase_branch
 assert 'for (uint8_t pass = 0u; pass < 6u; ++pass)' in mc and ('const bool reverse = (pass & 1u) != 0u' in mc or 'const bool reverse = pass >= 3u' in mc)
 assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++)' in halltest and 'isr<16u' in halltest

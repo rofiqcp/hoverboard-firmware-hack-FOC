@@ -50,7 +50,7 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y){
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
 static void fill_table(uint8_t t[8], uint8_t base){
     t[0]=255u; t[7]=255u;
-    for(int i=1;i<=6;i++) t[i]=(uint8_t)(base+(i-1)*30u);
+    for(int i=1;i<=6;i++) t[i]=(uint8_t)(base+(i-1)*33u);
 }
 static int same8(const uint8_t a[8],const uint8_t b[8]){return memcmp(a,b,8)==0;}
 

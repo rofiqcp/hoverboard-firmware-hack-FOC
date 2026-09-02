@@ -130,6 +130,16 @@ def print_diag(prefix: str, d: Diag) -> None:
         f"  pos_limit=[{d.position_min}, {d.position_max}] hall_table={d.hall_table} "
         f"hall_store={'OK' if d.hall_store_ok else 'NO/NOT-YET'} rx_ok={d.rx_ok} crc_err={d.rx_crc_errors}"
     )
+    if d.phase_raw is not None:
+        phase_deg = d.phase_raw * 360.0 / 65536.0
+        hall_deg = d.phase_hall_raw * 360.0 / 65536.0
+        target_deg = d.phase_target_raw * 360.0 / 65536.0
+        center_deg = (d.hall_angle200 * 1.8) if d.hall_angle200 is not None and d.hall_angle200 < 200 else float('nan')
+        print(f"  HALL_PHASE state={d.hall} table={d.hall_angle200}/200 center={center_deg:.1f}deg "
+              f"phase={phase_deg:.1f} hall_phase={hall_deg:.1f} target={target_deg:.1f} "
+              f"dir={d.hall_direction} interp={int(bool(d.hall_interp))} period={d.hall_period} ticks={d.hall_ticks} "
+              f"reject_seq={d.hall_sequence_rejects} reject_period={d.hall_period_rejects} "
+              f"last_reject={d.hall_last_reject_reason}:{d.hall_last_reject_from}->{d.hall_last_reject_to}")
 
 
 def hall_table_valid(table: list[int]) -> tuple[bool, str]:
@@ -331,6 +341,8 @@ def run_motion_test(args, link: VescDual, motor: str, cmd: int, raw: int, label:
     print_diag("AFTER", after)
     if samples:
         print_values("LAST", samples[-1][1])
+        if samples[-1][2] is not None:
+            print_diag("ACTIVE", samples[-1][2])
     if not samples:
         print("RESULT: FAIL tidak ada telemetry")
         return 2
@@ -446,6 +458,98 @@ def cmd_pos_count(args, link: VescDual) -> int:
     return 0
 
 
+
+def _phase_diff_deg(raw_a: int, raw_b: int) -> float:
+    d = (int(raw_a) - int(raw_b)) & 0xFFFF
+    if d >= 0x8000:
+        d -= 0x10000
+    return d * 360.0 / 65536.0
+
+
+def cmd_hall_phase(args, link: VescDual) -> int:
+    """Active proof of VESC Hall table -> electrical phase -> FOC phase.
+
+    VESC FOC Hall values are 0..199 for 0..360 electrical degrees; 255 is
+    invalid. During sensored closed-loop m_phase must be the corrected/rate-
+    limited Hall phase, while interpolation stays within the current sector.
+    """
+    require_arm(args)
+    left, right = motor_flags(args.motor)
+    if left and right:
+        raise SystemExit("hall-phase test jalankan satu motor")
+    is_right = right
+    motor = "right" if right else "left"
+    if args.erpm is not None:
+        erpm = int(round(args.erpm))
+    elif args.mech_rpm is not None:
+        erpm = int(round(args.mech_rpm * POLE_PAIRS))
+    else:
+        erpm = 750
+    if abs(erpm) < 300 or abs(erpm) > 1200:
+        raise SystemExit("hall-phase safety window: |ERPM| harus 300..1200")
+
+    before = link.diag(is_right)
+    seq0 = before.hall_sequence_rejects if before.hall_sequence_rejects is not None else before.hall_invalid
+    per0 = before.hall_period_rejects or 0
+    trip0 = before.current_trips
+    seen: set[int] = set()
+    checked = 0
+    max_center_err = 0.0
+    max_phase_use_err = 0.0
+    worst = None
+    sender = lambda: send_one(link, motor, COMM_SET_RPM, erpm)
+    start = time.monotonic()
+    try:
+        with Refresher(sender, min(max(args.hz, 20.0), 60.0)) as ref:
+            end = start + max(args.seconds, 2.0)
+            while time.monotonic() < end:
+                d = link.diag(is_right)
+                elapsed = time.monotonic() - start
+                if d.fault or d.current_trips != trip0:
+                    print(f"HALL_PHASE_FAIL fault/trip fault={d.fault} trips={trip0}->{d.current_trips}")
+                    return 2
+                if d.phase_raw is None or d.phase_hall_raw is None or d.phase_target_raw is None:
+                    print("HALL_PHASE_FAIL firmware diagnostic extension belum tersedia")
+                    return 2
+                if d.hall in range(1, 7):
+                    table_angle = d.hall_table[d.hall]
+                    if table_angle >= 200 or d.hall_angle200 != table_angle:
+                        print(f"HALL_PHASE_FAIL table mismatch state={d.hall} diag={d.hall_angle200} table={table_angle}")
+                        return 2
+                    center_raw = (table_angle * 65536) // 200
+                    center_err = abs(_phase_diff_deg(d.phase_hall_raw, center_raw))
+                    phase_use_err = abs(_phase_diff_deg(d.phase_raw, d.phase_hall_raw))
+                    if elapsed > 0.45:
+                        seen.add(d.hall); checked += 1
+                        max_center_err = max(max_center_err, center_err)
+                        max_phase_use_err = max(max_phase_use_err, phase_use_err)
+                        if center_err > 42.0 or phase_use_err > 3.0:
+                            worst = (d.hall, table_angle, center_err, phase_use_err, d.erpm)
+                            print(f"HALL_PHASE_FAIL state={d.hall} table={table_angle}/200 center_err={center_err:.1f}deg phase_use_err={phase_use_err:.1f}deg erpm={d.erpm}")
+                            return 2
+                time.sleep(0.04)
+            print(f"refresh count={ref.count} errors={len(ref.errors)}")
+    finally:
+        release_one(link, motor)
+
+    after = link.diag(is_right)
+    seq1 = after.hall_sequence_rejects if after.hall_sequence_rejects is not None else after.hall_invalid
+    per1 = after.hall_period_rejects or 0
+    print(f"HALL_PHASE_RESULT motor={motor} cmd={erpm:+d} samples={checked} states={sorted(seen)} "
+          f"max_center_err={max_center_err:.1f}deg max_phase_use_err={max_phase_use_err:.2f}deg "
+          f"seq_reject={seq0}->{seq1} period_reject={per0}->{per1}")
+    if checked < 10 or len(seen) < 4:
+        print("HALL_PHASE_FAIL coverage kurang")
+        return 2
+    if seq1 != seq0:
+        print("HALL_PHASE_FAIL ada electrical Hall sequence reject")
+        return 2
+    if after.fault or after.current_trips != trip0:
+        print("HALL_PHASE_FAIL fault/current-trip sesudah test")
+        return 2
+    print("HALL_PHASE_PASS table200->360e->FOC phase aktif konsisten")
+    return 0
+
 def cmd_all(args, link: VescDual) -> int:
     rc = 0
     print("=== INFO ===")
@@ -489,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="VESC 6.00 dual STM32F103 hardware/protocol debugger")
     p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
     p.add_argument("command", nargs="?", default="info",
-                   choices=("selftest","info","diag","rt","hall","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
+                   choices=("selftest","info","diag","rt","hall","hall-phase","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--motor", default="both", choices=("left","right","both"))
     p.add_argument("--hz", type=float, default=50.0)
@@ -522,6 +626,7 @@ def main() -> int:
         if args.command == "diag": return cmd_diag(args, link)
         if args.command == "rt": return cmd_rt(args, link)
         if args.command == "hall": return cmd_hall(args, link)
+        if args.command == "hall-phase": return cmd_hall_phase(args, link)
         if args.command == "current": return cmd_current(args, link)
         if args.command == "rpm": return cmd_rpm(args, link)
         if args.command == "pos-vesc": return cmd_pos_vesc(args, link)

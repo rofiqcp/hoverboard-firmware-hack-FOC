@@ -176,6 +176,20 @@ void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool second) {
     if (conf) conf_defaults(conf, second);
 }
 
+static bool hall_table_runtime_sane(const uint8_t t[8]) {
+    uint8_t u[8], sorted[6];
+    for (uint8_t i=0u;i<8u;++i) u[i]=(uint8_t)t[i];
+    if (u[0]!=255u || u[7]!=255u) return false;
+    for (uint8_t h=1u;h<=6u;++h) { if (u[h]>=200u) return false; sorted[h-1u]=u[h]; }
+    for (uint8_t i=0u;i<5u;++i) for(uint8_t j=(uint8_t)(i+1u);j<6u;++j)
+        if(sorted[j]<sorted[i]){uint8_t x=sorted[i];sorted[i]=sorted[j];sorted[j]=x;}
+    for (uint8_t i=0u;i<6u;++i) {
+        const uint16_t a=sorted[i], b=(i==5u)?(uint16_t)sorted[0]+200u:sorted[i+1u];
+        const uint16_t gap=b-a; if(gap<18u || gap>48u) return false;
+    }
+    return true;
+}
+
 static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     memset(m, 0, sizeof(*m));
     conf_defaults(&m->m_conf, second);
@@ -222,7 +236,14 @@ static int16_t amp_to_q4(const mcpwm_foc_motor_t *m, float current);
 void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (!conf) return;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
-    m->m_conf = *conf;
+    mc_configuration next = *conf;
+    /* Never let a malformed VESC Tool/EEPROM Hall table become the live FOC
+     * angle source. Preserve the last known-good table while still accepting
+     * the other configuration fields. */
+    if (!hall_table_runtime_sane(next.foc_hall_table)) {
+        for (uint8_t h=0u;h<8u;++h) next.foc_hall_table[h]=m->m_conf.foc_hall_table[h];
+    }
+    m->m_conf = next;
 
     /* VESC configuration uses electrical units. Convert once outside the ISR
      * and keep the actual speed-loop ramp integer/fixed-point. */
@@ -577,6 +598,9 @@ static int16_t hall_angle_diff(uint8_t now, uint8_t prev) {
 static void hall_estimator_reset(mcpwm_foc_motor_t *m) {
     m->m_hall_initialized = 0u;
     m->m_hall_direction = 0;
+    m->m_hall_debounce_initialized = 0u;
+    m->m_hall_candidate_count = 0u;
+    m->m_hall_direction_stable_edges = 0u;
     m->m_hall_ticks = 0u;
     m->m_hall_period = MCCONF_HALL_TIMEOUT_TICKS;
     for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = MCCONF_HALL_TIMEOUT_TICKS;
@@ -603,10 +627,36 @@ static uint8_t hall_midpoint200(uint8_t previous_center, int16_t center_delta) {
 }
 
 static void hall_update(mcpwm_foc_motor_t *m, bool second) {
-    const uint8_t h = hall_read(second);
+    const uint8_t raw_h = hall_read(second);
+    m->m_hall_raw_state = raw_h;
+
+    /* GPIO Hall inputs are asynchronous to the 16-kHz ADC ISR. One transient
+     * sample during a switching edge must never become an electrical-sector
+     * transition. Accept a new raw code only after consecutive agreement. */
+    if (!m->m_hall_debounce_initialized) {
+        m->m_hall_debounce_initialized = 1u;
+        m->m_hall_state = raw_h;
+        m->m_hall_candidate_state = raw_h;
+        m->m_hall_candidate_count = 0u;
+    } else if (raw_h == m->m_hall_state) {
+        m->m_hall_candidate_state = raw_h;
+        m->m_hall_candidate_count = 0u;
+    } else {
+        if (raw_h != m->m_hall_candidate_state) {
+            m->m_hall_candidate_state = raw_h;
+            m->m_hall_candidate_count = 1u;
+        } else if (m->m_hall_candidate_count < 0xffu) {
+            m->m_hall_candidate_count++;
+        }
+        if (m->m_hall_candidate_count >= MCCONF_HALL_DEBOUNCE_SAMPLES) {
+            m->m_hall_state = m->m_hall_candidate_state;
+            m->m_hall_candidate_count = 0u;
+        }
+    }
+
+    const uint8_t h = m->m_hall_state;
     const uint8_t angle = hall_table_angle(m, h);
     const bool valid = (h != 0u && h != 7u && angle < 200u);
-    m->m_hall_state = h;
     if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
 
     if (valid) {
@@ -634,6 +684,7 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                 const bool period_outlier =
                     (m->m_hall_direction != 0 &&
                      m->m_hall_direction == dir &&
+                     m->m_hall_direction_stable_edges >= MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES &&
                      m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS &&
                      ((uint32_t)period * MCCONF_HALL_PERIOD_OUTLIER_RATIO) < m->m_hall_period);
                 if (period_outlier) {
@@ -647,15 +698,26 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                      * hold time elapsed, turning one chatter/outlier edge into
                      * hundreds of reported invalid transitions. */
                     if (m->m_hall_reject_counted_state != h) {
-                        m->m_hall_invalid_transition_count++;
+                        /* Period rejection is a timing/filter event, not an
+                         * impossible Hall electrical sequence. Track it
+                         * separately so hall_bad means an actual mapping/state
+                         * error. */
+                        m->m_hall_period_reject_count++;
+                        m->m_hall_last_reject_reason = 1u;
+                        m->m_hall_last_reject_from = 0xffu;
+                        for(uint8_t rh=1u;rh<=6u;++rh) if(hall_table_angle(m,rh)==m->m_hall_pos_prev){m->m_hall_last_reject_from=rh;break;}
+                        m->m_hall_last_reject_to = h;
                         m->m_hall_reject_counted_state = h;
                     }
                 } else {
                     m->m_hall_reject_counted_state = 0xffu;
-                    if (m->m_hall_direction == 0 || m->m_hall_direction != dir ||
-                        m->m_hall_period_hist[0] == MCCONF_HALL_TIMEOUT_TICKS) {
+                    const bool direction_reset =
+                        (m->m_hall_direction == 0 || m->m_hall_direction != dir ||
+                         m->m_hall_period_hist[0] == MCCONF_HALL_TIMEOUT_TICKS);
+                    if (direction_reset) {
                         for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = period;
                         m->m_hall_hist_pos = 0u;
+                        m->m_hall_direction_stable_edges = 0u;
                     } else {
                         m->m_hall_period_hist[m->m_hall_hist_pos++ & 3u] = period;
                     }
@@ -665,6 +727,7 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                     if (!m->m_hall_period) m->m_hall_period = 1u;
                     m->m_hall_ticks = 0u;
                     m->m_hall_direction = dir;
+                    if (m->m_hall_direction_stable_edges < 0xffu) m->m_hall_direction_stable_edges++;
                     if (dir > 0 && m->m_position_counts < INT32_MAX) m->m_position_counts++;
                     else if (dir < 0 && m->m_position_counts > INT32_MIN) m->m_position_counts--;
                     /* VESC Hall tables contain SECTOR CENTERS. At an edge the
@@ -678,6 +741,11 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
             } else {
                 if (m->m_hall_reject_counted_state != h) {
                     m->m_hall_invalid_transition_count++;
+                    m->m_hall_sequence_reject_count++;
+                    m->m_hall_last_reject_reason = 2u;
+                    m->m_hall_last_reject_from = 0xffu;
+                    for(uint8_t rh=1u;rh<=6u;++rh) if(hall_table_angle(m,rh)==m->m_hall_pos_prev){m->m_hall_last_reject_from=rh;break;}
+                    m->m_hall_last_reject_to = h;
                     m->m_hall_reject_counted_state = h;
                 }
             }
@@ -762,7 +830,7 @@ static void openloop_current_ramp_update(mcpwm_foc_motor_t *m) {
     m->m_iq_set_q4=0;
 }
 
-static void openloop_update(mcpwm_foc_motor_t *m) {
+static void openloop_update(mcpwm_foc_motor_t *m, bool second) {
     const int16_t target=m->m_speed_set_rpm;
     const int8_t requested_dir=(target>0)?1:(target<0?-1:0);
     const uint16_t absrpm=(uint16_t)(target<0?-target:target);
@@ -804,7 +872,7 @@ static void openloop_update(mcpwm_foc_motor_t *m) {
     }
 
     const int8_t phase_dir=(requested_dir!=0)?requested_dir:m->m_openloop_direction;
-    const uint32_t stepPerRpm=(uint32_t)(((uint64_t)MCCONF_POLE_PAIRS_LEFT*4294967296ULL)/(60ULL*PWM_FREQ));
+    const uint32_t stepPerRpm=(uint32_t)(((uint64_t)motor_pole_pairs(second)*4294967296ULL)/(60ULL*PWM_FREQ));
     const uint32_t phaseStep=(uint32_t)(((uint64_t)(uint32_t)m->m_openloop_speed_q16*stepPerRpm)>>16);
     if(phase_dir>0)m->m_openloop_phase_acc_q32+=phaseStep;
     else if(phase_dir<0)m->m_openloop_phase_acc_q32-=phaseStep;
@@ -987,7 +1055,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                                int16_t i1_counts, int16_t idc_counts, bool control_update) {
     hall_update(m, second);
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP) {
-        openloop_update(m);
+        openloop_update(m, second);
     } else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
         /* Hall detection/static phase mode: ramp Id only. Never run the rotating
          * open-loop updater here, otherwise it overwrites m_phase_openloop. */

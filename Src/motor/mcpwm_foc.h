@@ -59,7 +59,12 @@ typedef struct {
     volatile uint8_t m_phase_override;
 
     /* Hall estimator and fixed point regulators. */
-    uint8_t m_hall_state;
+    uint8_t m_hall_state;              /* debounced Hall state used by FOC */
+    uint8_t m_hall_raw_state;          /* instantaneous GPIO sample */
+    uint8_t m_hall_candidate_state;
+    uint8_t m_hall_candidate_count;
+    uint8_t m_hall_debounce_initialized;
+    uint8_t m_hall_direction_stable_edges;
     uint8_t m_hall_pos;
     uint8_t m_hall_pos_prev;
     int8_t m_hall_direction;
@@ -76,6 +81,14 @@ typedef struct {
      * debounce/outlier hold time has elapsed. */
     uint8_t m_hall_reject_counted_state;
     uint32_t m_hall_invalid_transition_count;
+    /* Split Hall diagnostics: impossible state/angle sequence vs period filter.
+     * hall_invalid_transition_count remains the true electrical-sequence error
+     * counter; a legitimate acceleration/reversal must never inflate it. */
+    uint32_t m_hall_period_reject_count;
+    uint32_t m_hall_sequence_reject_count;
+    uint8_t m_hall_last_reject_reason; /* 0 none, 1 period, 2 sequence */
+    uint8_t m_hall_last_reject_from;
+    uint8_t m_hall_last_reject_to;
 
     int32_t m_iq_integrator;
     int32_t m_iq_set_ramp_q16;
