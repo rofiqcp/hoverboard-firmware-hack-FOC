@@ -20,6 +20,15 @@
 #define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
 #define MCCONF_SPEED_KP_Q11                  4833u
 #define MCCONF_SPEED_KI_Q16                   251u
+#define MCCONF_SPEED_KD_Q11                      0u
+#define MCCONF_POSITION_KP_Q11                8192u
+#define MCCONF_POSITION_KI_Q16                   0u
+#define MCCONF_POSITION_KD_Q11                   0u
+/* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
+ * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
+#define MCCONF_SPEED_RAMP_ERPMS_S             1500u
+#define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
+#define MCCONF_SPEED_STOP_VOLTAGE_MAX          4000   /* gentle stop ceiling; running limit remains 12800 */
 #define MCCONF_FOC_VOLTAGE_MAX              14400
 /* Closed-loop current/speed headroom for the hoverboard two-shunt ADC.
  * V9 logs stay clean below ~80% duty and become noisy around 83..90%.
@@ -34,8 +43,13 @@
 #define MCCONF_HALL_INTERP_ON_RPM              30
 #define MCCONF_HALL_INTERP_OFF_RPM             15
 #define MCCONF_FOC_CONTROL_DIV                  3u
-#define MCCONF_HALL_TIMEOUT_TICKS            2000u
-#define MCCONF_TRQ_STOP_BRAKE_CA      TRQ_STOP_BRAKE_CA
+/* Hall timeout must be longer than one Hall sector at low VESC ERPM.
+ * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.
+ * 8000 ticks (0.5 s) keeps valid low-speed Hall feedback down to ~20 ERPM. */
+#define MCCONF_HALL_TIMEOUT_TICKS            8000u
+/* Reject an impossible Hall edge that is >4x faster than the previous valid
+ * sector period. This suppresses contact/boundary chatter near zero speed. */
+#define MCCONF_HALL_PERIOD_OUTLIER_RATIO         4u
 #define MCCONF_TRQ_STOP_RPM_DEADBAND  TRQ_STOP_RPM_DEADBAND
 #define MCCONF_OPENLOOP_RPM_DEFAULT   SVPWM_OPENLOOP_RPM_DEFAULT
 #define MCCONF_OPENLOOP_RPM_MAX       SVPWM_OPENLOOP_RPM_MAX

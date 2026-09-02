@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "stm32f1xx_hal.h"
 #include "config.h"
 #include "defines.h"
@@ -9,6 +10,8 @@
 #include "util.h"
 #include "comms.h"
 #include "motor/mcpwm_foc.h"
+#include "motor/mcconf_default.h"
+#include "motor/foc_math.h"
 #include "motor/mc_interface.h"
 
 #define RAW_MIN -1500
@@ -32,12 +35,23 @@ extern volatile uint32_t foc_isr_cycles;
 extern volatile uint32_t foc_isr_cycles_max;
 extern volatile uint8_t motorRunReq;
 extern volatile uint16_t svpwmOpenloopRpm;
+extern volatile int32_t positionCommandL,positionCommandR;
 
 static int16_t vescCurrentMaxA = I_MOT_MAX;
+static volatile int32_t positionMinUser = INT32_MIN;
+static volatile int32_t positionMaxUser = INT32_MAX;
+
+static void applyPositionLimits(void) {
+  /* PMIN/PMAX are user-facing full signed-int32 count limits. */
+  mcpwm_foc_set_position_user_limits(positionMinUser, positionMaxUser, false);
+  mcpwm_foc_set_position_user_limits(positionMinUser, positionMaxUser, true);
+}
 static void applyVescCurrentMax(void) {
   m_motor_1.m_conf.l_current_max = m_motor_2.m_conf.l_current_max = (float)vescCurrentMaxA;
   m_motor_1.m_conf.l_current_min = m_motor_2.m_conf.l_current_min = -(float)vescCurrentMaxA;
 }
+static void applyTuning(void){mcpwm_foc_sync_tuning_to_conf(false);mcpwm_foc_sync_tuning_to_conf(true);}
+static int8_t resetPos(void){mcpwm_foc_reset_position(false);mcpwm_foc_reset_position(true);positionCommandL=positionCommandR=0;return 1;}
 
 enum commandTypes {READ,WRITE};
 const command_entry commands[] = {
@@ -47,14 +61,29 @@ const command_entry commands[] = {
     {WRITE,"SET",NULL,NULL,setParamValExt,"Set Parameter"},
     {WRITE,"INIT",NULL,initParamVal,NULL,"Init Parameter from EEPROM or CONFIG.H"},
     {WRITE,"SAVE",saveAllParamVal,NULL,NULL,"Save Parameters to EEPROM"},
+    {WRITE,"RESETPOS",resetPos,NULL,NULL,"Reset position"},
 };
 
 enum paramTypes {PARAMETER,VARIABLE};
 const parameter_entry params[] = {
-    {PARAMETER,"CTRL_MOD",ADD_PARAM(ctrlModReqRaw),NULL,0,CTRL_MOD_REQ,0,1,4,0,0,0,NULL,"1 duty/VLT 2 speed 3 current-Iq(cA) 4 sensorless openloop Id(A)"},
-    {PARAMETER,"MOT_RUN",ADD_PARAM(motorRunReq),NULL,0,1,0,0,1,0,0,0,NULL,"1 run, 0 controlled current brake then neutral"},
+    {PARAMETER,"CTRL_MOD",ADD_PARAM(ctrlModReqRaw),NULL,0,CTRL_MOD_REQ,0,1,5,0,0,0,NULL,"1 VLT 2 SPD 3 TRQ 4 sensorless Id 5 POS"},
+    {PARAMETER,"MOT_RUN",ADD_PARAM(motorRunReq),NULL,0,1,0,0,1,0,0,0,NULL,"1 run, 0 stop request: VLT/TRQ release; SPD ramp-to-zero then release"},
     {PARAMETER,"SVPWM_RPM",ADD_PARAM(svpwmOpenloopRpm),NULL,0,SVPWM_OPENLOOP_RPM_DEFAULT,0,1,SVPWM_OPENLOOP_RPM_MAX,0,0,0,NULL,"Mode4 mechanical open-loop RPM"},
     {PARAMETER,"L_CURRENT_MAX",ADD_PARAM(vescCurrentMaxA),NULL,1,I_MOT_MAX,1,1,I_MOT_MAX,0,0,0,applyVescCurrentMax,"VESC l_current_max ampere; hardware fixed-point ceiling 15 A"},
+    {PARAMETER,"KPQ",UINT16_T,&m_motor_1.m_kpq_q11,&m_motor_2.m_kpq_q11,0,MCCONF_FOC_CURRENT_KP_Q11,0,0,65535,0,0,0,applyTuning,"FOC q Kp Q11"},
+    {PARAMETER,"KIQ",UINT16_T,&m_motor_1.m_kiq_q16,&m_motor_2.m_kiq_q16,0,MCCONF_FOC_CURRENT_KI_Q16,0,0,65535,0,0,0,applyTuning,"FOC q Ki Q16"},
+    {PARAMETER,"KPD",UINT16_T,&m_motor_1.m_kpd_q11,&m_motor_2.m_kpd_q11,0,MCCONF_FOC_ID_KP_Q11,0,0,65535,0,0,0,applyTuning,"FOC d Kp Q11"},
+    {PARAMETER,"KID",UINT16_T,&m_motor_1.m_kid_q16,&m_motor_2.m_kid_q16,0,MCCONF_FOC_ID_KI_Q16,0,0,65535,0,0,0,applyTuning,"FOC d Ki Q16"},
+    {PARAMETER,"KPS",UINT16_T,&m_motor_1.m_kps_q11,&m_motor_2.m_kps_q11,0,MCCONF_SPEED_KP_Q11,0,0,65535,0,0,0,applyTuning,"Speed Kp Q11"},
+    {PARAMETER,"KIS",UINT16_T,&m_motor_1.m_kis_q16,&m_motor_2.m_kis_q16,0,MCCONF_SPEED_KI_Q16,0,0,65535,0,0,0,applyTuning,"Speed Ki Q16"},
+    {PARAMETER,"KDS",UINT16_T,&m_motor_1.m_kds_q11,&m_motor_2.m_kds_q11,0,MCCONF_SPEED_KD_Q11,0,0,65535,0,0,0,applyTuning,"Speed Kd Q11"},
+    {PARAMETER,"KPP",UINT16_T,&m_motor_1.m_kpp_q11,&m_motor_2.m_kpp_q11,0,MCCONF_POSITION_KP_Q11,0,0,65535,0,0,0,applyTuning,"Position Kp Q11"},
+    {PARAMETER,"KIP",UINT16_T,&m_motor_1.m_kip_q16,&m_motor_2.m_kip_q16,0,MCCONF_POSITION_KI_Q16,0,0,65535,0,0,0,applyTuning,"Position Ki Q16"},
+    {PARAMETER,"KDP",UINT16_T,&m_motor_1.m_kdp_q11,&m_motor_2.m_kdp_q11,0,MCCONF_POSITION_KD_Q11,0,0,65535,0,0,0,applyTuning,"Position Kd Q11"},
+    {PARAMETER,"PMIN",INT32_T,&positionMinUser,NULL,0,INT32_MIN,0,INT32_MIN,INT32_MAX,0,0,0,applyPositionLimits,"User position minimum signed int32 count"},
+    {PARAMETER,"PMAX",INT32_T,&positionMaxUser,NULL,0,INT32_MAX,0,INT32_MIN,INT32_MAX,0,0,0,applyPositionLimits,"User position maximum signed int32 count"},
+    {PARAMETER,"PSETL",INT32_T,&positionCommandL,NULL,0,0,0,INT32_MIN,INT32_MAX,0,0,0,NULL,"Left target int32"},
+    {PARAMETER,"PSETR",INT32_T,&positionCommandR,NULL,0,0,0,INT32_MIN,INT32_MAX,0,0,0,NULL,"Right target int32"},
 
     {VARIABLE,"CMDL_RAW",ADD_PARAM(input1[0].raw),NULL,0,0,0,RAW_MIN,RAW_MAX,0,0,0,NULL,"Left raw command"},
     {VARIABLE,"CMDL_IN",ADD_PARAM(input1[0].cmd),NULL,0,0,0,0,0,0,0,0,NULL,"Left requested command"},
@@ -64,6 +93,8 @@ const parameter_entry params[] = {
     {VARIABLE,"CMDR",ADD_PARAM(cmdR),NULL,0,0,0,0,0,0,0,0,NULL,"Right applied command"},
     {VARIABLE,"SPDL",ADD_PARAM(m_motor_1.m_rpm),NULL,0,0,0,0,0,0,0,0,NULL,"Motor1 mechanical RPM (legacy/debug)"},
     {VARIABLE,"SPDR",ADD_PARAM(m_motor_2.m_rpm),NULL,0,0,0,0,0,0,0,0,NULL,"Motor2 internal mechanical RPM (mirrored sign)"},
+    {VARIABLE,"POSL",ADD_PARAM(m_motor_1.m_position_counts),NULL,0,0,0,0,0,0,0,0,NULL,"Left position count"},
+    {VARIABLE,"POSR",ADD_PARAM(m_motor_2.m_position_counts),NULL,0,0,0,0,0,0,0,0,NULL,"Right internal position count"},
     {VARIABLE,"IQ_REF_L",ADD_PARAM(m_motor_1.m_iq_set_q4),NULL,0,0,0,0,0,A2BIT_CONV,100,4,NULL,"Active slewed Iq reference centiampere"},
     {VARIABLE,"IQ_TGT_L",ADD_PARAM(m_motor_1.m_iq_target_q4),NULL,0,0,0,0,0,A2BIT_CONV,100,4,NULL,"Requested Iq target centiampere"},
     {VARIABLE,"IQ_REF_R",ADD_PARAM(m_motor_2.m_iq_set_q4),NULL,0,0,0,0,0,A2BIT_CONV,100,4,NULL,"Right active Iq reference internal sign"},
@@ -106,6 +137,14 @@ int8_t watchParamList[MAX_PARAM_WATCH] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 // Set Param with Value from external format
 int8_t setParamValExt(uint8_t index, int32_t value) {   
   int8_t ret = 0;
+  if (strcmp(params[index].name, "PMIN") == 0 && value > positionMaxUser) {
+    printf("! PMIN must be <= PMAX\r\n");
+    return 0;
+  }
+  if (strcmp(params[index].name, "PMAX") == 0 && value < positionMinUser) {
+    printf("! PMAX must be >= PMIN\r\n");
+    return 0;
+  }
   /* Control mode may change only after the requested commands are zero AND
    * the rate-limited commands have fully ramped to zero. */
   if (strcmp(params[index].name, "CTRL_MOD") == 0 &&
@@ -171,16 +210,13 @@ int32_t getParamValExt(uint8_t index) {
 
 // Get Parameter Internal Value
 int32_t getParamValInt(uint8_t index) {
-  int32_t value = 0;
+  int64_t value = 0;
 
   int8_t countVar = 0;
   if (params[index].valueL != NULL) countVar++;
   if (params[index].valueR != NULL) countVar++;
 
   if (countVar > 0){
-    // Read Left and Right values and calculate average 
-    // If left and right have to be summed up, DIV field could be adapted to multiply by 2
-    // Cast to parameter datatype
     switch (params[index].datatype){
       case UINT8_T:
         if (params[index].valueL != NULL) value += *(volatile uint8_t*)params[index].valueL;
@@ -209,15 +245,14 @@ int32_t getParamValInt(uint8_t index) {
       default:
         value = 0;
     }
-
-    // Divide by number of values provided for the parameter
     value /= countVar;
   }else{
-    // No variable was provided, return init value that might contain a macro
     value = params[index].init;
   }
 
-  return value;
+  if (value > INT32_MAX) return INT32_MAX;
+  if (value < INT32_MIN) return INT32_MIN;
+  return (int32_t)value;
 }
 
 // Add or remove parameter from watch list
@@ -493,19 +528,9 @@ void handle_input(uint8_t *userCommand, uint32_t len)
     return;
   }
   
-  int32_t value = 0;
-  int8_t  sign  = 1;
-  int8_t  count = 0;
-
-  // Read sign
-  if (*userCommand == '-'){len-=1;userCommand+=1;sign =-1;} 
-  // Read value
-  for (value=0; (unsigned)*userCommand-'0'<10; userCommand++){
-    value = 10*value+(*userCommand-'0');
-    count++;
-    // Error - Value out of range
-    if (value > INT16_MAX) { command.error = 4; return; }
-  }
+  int64_t parsed=0; int8_t sign=1; int8_t count=0;
+  if(*userCommand=='-'){len--;userCommand++;sign=-1;}
+  for(;(unsigned)*userCommand-'0'<10;userCommand++){parsed=10*parsed+(*userCommand-'0');count++;if(parsed>((sign<0)?2147483648LL:2147483647LL)){command.error=4;return;}}
 
   if (count == 0){
     // Error - Value required
@@ -513,8 +538,7 @@ void handle_input(uint8_t *userCommand, uint32_t len)
     return;
   }
       
-  // Apply sign
-  value*= sign;
+  const int32_t value=(int32_t)(parsed*sign);
 
   // Command with parameter and value
   if (commands[cindex].callback_function2 != NULL){

@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-from pathlib import Path
-import subprocess, tempfile, shutil, sys
-ROOT=Path(__file__).resolve().parents[1]
-compilers=[c for c in ('gcc','clang') if shutil.which(c)]
-if not compilers:
-    raise SystemExit('No host C compiler')
-HAL=r'''#pragma once
+#pragma once
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -118,27 +111,4 @@ static inline int HAL_UART_Receive_DMA(UART_HandleTypeDef *h,uint8_t*d,uint16_t 
 static inline int HAL_FLASH_Unlock(void){return HAL_OK;}
 static inline int HAL_FLASH_Lock(void){return HAL_OK;}
 static inline int HAL_FLASH_Program(uint32_t type,uint32_t addr,uint64_t data){(void)type;(void)addr;(void)data;return HAL_OK;}
-static inline void HAL_Delay(uint32_t ms){(void)ms;}
-'''
-# Only changed/ported files; untouched board setup is inherited from the previously compiling V5.1 skeleton.
-sources=[
-# Compile the actual implementation files under Src/motor and Src/vesc directly.
-# No port_*.c wrapper translation units are used.
-'Src/motor/foc_math.c','Src/motor/mc_interface.c','Src/motor/mcpwm_foc.c',
-'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c','Src/vesc/vesc_protocol.c',
-'Src/comms.c','Src/util.c','Src/main.c'
-]
-with tempfile.TemporaryDirectory(prefix='vesc-final-host-') as td:
-    td=Path(td); (td/'stm32f1xx_hal.h').write_text(HAL)
-    for cc in compilers:
-        base=[cc,'-std=c11','-O0','-Wall','-Wextra','-Werror',f'-I{ROOT}',f'-I{ROOT/"Src"}',f'-I{ROOT/"Src/vesc"}',f'-I{td}']
-        for src in sources:
-            out=td/(Path(src).stem+'_'+cc+'.o')
-            cmd=base+['-c',str(ROOT/src),'-o',str(out)]
-            r=subprocess.run(cmd,text=True,capture_output=True)
-            if r.returncode:
-                print('FAIL',cc,src)
-                print(r.stdout+r.stderr)
-                sys.exit(r.returncode)
-            print('PASS',cc,'-Werror',src)
-print('HOST_COMPILE_CHANGED_SOURCES_PASS')
+void HAL_Delay(uint32_t ms);

@@ -9,13 +9,26 @@
 #include "vesc/mcconf_serial.h"
 #include "vesc/vesc_protocol.h"
 
-#define VESC_FW_MAJOR               7u
-#define VESC_FW_MINOR               1u
+#define VESC_FW_MAJOR               6u
+#define VESC_FW_MINOR               0u
 #define VESC_LOCAL_ID               1u
 #define VESC_SECOND_MOTOR_ID        2u
 #define VESC_LINK_HOLD_MS        2000u
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
+#define VESC_RX_QUEUE_DEPTH          4u
+#define VESC_RT_PERIOD_MS           20u
+
+/* Project-specific extensions are transported inside standard
+ * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
+#define HB_CUSTOM_MAGIC0              0x48u /* 'H' */
+#define HB_CUSTOM_MAGIC1              0x42u /* 'B' */
+#define HB_CUSTOM_VERSION                1u
+#define HB_CUSTOM_GET_DIAG               1u
+#define HB_CUSTOM_GET_POS_STATE          2u
+#define HB_CUSTOM_SET_POS_LIMITS         3u
+#define HB_CUSTOM_SET_POS_TARGET         4u
+#define HB_CUSTOM_RESET_POSITION         5u
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -26,17 +39,32 @@ static volatile uint16_t s_rx_expected = 0u;
 static volatile uint16_t s_payload_start = 0u;
 static volatile uint16_t s_payload_len = 0u;
 static uint8_t s_rx_frame[VESC_MAX_FRAME];
-static uint8_t s_pending_payload[VESC_MAX_PAYLOAD];
+static uint8_t s_pending_payload[VESC_RX_QUEUE_DEPTH][VESC_MAX_PAYLOAD];
 static uint8_t s_process_payload[VESC_MAX_PAYLOAD];
 static uint8_t s_config_payload[VESC_MAX_PAYLOAD];
-static volatile uint16_t s_pending_len = 0u;
-static volatile uint8_t s_pending = 0u;
+static volatile uint16_t s_pending_len[VESC_RX_QUEUE_DEPTH];
+static volatile uint8_t s_pending_head = 0u;
+static volatile uint8_t s_pending_tail = 0u;
+static volatile uint8_t s_pending_count = 0u;
+static volatile uint32_t s_rx_queue_drop = 0u;
 static volatile uint32_t s_link_last_ms = 0u;
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
+static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
 
 static app_configuration s_app_local;
 static app_configuration s_app_right;
+
+typedef struct {
+    uint8_t active;
+    uint8_t second;
+    uint8_t selective;
+    uint8_t setup;
+    uint32_t mask;
+    uint32_t last_tx_ms;
+} vesc_rt_stream_t;
+
+static vesc_rt_stream_t s_rt_stream = {0u, 0u, 0u, 0u, 0xffffffffu, 0u};
 
 static void rx_reset(void) {
     s_rx_active = 0u;
@@ -61,11 +89,19 @@ static void app_defaults(app_configuration *a, uint8_t id) {
 
 void vesc_protocol_init(void) {
     rx_reset();
-    s_pending = 0u;
-    s_pending_len = 0u;
+    s_pending_head = s_pending_tail = s_pending_count = 0u;
+    memset((void *)s_pending_len, 0, sizeof(s_pending_len));
+    s_rx_queue_drop = 0u;
+    s_rt_stream.active = 0u;
+    s_rt_stream.second = 0u;
+    s_rt_stream.selective = 0u;
+    s_rt_stream.setup = 0u;
+    s_rt_stream.mask = 0xffffffffu;
+    s_rt_stream.last_tx_ms = 0u;
     s_link_last_ms = 0u;
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
+    s_last_hall_store_ok[0] = s_last_hall_store_ok[1] = 0u;
     app_defaults(&s_app_local, VESC_LOCAL_ID);
     app_defaults(&s_app_right, VESC_SECOND_MOTOR_ID);
 }
@@ -83,10 +119,18 @@ static void complete_frame(void) {
         valid = (s_rx_frame[p + n + 2u] == 3u) && (rx_crc == calc);
     }
     if (valid) {
-        if (!s_pending) {
-            memcpy(s_pending_payload, &s_rx_frame[p], n);
-            s_pending_len = n;
-            s_pending = 1u;
+        /* UART DMA/ISR can deliver several VESC Tool requests before the 5-ms
+         * main loop processes them. V15 had one pending slot and silently
+         * discarded every additional valid packet; that is especially harmful
+         * to realtime polling. Keep a small bounded FIFO instead. */
+        if (s_pending_count < VESC_RX_QUEUE_DEPTH) {
+            const uint8_t slot = s_pending_head;
+            memcpy(s_pending_payload[slot], &s_rx_frame[p], n);
+            s_pending_len[slot] = n;
+            s_pending_head = (uint8_t)((slot + 1u) % VESC_RX_QUEUE_DEPTH);
+            s_pending_count++;
+        } else {
+            s_rx_queue_drop++;
         }
         s_link_last_ms = HAL_GetTick();
         s_rx_ok++;
@@ -181,8 +225,8 @@ static void read_uuid(uint8_t out[12], bool second) {
 static void reply_fw_version(bool second) {
     uint8_t b[80];
     int32_t i = 0;
-    const char *hw = second ? "HOVERBOARD_F103_RIGHT" : "HOVERBOARD_F103_DUAL";
-    const char *fw = "F103_FIXED_FOC_VESC";
+    const char *hw = second ? "motor_right" : "motor_left";
+    const char *fw = second ? "motor_right" : "motor_left";
     uint8_t uid[12];
     read_uuid(uid, second);
     b[i++] = COMM_FW_VERSION;
@@ -199,7 +243,8 @@ static void reply_fw_version(bool second) {
     b[i++] = 0u;                 /* QML app */
     b[i++] = 0u;                 /* NRF flags */
     strcpy((char *)&b[i], fw); i += (int32_t)strlen(fw) + 1;
-    buffer_append_uint32(b, 0u, &i); /* hardware CRC not used on this bare-metal port */
+    /* VESC firmware 6.00 ends COMM_FW_VERSION after FW_NAME. Do not append
+     * post-6.00 fields; older VESC Tool parsers otherwise see trailing bytes. */
     uart_send_payload(b, (uint16_t)i);
 }
 
@@ -215,10 +260,20 @@ static void get_values_normalized(bool second, mc_values *v) {
         /* Right power stage is physically mirrored. Expose the same positive-wheel
          * convention to VESC Tool as the local left motor. */
         v->rpm = -v->rpm;
-        v->current_motor = -v->current_motor;
+        /* current_motor is VESC's signed current-vector magnitude and already
+         * follows electrical power direction; unlike Iq it does not need the
+         * right-motor phase-orientation sign normalization. */
         v->iq = -v->iq;
         v->duty_now = -v->duty_now;
         v->vq = -v->vq;
+        v->tachometer = -v->tachometer;
+        /* Stock VESC position is normalized to 0..360 deg. The right power
+         * stage is mirrored, so expose 360-internal_angle rather than a
+         * negative angle to VESC Tool. */
+        if (v->position > 0.0f) {
+            v->position = 360.0f - v->position;
+            if (v->position >= 360.0f) v->position = 0.0f;
+        }
     }
 }
 
@@ -251,35 +306,44 @@ static void append_values_fields(uint8_t *b, int32_t *i, const mc_values *v, uin
     if (mask & (1u << 21)) b[(*i)++] = 0u; /* timeout/kill status */
 }
 
-static void reply_values(bool second, bool selective, const uint8_t *data, uint16_t len) {
+static void send_values_packet(bool second, bool selective, uint32_t mask) {
     uint8_t b[128];
     int32_t i = 0;
-    uint32_t mask = 0xffffffffu;
     b[i++] = selective ? COMM_GET_VALUES_SELECTIVE : COMM_GET_VALUES;
-    if (selective) {
-        if (len < 4u) return;
-        int32_t r = 0;
-        mask = buffer_get_uint32(data, &r);
-        buffer_append_uint32(b, mask, &i);
-    }
+    if (selective) buffer_append_uint32(b, mask, &i);
     mc_values v;
     get_values_normalized(second, &v);
     append_values_fields(b, &i, &v, mask);
     uart_send_payload(b, (uint16_t)i);
 }
 
-static void reply_values_setup(bool second, bool selective, const uint8_t *data, uint16_t len) {
-    uint8_t b[128];
-    int32_t i = 0;
+static void reply_values(bool second, bool selective, const uint8_t *data, uint16_t len) {
     uint32_t mask = 0xffffffffu;
-    const COMM_PACKET_ID id = selective ? COMM_GET_VALUES_SETUP_SELECTIVE : COMM_GET_VALUES_SETUP;
-    b[i++] = (uint8_t)id;
     if (selective) {
         if (len < 4u) return;
         int32_t r = 0;
         mask = buffer_get_uint32(data, &r);
-        buffer_append_uint32(b, mask, &i);
     }
+    send_values_packet(second, selective, mask);
+
+    /* A valid realtime request arms a standard VESC packet stream. Polling
+     * VESC Tool still receives its immediate request/reply response; if the
+     * host pauses between requests, periodic() continues the same packet type
+     * at 20 ms (50 Hz), never mixing legacy telemetry into the VESC stream. */
+    s_rt_stream.active = 1u;
+    s_rt_stream.second = second ? 1u : 0u;
+    s_rt_stream.selective = selective ? 1u : 0u;
+    s_rt_stream.setup = 0u;
+    s_rt_stream.mask = mask;
+    s_rt_stream.last_tx_ms = HAL_GetTick();
+}
+
+static void send_values_setup_packet(bool second, bool selective, uint32_t mask) {
+    uint8_t b[128];
+    int32_t i = 0;
+    const COMM_PACKET_ID id = selective ? COMM_GET_VALUES_SETUP_SELECTIVE : COMM_GET_VALUES_SETUP;
+    b[i++] = (uint8_t)id;
+    if (selective) buffer_append_uint32(b, mask, &i);
 
     mc_values v;
     get_values_normalized(second, &v);
@@ -308,6 +372,22 @@ static void reply_values_setup(bool second, bool selective, const uint8_t *data,
     uart_send_payload(b, (uint16_t)i);
 }
 
+static void reply_values_setup(bool second, bool selective, const uint8_t *data, uint16_t len) {
+    uint32_t mask = 0xffffffffu;
+    if (selective) {
+        if (len < 4u) return;
+        int32_t r = 0;
+        mask = buffer_get_uint32(data, &r);
+    }
+    send_values_setup_packet(second, selective, mask);
+    s_rt_stream.active = 1u;
+    s_rt_stream.second = second ? 1u : 0u;
+    s_rt_stream.selective = selective ? 1u : 0u;
+    s_rt_stream.setup = 1u;
+    s_rt_stream.mask = mask;
+    s_rt_stream.last_tx_ms = HAL_GetTick();
+}
+
 static float right_sign(bool second, float value) { return second ? -value : value; }
 
 static void touch_motor(bool second) { mcpwm_foc_vesc_override_touch(second); }
@@ -316,13 +396,19 @@ static void reply_mcconf(bool second, COMM_PACKET_ID id) {
     static mc_configuration c;
     int32_t i = 0;
     s_config_payload[i++] = (uint8_t)id;
-    c = *mc_interface_get_configuration_motor(second);
+    if (id == COMM_GET_MCCONF_DEFAULT) {
+        mcpwm_foc_get_default_configuration(&c, second);
+    } else {
+        mcpwm_foc_sync_tuning_to_conf(second);
+        c = *mc_interface_get_configuration_motor(second);
+    }
     const int32_t n = confgenerator_serialize_mcconf(&s_config_payload[i], &c);
     if (n > 0 && (uint32_t)(i + n) <= sizeof(s_config_payload)) uart_send_payload(s_config_payload, (uint16_t)(i + n));
 }
 
 static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
     static mc_configuration c;
+    bool applied = false;
     c = *mc_interface_get_configuration_motor(second);
     const int32_t expected = confgenerator_serialize_mcconf(s_config_payload, &c);
     if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_mcconf(data, &c)) {
@@ -332,22 +418,28 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
         if (c.l_current_min > -0.1f) c.l_current_min = -0.1f;
         if (c.l_current_min < -(float)I_MOT_MAX) c.l_current_min = -(float)I_MOT_MAX;
         /* Physical current sample/PI topology is fixed for this board. */
-        c.motor_type = MOTOR_TYPE_FOC;
         c.foc_sensor_mode = FOC_SENSOR_MODE_HALL;
         c.si_motor_poles = 30u;
         mc_interface_select_motor_thread(second ? 2 : 1);
         mc_interface_set_configuration(&c);
+        applied = mc_interface_store_configuration_motor(second);
     }
-    /* Stock VESC replies to COMM_SET_MCCONF with the resulting serialized
-     * motor configuration, not a one-byte ACK. Mirror that behavior so
-     * VESC Tool can immediately refresh the editor after Apply/Write. */
-    reply_mcconf(second, COMM_SET_MCCONF);
+    /* Stock VESC 6.00 acknowledges SET_MCCONF with the command byte only. */
+    (void)applied; /* ACK means the packet was handled; persistence is best-effort flash IO. */
+    { uint8_t ack = COMM_SET_MCCONF; uart_send_payload(&ack, 1u); }
 }
 
 static void reply_appconf(bool second, COMM_PACKET_ID id) {
     int32_t i = 0;
+    app_configuration defaults;
+    const app_configuration *a;
     s_config_payload[i++] = (uint8_t)id;
-    const app_configuration *a = second ? &s_app_right : &s_app_local;
+    if (id == COMM_GET_APPCONF_DEFAULT) {
+        app_defaults(&defaults, second ? VESC_SECOND_MOTOR_ID : VESC_LOCAL_ID);
+        a = &defaults;
+    } else {
+        a = second ? &s_app_right : &s_app_local;
+    }
     const int32_t n = confgenerator_serialize_appconf(&s_config_payload[i], a);
     if (n > 0 && (uint32_t)(i + n) <= sizeof(s_config_payload)) uart_send_payload(s_config_payload, (uint16_t)(i + n));
 }
@@ -367,6 +459,127 @@ static void set_appconf(bool second, const uint8_t *data, uint16_t len) {
     }
     uint8_t ack = COMM_SET_APPCONF;
     uart_send_payload(&ack, 1u);
+}
+
+static void detect_hall_foc(bool second, const uint8_t *data, uint16_t len) {
+    uint8_t reply[10];
+    int32_t i = 0;
+    float current = 1.0f;
+    reply[0] = COMM_DETECT_HALL_FOC;
+    for (uint8_t h = 0u; h < 8u; ++h) reply[1u + h] = 255u;
+    reply[9] = 1u;
+    if (len >= 4u) current = (float)buffer_get_int32(data, &i) / 1000.0f;
+    if (mcpwm_foc_detect_hall(current, second, &reply[1])) {
+        /* VESC result byte reports DETECTION success. Persistence is an
+         * additional project feature and is exposed separately in diagnostics;
+         * a flash-write problem must not be misreported as "bad hall". */
+        s_last_hall_store_ok[second ? 1u : 0u] =
+            mc_interface_store_configuration_motor(second) ? 1u : 0u;
+        reply[9] = 0u;
+    } else {
+        s_last_hall_store_ok[second ? 1u : 0u] = 0u;
+    }
+    uart_send_payload(reply, sizeof(reply));
+}
+
+static int32_t q4_to_milliamps_normalized(int16_t q4, bool second) {
+    int32_t ma = ((int32_t)q4 * 1000) / ((int32_t)A2BIT_CONV * 16);
+    return second ? -ma : ma;
+}
+
+static void reply_custom_pos_state(bool second, uint8_t op, uint8_t status) {
+    uint8_t b[32];
+    int32_t i = 0;
+    b[i++] = COMM_CUSTOM_APP_DATA;
+    b[i++] = HB_CUSTOM_MAGIC0;
+    b[i++] = HB_CUSTOM_MAGIC1;
+    b[i++] = HB_CUSTOM_VERSION;
+    b[i++] = op;
+    b[i++] = status;
+    buffer_append_int32(b, mcpwm_foc_get_position_user_counts(second), &i);
+    buffer_append_int32(b, mcpwm_foc_get_position_target_user_counts(second), &i);
+    buffer_append_int32(b, mcpwm_foc_get_position_min_user_counts(second), &i);
+    buffer_append_int32(b, mcpwm_foc_get_position_max_user_counts(second), &i);
+    uart_send_payload(b, (uint16_t)i);
+}
+
+static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
+    if (!data || len < 4u || data[0] != HB_CUSTOM_MAGIC0 ||
+        data[1] != HB_CUSTOM_MAGIC1 || data[2] != HB_CUSTOM_VERSION) {
+        return;
+    }
+    const uint8_t op = data[3];
+    const uint8_t *d = data + 4;
+    const uint16_t n = (uint16_t)(len - 4u);
+    int32_t k = 0;
+
+    if (op == HB_CUSTOM_GET_POS_STATE) {
+        reply_custom_pos_state(second, op, 0u);
+        return;
+    }
+    if (op == HB_CUSTOM_SET_POS_LIMITS) {
+        if (n < 8u) { reply_custom_pos_state(second, op, 1u); return; }
+        const int32_t minc = buffer_get_int32(d, &k);
+        const int32_t maxc = buffer_get_int32(d, &k);
+        if (minc > maxc) { reply_custom_pos_state(second, op, 2u); return; }
+        mcpwm_foc_set_position_user_limits(minc, maxc, second);
+        reply_custom_pos_state(second, op, 0u);
+        return;
+    }
+    if (op == HB_CUSTOM_SET_POS_TARGET) {
+        if (n < 4u) { reply_custom_pos_state(second, op, 1u); return; }
+        const int32_t target = buffer_get_int32(d, &k);
+        mcpwm_foc_set_position_user_counts(target, second);
+        touch_motor(second);
+        reply_custom_pos_state(second, op, 0u);
+        return;
+    }
+    if (op == HB_CUSTOM_RESET_POSITION) {
+        mcpwm_foc_reset_position(second);
+        reply_custom_pos_state(second, op, 0u);
+        return;
+    }
+    if (op == HB_CUSTOM_GET_DIAG) {
+        uint8_t b[96];
+        int32_t i = 0;
+        const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
+        float erpm_f = mcpwm_foc_get_erpm_motor(second);
+        if (second) erpm_f = -erpm_f;
+        int32_t erpm = (int32_t)(erpm_f >= 0.0f ? erpm_f + 0.5f : erpm_f - 0.5f);
+        int32_t duty = (int32_t)m->m_duty_now_permille * 100;
+        if (second) duty = -duty;
+
+        b[i++] = COMM_CUSTOM_APP_DATA;
+        b[i++] = HB_CUSTOM_MAGIC0;
+        b[i++] = HB_CUSTOM_MAGIC1;
+        b[i++] = HB_CUSTOM_VERSION;
+        b[i++] = op;
+        b[i++] = 0u;
+        b[i++] = second ? VESC_SECOND_MOTOR_ID : VESC_LOCAL_ID;
+        b[i++] = (uint8_t)m->m_control_mode;
+        b[i++] = (uint8_t)m->m_state;
+        b[i++] = (uint8_t)m->m_fault;
+        b[i++] = m->m_hall_state;
+        b[i++] = mcpwm_foc_vesc_override_active(second) ? 1u : 0u;
+        b[i++] = s_last_hall_store_ok[second ? 1u : 0u];
+        b[i++] = 0u;
+        buffer_append_int32(b, q4_to_milliamps_normalized(m->m_iq_target_q4, second), &i);
+        buffer_append_int32(b, q4_to_milliamps_normalized(m->m_iq_set_q4, second), &i);
+        buffer_append_int32(b, q4_to_milliamps_normalized(m->m_iq_q4, second), &i);
+        buffer_append_int32(b, q4_to_milliamps_normalized(m->m_id_q4, false), &i);
+        buffer_append_int32(b, erpm, &i);
+        buffer_append_int32(b, duty, &i);
+        buffer_append_int32(b, mcpwm_foc_get_position_user_counts(second), &i);
+        buffer_append_int32(b, mcpwm_foc_get_position_target_user_counts(second), &i);
+        buffer_append_int32(b, mcpwm_foc_get_position_min_user_counts(second), &i);
+        buffer_append_int32(b, mcpwm_foc_get_position_max_user_counts(second), &i);
+        buffer_append_uint32(b, m->m_hall_invalid_transition_count, &i);
+        buffer_append_uint32(b, m->m_current_trip_count, &i);
+        buffer_append_uint32(b, s_rx_ok, &i);
+        buffer_append_uint32(b, s_rx_crc_err, &i);
+        for (uint8_t h = 0u; h < 8u; ++h) b[i++] = (uint8_t)m->m_conf.foc_hall_table[h];
+        uart_send_payload(b, (uint16_t)i);
+    }
 }
 
 static void process_command(const uint8_t *p, uint16_t len, bool second) {
@@ -418,6 +631,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
             mc_interface_set_pid_speed(right_sign(second, rpm)); touch_motor(second);
         }
         break;
+    case COMM_SET_POS:
+        if(n>=4u){const float pos=(float)buffer_get_int32(d,&k)/1000000.0f;mc_interface_set_pid_pos(right_sign(second,pos));touch_motor(second);}
+        break;
     case COMM_ALIVE:
         touch_motor(second);
         break;
@@ -434,6 +650,12 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_SET_APPCONF:
         set_appconf(second, d, n);
+        break;
+    case COMM_DETECT_HALL_FOC:
+        detect_hall_foc(second, d, n);
+        break;
+    case COMM_CUSTOM_APP_DATA:
+        process_custom_app(second, d, n);
         break;
     default:
         /* Unsupported commands are intentionally ignored, as stock VESC commands.c does
@@ -463,15 +685,36 @@ static void process_top_packet(const uint8_t *p, uint16_t len) {
 }
 
 void vesc_protocol_process_pending(void) {
-    if (!s_pending) return;
-    uint16_t n;
-    __disable_irq();
-    n = s_pending_len;
-    if (n > VESC_MAX_PAYLOAD) n = VESC_MAX_PAYLOAD;
-    memcpy(s_process_payload, s_pending_payload, n);
-    s_pending = 0u;
-    s_pending_len = 0u;
-    __enable_irq();
-    s_link_last_ms = HAL_GetTick();
-    process_top_packet(s_process_payload, n);
+    for (;;) {
+        uint16_t n = 0u;
+        uint8_t slot = 0u;
+        __disable_irq();
+        if (s_pending_count == 0u) {
+            __enable_irq();
+            break;
+        }
+        slot = s_pending_tail;
+        n = s_pending_len[slot];
+        if (n > VESC_MAX_PAYLOAD) n = VESC_MAX_PAYLOAD;
+        memcpy(s_process_payload, s_pending_payload[slot], n);
+        s_pending_len[slot] = 0u;
+        s_pending_tail = (uint8_t)((slot + 1u) % VESC_RX_QUEUE_DEPTH);
+        s_pending_count--;
+        __enable_irq();
+        s_link_last_ms = HAL_GetTick();
+        process_top_packet(s_process_payload, n);
+    }
+}
+
+void vesc_protocol_periodic(void) {
+    if (!s_rt_stream.active) return;
+    if (!vesc_protocol_link_active()) { s_rt_stream.active = 0u; return; }
+    const uint32_t now = HAL_GetTick();
+    if ((uint32_t)(now - s_rt_stream.last_tx_ms) < VESC_RT_PERIOD_MS) return;
+    if (s_rt_stream.setup) {
+        send_values_setup_packet(s_rt_stream.second != 0u, s_rt_stream.selective != 0u, s_rt_stream.mask);
+    } else {
+        send_values_packet(s_rt_stream.second != 0u, s_rt_stream.selective != 0u, s_rt_stream.mask);
+    }
+    s_rt_stream.last_tx_ms = now;
 }

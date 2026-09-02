@@ -1,78 +1,275 @@
-# Hoverboard STM32F103RCT6 — VESC Dual FOC V10 Final
+# Hoverboard STM32F103RCT6 — VESC 6.00 Dual FOC V16
 
-Target hardware: STM32F103RCT6 hoverboard/EFeru dual motor, bare-metal STM32Cube, PWM/ADC 16 kHz, USART3 PB10/PB11 115200.
+Firmware dual-motor FOC bare-metal untuk board hoverboard STM32F103RCT6.
+Jalur ADC dual-DMA, PWM TIM8/TIM1, dan ISR FOC 16 kHz tetap memakai basis EFeru
+yang sudah digunakan pada hardware ini. USART3 PB10/PB11 = 115200 baud.
 
-## Struktur
-- `Src/motor/mcpwm_foc.c` — ISR-facing dual-motor state dan seluruh algoritma mode motor.
-- `Src/motor/foc_math.c` — fixed-point Clarke/Park, PI, vector limit, centered SVPWM.
-- `Src/motor/mc_interface.c` — interface VESC ke motor local/right.
-- `Src/vesc/*` — `datatypes.h`, framing, CRC, config serializer, VESC protocol/virtual CAN.
-- LEFT = local VESC; RIGHT = virtual CAN ID 2.
+## Mapping motor
 
-Tidak ada `port_*`, `BLDC_controller*`, `bldc.c`, `rtwtypes.h`, atau `current_scale.h`.
+- LEFT = local VESC, ID 1
+- RIGHT = virtual VESC/CAN ID 2
+- `COMM_FORWARD_CAN,2,<packet>` mengeksekusi packet pada motor kanan secara lokal.
+- Tidak membutuhkan CAN fisik untuk motor kanan.
 
-## Satuan dan algoritma mode legacy
+Arah motor kanan dinormalisasi pada boundary protocol sehingga nilai user positif
+memiliki arah kendaraan yang sama dengan motor kiri.
 
-| Mode | Command terminal | Algoritma |
-|---|---|---|
-| 1 VLT | permille (`100=10%`, `1000=100%`) | Hall electrical angle + direct `Vq`, `Vd=0`, centered SVPWM |
-| 2 SPD | mechanical RPM (`50=50 rpm`) | Hall estimator + speed PI -> `Vq`, `Id=0`; PI update 16 kHz/3 = 5.333 kHz |
-| 3 TRQ | centiampere (`50=0.50 A`, `1500=15 A`) | Hall FOC + `Iq` current PI, `Id=0`, current slew + voltage-circle anti-windup |
-| 4 sensorless | ampere Id (`2=2 A`) | synthetic electrical phase, `Id` PI, `Iq=0`, current feedback tetap ADC; Hall hanya telemetry |
+## Perbaikan runtime V16
 
-### Current scale
-`A2BIT_CONV=50 count/A`, current FOC Q4 sehingga `1 A = 50*16 = 800 Q4`.
+### 1. SET_CURRENT 3 A
 
-### Mode 4 safety
-Default 10 mechanical rpm, acceleration 20 rpm/s, alignment 600 ms, Id slew 4 A/s, Id command clamp 6 A, phase/DC fast trip 8 A.
+Jalur standar VESC tetap:
 
-## Satuan VESC Tool / Python standar
-- `COMM_SET_DUTY`: ratio -1..1.
-- `COMM_SET_CURRENT`: ampere.
-- `COMM_SET_RPM`: ERPM. Dengan 15 pole-pair, 750 ERPM = 50 mechanical RPM.
-- `mc_values.rpm`: ERPM.
-- Motor kanan dinormalisasi di protocol boundary sehingga command positif berarti arah kendaraan yang sama dengan motor kiri.
+```text
+COMM_SET_CURRENT
+int32 / 1000
+3.000 A -> 3000 -> Iq_target 3.000 A
+```
 
-## Compile
+Command VESC memiliki ownership per motor selama 500 ms sehingga command legacy
+tidak menimpa setpoint pada ISR berikutnya. Bridge kiri/kanan juga sekarang
+digating berdasarkan ownership masing-masing motor, bukan flag global.
+
+Masalah utama V14 bukan scaling 3 A, tetapi Hall detector fisik: fixed electrical
+phase detector ditimpa kembali oleh updater rotating-openloop di ISR. Akibatnya
+tabel Hall hasil deteksi hardware dapat salah, sehingga Iq 3 A tidak menghasilkan
+orientasi torsi yang benar. V16 mempertahankan pemisahan `CONTROL_MODE_OPENLOOP_PHASE`: pada
+mode ini ISR hanya meramp Id dan tidak pernah mengubah phase yang diperintahkan
+detector.
+
+### 2. SET_RPM 50 ERPM
+
+`COMM_SET_RPM` tetap menggunakan ERPM VESC.
+
+Dengan 15 pole-pair:
+
+```text
+50 ERPM = 3.333333 mechanical RPM
+```
+
+V14 mengubahnya menjadi integer 3 mechanical RPM sehingga control target efektif
+sekitar 45 ERPM. V16 menyimpan target mechanical RPM dalam Q16 fractional dan
+speed PI menghitung error terhadap estimasi Hall Q16 fractional.
+
+Hall timeout juga dinaikkan dari 2000 tick (125 ms) menjadi 8000 tick (500 ms).
+Pada 50 ERPM satu Hall transition sekitar 200 ms, sehingga V14 memang dapat
+menganggap speed nol sebelum transition berikutnya. Telemetry ERPM sekarang
+dihitung langsung dari Hall period sehingga 50 ERPM tidak dikuantisasi menjadi 45.
+
+### 3. Position
+
+Standard VESC tetap single-turn:
+
+```text
+COMM_SET_POS
+0 .. 360 degree rotor electrical
+```
+
+Python menyediakan API terpisah melalui `COMM_CUSTOM_APP_DATA` untuk posisi
+multi-turn Hall-count signed int32:
+
+```text
+min     = signed int32 bebas
+max     = signed int32 bebas
+target  = signed int32 bebas
+```
+
+Contoh:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-limits --motor left --min -1000000 --max 2000000
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-count --motor left --count -250 --seconds 2 --arm
+```
+
+Position min/max custom adalah konfigurasi runtime; V16 belum mengklaim persistence
+min/max position ke EEPROM. Hall table, current limit, PID yang diimplementasikan,
+speed ramp, dan speed release tetap dipersist per motor seperti V14.
+
+### 4. Realtime data VESC Tool 50 Hz
+
+Tidak ada lagi `LIVEON`, `LIVEOFF`, atau parameter `LIVE`.
+
+- Saat tidak ada link VESC binary, legacy 72-byte telemetry dikirim otomatis 50 Hz.
+- Saat VESC Tool aktif, legacy bytes dihentikan agar tidak mencemari parser VESC.
+- RX VESC sekarang memakai FIFO 4 paket; burst request tidak lagi hilang karena satu slot pending.
+- `COMM_GET_VALUES`, `COMM_GET_VALUES_SELECTIVE`, `COMM_GET_VALUES_SETUP`, dan
+  `COMM_GET_VALUES_SETUP_SELECTIVE` tetap selalu mendapat reply langsung.
+- Request realtime terakhir juga mengaktifkan pengiriman paket dengan ID/mask yang sama
+  setiap 20 ms (50 Hz) selama link VESC aktif. Jadi hanya frame VESC ber-CRC yang keluar,
+  tidak ada byte legacy yang disisipkan ke stream VESC Tool.
+
+Contoh verifikasi host:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 rt --motor both --hz 50 --seconds 10
+```
+
+Regression host memeriksa `COMM_GET_VALUES` dan `COMM_GET_VALUES_SETUP`: reply langsung
+serta paket periodik baru muncul saat interval 20 ms tercapai.
+
+### 5. Hall estimator / getar di sekitar 450 ERPM
+
+Tabel hasil Hall detect adalah **sector center** (0..199 = 0..360° electrical). V15
+memulai interpolasi dari center Hall baru lalu menambahkan hingga satu sektor lagi. Pada
+15 pole-pair, threshold 30 RPM mekanik tepat sama dengan 450 ERPM, sehingga bug ini dapat
+muncul sebagai getar/commutation kasar ketika interpolation mulai aktif.
+
+V16 menggunakan midpoint antara sector center lama dan baru sebagai posisi tepat saat
+Hall edge, lalu menginterpolasi edge-to-edge. Sudut Hall yang dikoreksi juga diberi
+rate-limit untuk mencegah lonjakan current akibat perubahan phase mendadak. Pada low
+speed, estimator memakai calibrated sector center secara langsung.
+
+Saat motor OFF/bridge undriven, Id/Iq/Iin dan current LPF juga di-zero-kan. Sample ADC
+phase ketika bridge OFF tidak lagi ditampilkan sebagai current puluhan ampere palsu pada
+Realtime Data/debug.
+
+### 6. Hall detect
+
+`COMM_DETECT_HALL_FOC` menggunakan power/current-control path mode 4 dengan
+submode fixed electrical phase:
+
+```text
+Id detect current
+-> align
+-> forward sweep
+-> reverse sweep
+-> sample raw Hall 1..6
+-> circular mean angle
+-> check 6 states + sector spacing
+-> apply foc_hall_table
+-> EEPROM per motor
+-> VESC reply: command + 8 Hall values + result
+```
+
+Proteksi phase/DC 8 A untuk mode 4 sekarang juga aktif pada fixed-phase Hall
+detector walaupun `ctrlModReq` legacy bukan mode 4.
+
+Current detect:
+
+```text
+minimum          0.5 A
+maximum          40% l_current_max
+absolute maximum 4.0 A
+recommended start 1.0 A
+```
+
+Detector belajar mapping raw Hall terhadap electrical phase yang benar. Urutan
+Hall/phase yang berbeda dapat dikalibrasi selama rangkaian 3-phase dan current
+sense hardware tetap valid. State Hall 000/111 tetap invalid. Deteksi gagal/noisy
+tidak mengganti tabel lama.
+
+## VESC 6.00 protocol identity
+
+Firmware mengiklankan:
+
+```text
+FW 6.00
+motor_left  (local, ID 1)
+motor_right (virtual CAN ID 2)
+```
+
+`COMM_FW_VERSION` V16 berhenti setelah field FW_NAME sesuai layout VESC 6.00;
+field tambahan CRC yang sebelumnya ada di V14 sudah dihapus.
+
+Motor/app config signature:
+
+```text
+MCCONF_SIGNATURE = 776184161
+APPCONF_SIGNATURE = 486554156
+```
+
+`Src/vesc/datatypes.h` dipertahankan byte-identical dengan referensi:
+
+```text
+SHA256 4ecae1f31c12c1ab415d47dd997396d0792e94249203cbeb877ada75f76d5340
+```
+
+## VESC telemetry
+
+`COMM_GET_VALUES`/selective menyediakan nilai aktual:
+
+- Imotor
+- Iin / DC-link current
+- Id
+- Iq
+- duty
+- ERPM
+- Vin
+- fault
+- rotor position 0..360 deg
+- VESC ID
+- Vd
+- Vq
+
+## vesc_debug.py
+
+Offline parser/selftest:
+
+```bash
+python3 tools/vesc_debug.py selftest
+```
+
+Informasi lengkap:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 info
+python3 tools/vesc_debug.py /dev/ttyUSB0 diag --motor both
+```
+
+Realtime 50 Hz:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 rt --motor both --hz 50 --seconds 10
+```
+
+Hall detect:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 hall --motor left  --amps 1.0 --arm
+python3 tools/vesc_debug.py /dev/ttyUSB0 hall --motor right --amps 1.0 --arm
+```
+
+Current command path 3 A:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 current --motor left --amps 3 --seconds 3 --arm
+```
+
+50 ERPM:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 rpm --motor left --erpm 50 --seconds 5 --arm
+```
+
+VESC position 0..360:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-vesc --motor left --deg 90 --seconds 2 --arm
+```
+
+Long-range position:
+
+```bash
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-limits --motor left --min -1000000 --max 2000000
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-count  --motor left --count 150000 --seconds 2 --arm
+python3 tools/vesc_debug.py /dev/ttyUSB0 pos-state  --motor both
+```
+
+Semua motor-moving test sengaja membutuhkan `--arm`.
+
+## Build target
+
 ```bash
 pio run -e VARIANT_USART
 ```
-`-Wall -Wextra -Werror` hanya diterapkan ke source project melalui `build_src_flags`, bukan STM32Cube HAL bawaan.
+
+Environment pembuat V15 ini tidak memiliki `pio` maupun `arm-none-eabi-gcc`,
+sehingga ARM build dan pengujian motor fisik tidak diklaim PASS di sini.
 
 ## Host regression
+
 ```bash
 python3 tools/run_all_checks.py
 ```
-Target:
-```text
-ALL_FINAL_HOST_CHECKS_PASS
-```
 
-## Hardware test awal
-Roda diangkat terlebih dahulu.
-
-```text
-mode 1
-start 30 30
-drive 50 50
-stop
-
-mode 2
-start 20 20
-drive 50 50
-stop
-
-mode 3
-start 25 25
-drive 50 50
-drive 100 100
-stop
-
-mode 4
-SET SVPWM_RPM 10
-start 1 1
-drive 2 2
-stop
-```
-
-Mode 3 adalah torque/current control, jadi pada roda bebas arus positif akan terus mempercepat motor. Gunakan mode 2 bila yang ingin dipertahankan adalah RPM.
+Lihat `VALIDATION_V15.md` dan `AUDIT_VESC600_RUNTIME_V15.md`.

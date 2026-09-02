@@ -27,7 +27,7 @@ uint8_t timeoutFlgSerial = 1;
 uint8_t ctrlModReqRaw = CTRL_MOD_REQ;
 uint8_t ctrlModReq = OPEN_MODE;
 
-uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002};
+uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047};
 
 static int16_t inputMax = 1000;
 static int16_t inputMin = -1000;
@@ -70,20 +70,13 @@ void Input_Init(void) {
   HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
   UART_DisableRxErrors(&huart3);
 
-  uint16_t writeCheck = 0;
-  uint16_t value = 0;
   HAL_FLASH_Unlock();
-  EE_Init();
-  if (EE_ReadVariable(VirtAddVarTab[0], &writeCheck) == 0 && writeCheck == FLASH_WRITE_KEY) {
-    if (EE_ReadVariable(VirtAddVarTab[1], &value) == 0) {
-      if (value >= 1 && value <= 40) {
-        m_motor_1.m_conf.l_current_max = m_motor_2.m_conf.l_current_max = (float)value;
-        m_motor_1.m_conf.l_current_min = m_motor_2.m_conf.l_current_min = -(float)value;
-      }
-    }
-    if (EE_ReadVariable(VirtAddVarTab[2], &value) == 0) { (void)value; /* N_MOT_MAX kept compile-time in fixed speed PI. */ }
-  }
+  (void)EE_Init();
   HAL_FLASH_Lock();
+  /* Load only fields that are actually implemented by this fixed-point port.
+   * Defaults remain active when EEPROM is blank or incompatible. */
+  (void)mc_interface_load_configuration_motor(false);
+  (void)mc_interface_load_configuration_motor(true);
 }
 
 void poweronMelody(void) {

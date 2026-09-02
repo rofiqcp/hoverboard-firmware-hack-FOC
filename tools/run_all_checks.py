@@ -21,7 +21,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/vesc_dual.py','tools/hoverserial.py','tools/test_motor_control_v10.py','tools/test_motor_control_v10.c'
+        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -49,15 +49,23 @@ def check_static():
     mathc=(ROOT/'Src/motor/foc_math.c').read_text()
     mcc=(ROOT/'Src/motor/mcconf_default.h').read_text()
     assert re.search(r'#define\s+MCCONF_FOC_CONTROL_DIV\s+3u',mcc), 'FOC scheduler must match generated 1-of-3 cadence'
-    assert 'e_q4_raw=((int32_t)m->m_speed_set_rpm-(int32_t)m->m_rpm)<<4' in mc, 'speed PI error must be Q4 mechanical RPM'
+    assert 'e_q4_raw=(m->m_speed_set_ramp_q16-measured_q16)>>12' in mc, 'speed PI error must preserve fractional mechanical RPM in Q4'
     assert 'speed PI drives Vq directly' in mc and 'm->m_iq_set_q4=pi_run_state' not in mc, 'mode2 must use proven speed-PI-to-Vq architecture'
+    assert 'speed_setpoint_slew_step' in mc and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp missing'
+    assert 'MCCONF_SPEED_STOP_VOLTAGE_MAX' in mc, 'mode2 gentle stop voltage ceiling missing'
+    assert 'mcpwm_foc_release_motor(second)' in mc and 'stop_reached' in mc, 'mode2 low-speed release missing'
+    assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'closed-loop voltage-circle anti-windup missing'
     assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'mode3 current setpoint slew missing'
     assert 'leftPhaseTrip=leftBridgeWasOn' in mc and 'rightPhaseTrip=rightBridgeWasOn' in mc, 'phase over-current must protect all powered modes'
+    assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
+    assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
     assert 'v->rpm=mcpwm_foc_get_erpm_motor(second)' in mc, 'VESC mc_values.rpm must be ERPM'
-    assert 'erpm_to_mech_rpm' in mc, 'VESC COMM_SET_RPM ERPM conversion missing'
+    assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'm->m_phase_openloop : m->m_phase_hall' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
-    assert '(base_pos+1u)%6u' in mc, 'reverse Hall pos+1 convention missing'
+    assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
+    assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'FOC Hall detection/validation missing'
+    assert 'gap < 18u || gap > 48u' in mc, 'Hall detect sector-gap rejection missing'
     assert 'MCCONF_HALL_INTERP_ON_RPM' in mc and 'MCCONF_HALL_INTERP_OFF_RPM' in mc, 'low-speed Hall interpolation hysteresis missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
     assert 'm->m_duty_set_permille*MCCONF_FOC_VOLTAGE_MAX' in mc, 'mode1 permille-to-voltage scaling missing'
@@ -71,10 +79,26 @@ def check_static():
     assert '(((i_sum >> 16) << 1) + (int32_t)p_term) >> 1' in mathc, 'PI equation no longer matches generated PI_clamp_fixdt'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
+    assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
+    assert 'COMM_DETECT_HALL_FOC' in vp and 'mcpwm_foc_detect_hall' in vp, 'VESC Hall detect command missing'
+    assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
+    serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
+    assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'
+    assert 'APPCONF_SIGNATURE 486554156u' in serial, 'VESC 6.00 App config signature mismatch'
+    serc=(ROOT/'Src/vesc/mcconf_serial.c').read_text()
+    assert 'appconf6_append_balance_placeholder' in serc and 'appconf6_skip_balance_placeholder' in serc, 'VESC 6.00 balance wire block adapter missing'
+    assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
+    mci=(ROOT/'Src/motor/mc_interface.c').read_text()
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM motor config persistence missing'
     assert 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp, 'virtual CAN routing missing'
-    assert 'VESC_SECOND_ID' in vp or 'MCCONF_VESC_RIGHT_ID' in vp or 'RIGHT' in vp, 'virtual right ID declaration not found'
+    assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'
+    eeh=(ROOT/'Src/eeprom.h').read_text()
+    lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
+    assert '0x0803F800u' in eeh and '0x0803FC00u' in eeh, 'EEPROM must use physical flash pages 254/255'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x30\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*254K', lds), 'linker must reserve final 2 KiB for EEPROM'
     mainc=(ROOT/'Src/main.c').read_text()
     assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
     assert 'feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);' in mainc, 'custom telemetry right Vq sign not normalized'
@@ -106,11 +130,19 @@ def config_size_check():
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/test_vesc_dual.py'])
+    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py'])
     run([sys.executable,'tools/host_compile_check.py'])
     run([sys.executable,'tools/test_foc_math.py'])
-    run([sys.executable,'tools/test_motor_control_v10.py'])
+    run([sys.executable,'tools/test_motor_control_v12.py'])
+    run([sys.executable,'tools/test_motor_control_v13.py'])
     run([sys.executable,'tools/test_vesc_protocol_host.py'])
     config_size_check()
     run([sys.executable,'tools/test_vesc_dual.py'])
+    run([sys.executable,'tools/test_v13_features.py'])
+    run([sys.executable,'tools/test_v14_features.py'])
+    run([sys.executable,'tools/test_v15_features.py'])
+    run([sys.executable,'tools/test_v16_features.py'])
+    run([sys.executable,'tools/vesc_debug.py','selftest'])
+    run([sys.executable,'tools/test_hall_detect_algorithm.py'])
+    run([sys.executable,'tools/test_eeprom_persistence.py'])
     print('ALL_FINAL_HOST_CHECKS_PASS')

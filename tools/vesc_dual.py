@@ -26,16 +26,27 @@ COMM_SET_DUTY = 5
 COMM_SET_CURRENT = 6
 COMM_SET_CURRENT_BRAKE = 7
 COMM_SET_RPM = 8
+COMM_SET_POS = 9
+COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
 COMM_FORWARD_CAN = 34
+COMM_CUSTOM_APP_DATA = 36
 COMM_GET_VALUES_SELECTIVE = 50
 COMM_PING_CAN = 62
 RIGHT_ID = 2
 POLE_PAIRS = 15
 STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
 
+HB_MAGIC = b"HB"
+HB_VERSION = 1
+HB_GET_DIAG = 1
+HB_GET_POS_STATE = 2
+HB_SET_POS_LIMITS = 3
+HB_SET_POS_TARGET = 4
+HB_RESET_POSITION = 5
+
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
-VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 17, 19, 20))
+VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
 
 
 def crc16(data: bytes) -> int:
@@ -115,6 +126,7 @@ class Values:
     duty: float = 0.0
     rpm: float = 0.0
     vin: float = 0.0
+    position: float = 0.0
     fault: int = 0
     vesc_id: int = 0
     vd: float = 0.0
@@ -124,8 +136,91 @@ class Values:
         return (f"id={self.vesc_id} rpm={self.rpm:.0f} duty={100*self.duty:.1f}% "
                 f"Imot={self.current_motor:.2f}A Iin={self.current_in:.2f}A "
                 f"Id={self.id:.2f}A Iq={self.iq:.2f}A Vd={self.vd:.2f}V "
-                f"Vq={self.vq:.2f}V Vin={self.vin:.1f}V fault={self.fault}")
+                f"Vq={self.vq:.2f}V Vin={self.vin:.1f}V pos={self.position:.2f}deg fault={self.fault}")
 
+
+
+@dataclass
+class PositionState:
+    current: int
+    target: int
+    minimum: int
+    maximum: int
+
+
+@dataclass
+class Diag:
+    vesc_id: int
+    control_mode: int
+    state: int
+    fault: int
+    hall: int
+    override: bool
+    hall_store_ok: bool
+    iq_target_a: float
+    iq_ref_a: float
+    iq_a: float
+    id_a: float
+    erpm: int
+    duty: float
+    position: int
+    position_target: int
+    position_min: int
+    position_max: int
+    hall_invalid: int
+    current_trips: int
+    rx_ok: int
+    rx_crc_errors: int
+    hall_table: list[int]
+
+    def short(self) -> str:
+        return (
+            f"id={self.vesc_id} mode={self.control_mode} state={self.state} fault={self.fault} "
+            f"hall={self.hall} own={int(self.override)} Iq_tgt={self.iq_target_a:.3f}A "
+            f"Iq_ref={self.iq_ref_a:.3f}A Iq={self.iq_a:.3f}A Id={self.id_a:.3f}A "
+            f"erpm={self.erpm} duty={100*self.duty:.2f}% pos={self.position} "
+            f"target={self.position_target} trips={self.current_trips} hall_bad={self.hall_invalid}"
+        )
+
+
+def parse_custom_header(payload: bytes, op: int) -> int:
+    if len(payload) < 6 or payload[0] != COMM_CUSTOM_APP_DATA:
+        raise ValueError("not COMM_CUSTOM_APP_DATA")
+    if payload[1:3] != HB_MAGIC or payload[3] != HB_VERSION or payload[4] != op:
+        raise ValueError("custom app header mismatch")
+    return payload[5]
+
+
+def parse_position_state(payload: bytes, op: int) -> PositionState:
+    status = parse_custom_header(payload, op)
+    if status:
+        raise RuntimeError(f"custom position command failed status={status}")
+    if len(payload) < 22:
+        raise ValueError(f"short position state reply: {len(payload)}")
+    return PositionState(*struct.unpack_from(">iiii", payload, 6))
+
+
+def parse_diag(payload: bytes) -> Diag:
+    status = parse_custom_header(payload, HB_GET_DIAG)
+    if status:
+        raise RuntimeError(f"diagnostic command failed status={status}")
+    if len(payload) < 78:
+        raise ValueError(f"short diagnostic reply: {len(payload)}")
+    vid, mode, state, fault, hall, own, store_ok, _reserved = struct.unpack_from(">8B", payload, 6)
+    vals = struct.unpack_from(">10i", payload, 14)
+    hall_invalid, trips, rx_ok, rx_crc = struct.unpack_from(">4I", payload, 54)
+    table = list(payload[70:78])
+    return Diag(
+        vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
+        override=bool(own), hall_store_ok=bool(store_ok),
+        iq_target_a=vals[0] / 1000.0, iq_ref_a=vals[1] / 1000.0,
+        iq_a=vals[2] / 1000.0, id_a=vals[3] / 1000.0,
+        erpm=vals[4], duty=vals[5] / 100000.0,
+        position=vals[6], position_target=vals[7],
+        position_min=vals[8], position_max=vals[9],
+        hall_invalid=hall_invalid, current_trips=trips,
+        rx_ok=rx_ok, rx_crc_errors=rx_crc, hall_table=table,
+    )
 
 def _i16(data: bytes, i: int, scale: float):
     return struct.unpack_from(">h", data, i)[0] / scale, i + 2
@@ -158,7 +253,7 @@ def parse_selective(payload: bytes, expected_mask: int = VALUE_MASK) -> Values:
         elif bit in (9, 10, 11, 12): _, i = _i32(payload, i, 10000)
         elif bit in (13, 14): _, i = _i32(payload, i, 1)
         elif bit == 15: v.fault, i = payload[i], i + 1
-        elif bit == 16: _, i = _i32(payload, i, 1_000_000)
+        elif bit == 16: v.position, i = _i32(payload, i, 1000000)
         elif bit == 17: v.vesc_id, i = payload[i], i + 1
         elif bit == 18: i += 6
         elif bit == 19: v.vd, i = _i32(payload, i, 1000)
@@ -228,6 +323,21 @@ class VescDual:
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
 
+    def set_pos(self, left_deg: float, right_deg: float):
+        """Stock VESC single-turn position command, intentionally 0..360 deg.
+
+        Use set_position_counts()/set_position_limits() for this project's signed
+        int32 multi-turn Hall-count position API. Keeping the two APIs separate
+        prevents VESC Tool's rotor-angle command from being reinterpreted as a
+        long-range actuator position.
+        """
+        def enc(deg: float) -> bytes:
+            if not 0.0 <= deg <= 360.0:
+                raise ValueError("standard VESC position must be 0..360 degrees")
+            return bytes((COMM_SET_POS,)) + struct.pack(">i", round(deg * 1000000.0))
+        with self.io_lock:
+            self.send(enc(left_deg)); self.send(self.fwd(enc(right_deg)))
+
     def brake(self, left_a: float, right_a: float):
         l = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(abs(left_a) * 1000))
         r = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(abs(right_a) * 1000))
@@ -238,6 +348,49 @@ class VescDual:
         req = bytes((COMM_GET_VALUES_SELECTIVE,)) + struct.pack(">I", VALUE_MASK)
         p = self.transact(self.fwd(req) if right else req, COMM_GET_VALUES_SELECTIVE)
         return parse_selective(p)
+
+    def detect_hall(self, current_a: float = 1.0, right: bool = False):
+        if current_a <= 0.0:
+            raise ValueError("Hall detect current must be > 0 A")
+        req = bytes((COMM_DETECT_HALL_FOC,)) + struct.pack(">i", round(current_a * 1000.0))
+        p = self.transact(self.fwd(req) if right else req, COMM_DETECT_HALL_FOC, 20.0)
+        if len(p) != 10:
+            raise ValueError(f"unexpected Hall detect reply length {len(p)}")
+        table = list(p[1:9])
+        ok = p[9] == 0
+        return ok, table
+
+    @staticmethod
+    def _custom(op: int, data: bytes = b"") -> bytes:
+        return bytes((COMM_CUSTOM_APP_DATA,)) + HB_MAGIC + bytes((HB_VERSION, op)) + data
+
+    def custom_transact(self, op: int, data: bytes = b"", right: bool = False,
+                        timeout: float | None = None) -> bytes:
+        req = self._custom(op, data)
+        return self.transact(self.fwd(req) if right else req, COMM_CUSTOM_APP_DATA, timeout)
+
+    def position_state(self, right: bool = False) -> PositionState:
+        return parse_position_state(self.custom_transact(HB_GET_POS_STATE, right=right), HB_GET_POS_STATE)
+
+    def set_position_limits(self, minimum: int, maximum: int, right: bool = False) -> PositionState:
+        if not (-2147483648 <= minimum <= 2147483647 and -2147483648 <= maximum <= 2147483647):
+            raise ValueError("position limits must fit signed int32")
+        if minimum > maximum:
+            raise ValueError("minimum must be <= maximum")
+        p = self.custom_transact(HB_SET_POS_LIMITS, struct.pack(">ii", minimum, maximum), right=right)
+        return parse_position_state(p, HB_SET_POS_LIMITS)
+
+    def set_position_counts(self, target: int, right: bool = False) -> PositionState:
+        if not -2147483648 <= target <= 2147483647:
+            raise ValueError("position target must fit signed int32")
+        p = self.custom_transact(HB_SET_POS_TARGET, struct.pack(">i", target), right=right)
+        return parse_position_state(p, HB_SET_POS_TARGET)
+
+    def reset_position(self, right: bool = False) -> PositionState:
+        return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
+
+    def diag(self, right: bool = False) -> Diag:
+        return parse_diag(self.custom_transact(HB_GET_DIAG, right=right))
 
 
 class ReplWorker:
@@ -264,8 +417,19 @@ class ReplWorker:
 
     def stop_controlled(self):
         with self.lock:
-            self.stop_flag = True
-            self.active = True
+            # Speed uses firmware RPM ramp-to-zero. Current/duty/position issue
+            # zero current once and stop refreshing; the 500-ms ownership timeout
+            # then releases the bridge to free-run.
+            if self.mode == "rpm":
+                self.left = 0.0
+                self.right = 0.0
+                self.stop_flag = True
+                self.active = True
+            else:
+                self.stop_flag = False
+                self.active = False
+        if self.mode != "rpm":
+            self.link.set_current(0.0, 0.0)
 
     def release(self):
         self.link.set_current(0.0, 0.0)
@@ -284,17 +448,18 @@ class ReplWorker:
                 mode, l, r, active, stopping = self.mode, self.left, self.right, self.active, self.stop_flag
             try:
                 if active:
-                    if stopping:
-                        self.link.brake(1.2, 1.2)
+                    if stopping and mode == "rpm":
+                        self.link.set_rpm(0, 0)
                     elif mode == "current": self.link.set_current(l, r)
                     elif mode == "rpm": self.link.set_rpm(int(l), int(r))
                     elif mode == "duty": self.link.set_duty(l, r)
+                    elif mode == "pos": self.link.set_pos(l, r)
                 if now >= next_tel:
                     next_tel = now + self.telemetry_period
                     self.last_l = self.link.values(False)
                     self.last_r = self.link.values(True)
-                    if stopping and abs(self.last_l.rpm) <= STOP_ERPM and abs(self.last_r.rpm) <= STOP_ERPM:
-                        self.link.set_current(0.0, 0.0)
+                    if stopping and mode == "rpm" and abs(self.last_l.rpm) <= STOP_ERPM and abs(self.last_r.rpm) <= STOP_ERPM:
+                        self.link.set_rpm(0, 0)
                         with self.lock:
                             self.active = False; self.stop_flag = False
             except Exception as e:
@@ -320,8 +485,8 @@ def main():
     ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--command-hz", type=float, default=50.0)
-    ap.add_argument("--telemetry-hz", type=float, default=20.0,
-                    help="selective VESC telemetry polling; 20 default, 50 supported for testing")
+    ap.add_argument("--telemetry-hz", type=float, default=50.0,
+                    help="selective VESC telemetry polling; default 50 Hz")
     args = ap.parse_args()
     link = VescDual(args.port, args.baud)
     try:
@@ -329,7 +494,7 @@ def main():
         print("virtual CAN:", link.ping_can())
         print("right:", parse_fw(link.fw(True)))
         w = ReplWorker(link, args.command_hz, args.telemetry_hz)
-        print("commands: current L R [A] | rpm L R [ERPM] | duty L R [-1..1] | stop | release | values | scan | fw | quit")
+        print("commands: current L R [A] | rpm L R [ERPM] | duty L R [-1..1] | pos L R [deg] | hall [A] [left|right|both] | diag | posstate | stop | release | values | scan | fw | quit")
         while True:
             try: line = input("vesc-dual> ").strip()
             except (EOFError, KeyboardInterrupt): break
@@ -339,13 +504,23 @@ def main():
                 if cmd == "current" and len(a) == 3: w.set("current", float(a[1]), float(a[2]))
                 elif cmd == "rpm" and len(a) == 3: w.set("rpm", float(a[1]), float(a[2]))
                 elif cmd == "duty" and len(a) == 3: w.set("duty", float(a[1]), float(a[2]))
+                elif cmd in ("pos", "position") and len(a) == 3: w.set("pos", float(a[1]), float(a[2]))
                 elif cmd == "stop": w.stop_controlled()
                 elif cmd == "release": w.release()
                 elif cmd == "values": print("L", w.last_l.short()); print("R", w.last_r.short())
                 elif cmd == "scan": print("virtual CAN IDs:", link.ping_can())
                 elif cmd == "fw": print("L", parse_fw(link.fw(False))); print("R", parse_fw(link.fw(True)))
+                elif cmd == "diag": print("L", link.diag(False).short()); print("R", link.diag(True).short())
+                elif cmd == "posstate": print("L", link.position_state(False)); print("R", link.position_state(True))
+                elif cmd == "hall":
+                    current = float(a[1]) if len(a) >= 2 else 1.0
+                    which = a[2].lower() if len(a) >= 3 else "both"
+                    if which in ("left", "l", "both"):
+                        ok, tab = link.detect_hall(current, False); print("Hall LEFT", "OK" if ok else "FAIL", tab)
+                    if which in ("right", "r", "both"):
+                        ok, tab = link.detect_hall(current, True); print("Hall RIGHT", "OK" if ok else "FAIL", tab)
                 elif cmd in ("quit", "exit", "q"): break
-                else: print("usage: current L R | rpm L R | duty L R | stop | release | values | scan | fw | quit")
+                else: print("usage: current L R | rpm L R | duty L R | pos L R | hall [A] [left|right|both] | stop | release | values | scan | fw | quit")
             except Exception as e:
                 print("[ERR]", e)
         w.shutdown()

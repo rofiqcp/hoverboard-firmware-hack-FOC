@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Diagnostik lengkap VESC 6.00 dual hoverboard STM32F103.
+
+Contoh cepat:
+  python3 tools/vesc_debug.py /dev/ttyUSB0 selftest
+  python3 tools/vesc_debug.py /dev/ttyUSB0 info
+  python3 tools/vesc_debug.py /dev/ttyUSB0 rt --motor both --hz 50 --seconds 10
+  python3 tools/vesc_debug.py /dev/ttyUSB0 hall --motor left --amps 1.0 --arm
+  python3 tools/vesc_debug.py /dev/ttyUSB0 current --motor left --amps 3 --seconds 3 --arm
+  python3 tools/vesc_debug.py /dev/ttyUSB0 rpm --motor left --erpm 50 --seconds 5 --arm
+  python3 tools/vesc_debug.py /dev/ttyUSB0 pos-limits --motor both --min -1000000 --max 1000000
+  python3 tools/vesc_debug.py /dev/ttyUSB0 pos-count --motor left --count -250 --seconds 2 --arm
+
+Motor yang dapat bergerak hanya dijalankan bila --arm diberikan. Semua setpoint aktif
+secara periodik 50 Hz agar ownership/timeout VESC 500 ms tidak memutus command.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import struct
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Callable
+
+from vesc_dual import (
+    VescDual, Values, Diag, PositionState, PacketDecoder,
+    frame, crc16, parse_fw, parse_selective, parse_diag, parse_position_state,
+    COMM_SET_CURRENT, COMM_SET_RPM, COMM_SET_DUTY, COMM_SET_POS,
+    COMM_GET_VALUES_SELECTIVE, COMM_CUSTOM_APP_DATA,
+    HB_MAGIC, HB_VERSION, HB_GET_DIAG, HB_GET_POS_STATE,
+    VALUE_MASK, POLE_PAIRS,
+)
+
+INT32_MIN = -2147483648
+INT32_MAX = 2147483647
+DEFAULT_HZ = 50.0
+
+
+def motor_flags(name: str) -> tuple[bool, bool]:
+    n = name.lower()
+    if n in ("left", "l"):
+        return True, False
+    if n in ("right", "r"):
+        return False, True
+    if n in ("both", "all"):
+        return True, True
+    raise ValueError(f"motor tidak dikenal: {name}")
+
+
+def send_one(link: VescDual, motor: str, cmd: int, raw: int) -> None:
+    payload = bytes((cmd,)) + struct.pack(">i", int(raw))
+    with link.io_lock:
+        if motor == "right":
+            link.send(link.fwd(payload))
+        else:
+            link.send(payload)
+
+
+def release_one(link: VescDual, motor: str) -> None:
+    # 0 A lalu berhenti refresh. Firmware melepas bridge setelah timeout ownership.
+    for _ in range(3):
+        send_one(link, motor, COMM_SET_CURRENT, 0)
+        time.sleep(0.02)
+
+
+class Refresher:
+    def __init__(self, fn: Callable[[], None], hz: float = DEFAULT_HZ):
+        if hz <= 0:
+            raise ValueError("hz harus > 0")
+        self.fn = fn
+        self.period = 1.0 / hz
+        self.stop_evt = threading.Event()
+        self.errors: list[str] = []
+        self.count = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        nxt = time.monotonic()
+        while not self.stop_evt.is_set():
+            now = time.monotonic()
+            if now < nxt:
+                self.stop_evt.wait(min(0.002, nxt - now))
+                continue
+            try:
+                self.fn()
+                self.count += 1
+            except Exception as exc:  # hardware diagnostic: report, jangan matikan thread diam-diam
+                self.errors.append(str(exc))
+            nxt += self.period
+            if now - nxt > self.period * 4:
+                nxt = now + self.period
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop_evt.set()
+        self.thread.join(timeout=1.0)
+
+
+def print_values(prefix: str, v: Values) -> None:
+    print(
+        f"{prefix}: id={v.vesc_id} ERPM={v.rpm:8.1f} duty={v.duty*100:7.2f}% "
+        f"Imotor={v.current_motor:7.3f}A Iin={v.current_in:7.3f}A "
+        f"Id={v.id:7.3f}A Iq={v.iq:7.3f}A Vd={v.vd:7.3f}V Vq={v.vq:7.3f}V "
+        f"Vin={v.vin:6.2f}V pos={v.position:7.2f}deg fault={v.fault}"
+    )
+
+
+def print_diag(prefix: str, d: Diag) -> None:
+    print(prefix + ": " + d.short())
+    print(
+        f"  pos_limit=[{d.position_min}, {d.position_max}] hall_table={d.hall_table} "
+        f"hall_store={'OK' if d.hall_store_ok else 'NO/NOT-YET'} rx_ok={d.rx_ok} crc_err={d.rx_crc_errors}"
+    )
+
+
+def hall_table_valid(table: list[int]) -> tuple[bool, str]:
+    if len(table) != 8:
+        return False, "panjang bukan 8"
+    if table[0] != 255 or table[7] != 255:
+        return False, "state 0/7 harus 255"
+    vals = table[1:7]
+    if any(x == 255 or x > 199 for x in vals):
+        return False, "state Hall 1..6 belum semuanya valid"
+    sv = sorted(vals)
+    gaps = [sv[i + 1] - sv[i] for i in range(5)] + [sv[0] + 200 - sv[5]]
+    if any(g < 18 or g > 48 for g in gaps):
+        return False, f"spacing tidak wajar: {gaps}"
+    return True, f"spacing={gaps}"
+
+
+def require_arm(args) -> None:
+    if not args.arm:
+        raise SystemExit("Perintah ini dapat menggerakkan motor. Jalankan ulang dengan --arm.")
+
+
+def cmd_selftest(_args) -> int:
+    payload = bytes((COMM_GET_VALUES_SELECTIVE,)) + struct.pack(">I", VALUE_MASK)
+    raw = frame(payload)
+    dec = PacketDecoder()
+    chunks = [raw[:1], raw[1:4], raw[4:9], raw[9:]]
+    got = []
+    for c in chunks:
+        got += dec.feed(c)
+    assert got == [payload]
+    assert crc16(payload) == ((raw[-3] << 8) | raw[-2])
+
+    # custom position parser
+    pos_payload = bytes((COMM_CUSTOM_APP_DATA,)) + HB_MAGIC + bytes((HB_VERSION, HB_GET_POS_STATE, 0)) + struct.pack(">iiii", -12, 34, INT32_MIN, INT32_MAX)
+    ps = parse_position_state(pos_payload, HB_GET_POS_STATE)
+    assert ps.current == -12 and ps.target == 34 and ps.minimum == INT32_MIN and ps.maximum == INT32_MAX
+
+    # custom diagnostic parser, layout harus tetap sinkron firmware
+    diag_payload = bytearray(bytes((COMM_CUSTOM_APP_DATA,)) + HB_MAGIC + bytes((HB_VERSION, HB_GET_DIAG, 0)))
+    diag_payload += struct.pack(">8B", 1, 3, 1, 0, 5, 1, 1, 0)
+    diag_payload += struct.pack(">10i", 3000, 2500, 2400, 10, 50, 1234, -7, -8, -1000, 1000)
+    diag_payload += struct.pack(">4I", 2, 3, 100, 0)
+    diag_payload += bytes((255, 83, 17, 50, 150, 117, 183, 255))
+    d = parse_diag(bytes(diag_payload))
+    assert math.isclose(d.iq_target_a, 3.0) and d.erpm == 50 and d.hall == 5
+    ok, _ = hall_table_valid(d.hall_table)
+    assert ok
+    print("VESC_DEBUG_SELFTEST_PASS")
+    return 0
+
+
+def cmd_info(args, link: VescDual) -> int:
+    print("LOCAL :", parse_fw(link.fw(False)))
+    ids = link.ping_can()
+    print("CAN   :", ids)
+    if 2 in ids:
+        print("RIGHT :", parse_fw(link.fw(True)))
+    else:
+        print("RIGHT : ID 2 tidak muncul pada PING_CAN")
+    print_values("L", link.values(False))
+    if 2 in ids:
+        print_values("R", link.values(True))
+    try:
+        print_diag("L", link.diag(False))
+        if 2 in ids:
+            print_diag("R", link.diag(True))
+    except Exception as exc:
+        print("[WARN] custom diagnostic:", exc)
+    return 0
+
+
+def cmd_diag(args, link: VescDual) -> int:
+    left, right = motor_flags(args.motor)
+    if left:
+        print_diag("L", link.diag(False))
+    if right:
+        print_diag("R", link.diag(True))
+    return 0
+
+
+def cmd_rt(args, link: VescDual) -> int:
+    if not (1 <= args.hz <= 100):
+        raise SystemExit("--hz harus 1..100")
+    left, right = motor_flags(args.motor)
+    period = 1.0 / args.hz
+    end = time.monotonic() + args.seconds
+    nxt = time.monotonic()
+    ok_count = 0
+    errors = 0
+    rows = []
+    start = time.monotonic()
+    while time.monotonic() < end:
+        now = time.monotonic()
+        if now < nxt:
+            time.sleep(min(0.001, nxt - now))
+            continue
+        timestamp = time.monotonic() - start
+        try:
+            if left:
+                v = link.values(False); ok_count += 1
+                rows.append((timestamp, "L", v.rpm, v.current_motor, v.current_in, v.id, v.iq, v.duty, v.vin, v.position, v.fault))
+            if right:
+                v = link.values(True); ok_count += 1
+                rows.append((timestamp, "R", v.rpm, v.current_motor, v.current_in, v.id, v.iq, v.duty, v.vin, v.position, v.fault))
+        except Exception as exc:
+            errors += 1
+            print("[RT ERROR]", exc)
+        nxt += period
+        if now - nxt > period * 4:
+            nxt = now + period
+    elapsed = max(time.monotonic() - start, 1e-9)
+    channels = int(left) + int(right)
+    expected = args.hz * elapsed * channels
+    actual_hz_per_motor = ok_count / elapsed / max(channels, 1)
+    print(f"RT_RESULT replies={ok_count} errors={errors} elapsed={elapsed:.3f}s rate_per_motor={actual_hz_per_motor:.2f}Hz expected~{expected:.0f}")
+    if rows:
+        last_l = next((r for r in reversed(rows) if r[1] == "L"), None)
+        last_r = next((r for r in reversed(rows) if r[1] == "R"), None)
+        if last_l: print("last L:", last_l)
+        if last_r: print("last R:", last_r)
+    if args.csv:
+        out = Path(args.csv)
+        with out.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(("time_s", "motor", "erpm", "imotor_a", "iin_a", "id_a", "iq_a", "duty", "vin_v", "pos_deg", "fault"))
+            w.writerows(rows)
+        print("CSV:", out)
+    # toleransi scheduler/serial 10%; target utamanya 50 Hz saat --hz 50
+    if errors or actual_hz_per_motor < args.hz * 0.90:
+        print("RESULT: FAIL/UNSTABLE realtime rate")
+        return 2
+    print("RESULT: PASS realtime polling")
+    return 0
+
+
+def cmd_hall(args, link: VescDual) -> int:
+    require_arm(args)
+    left, right = motor_flags(args.motor)
+    result = 0
+    for name, is_right in (("LEFT", False), ("RIGHT", True)):
+        if (is_right and not right) or ((not is_right) and not left):
+            continue
+        before = link.diag(is_right)
+        print_diag(name + " BEFORE", before)
+        print(f"{name}: Hall detect {args.amps:.2f} A ...")
+        ok, table = link.detect_hall(args.amps, is_right)
+        valid, why = hall_table_valid(table)
+        after = link.diag(is_right)
+        print(f"{name}: protocol_result={'OK' if ok else 'FAIL'} table={table} {why}")
+        print_diag(name + " AFTER", after)
+        if not ok or not valid or after.hall_table != table or not after.hall_store_ok:
+            print(f"{name}: RESULT FAIL (detect/table/apply/EEPROM)")
+            result = 2
+        else:
+            print(f"{name}: RESULT PASS Hall table aktif + EEPROM")
+    return result
+
+
+def run_motion_test(args, link: VescDual, motor: str, cmd: int, raw: int, label: str) -> int:
+    require_arm(args)
+    is_right = motor == "right"
+    before = link.diag(is_right)
+    print_diag("BEFORE", before)
+    sender = lambda: send_one(link, motor, cmd, raw)
+    samples: list[tuple[float, Values, Diag | None]] = []
+    start = time.monotonic()
+    try:
+        with Refresher(sender, args.hz) as ref:
+            end = start + args.seconds
+            next_sample = start
+            next_diag = start
+            latest_diag = None
+            while time.monotonic() < end:
+                now = time.monotonic()
+                if now >= next_diag:
+                    latest_diag = link.diag(is_right)
+                    next_diag += 0.20
+                if now >= next_sample:
+                    v = link.values(is_right)
+                    samples.append((now - start, v, latest_diag))
+                    next_sample += 0.05
+                time.sleep(0.002)
+            print(f"setpoint refresh count={ref.count} errors={len(ref.errors)}")
+            if ref.errors:
+                print("refresh errors:", ref.errors[-3:])
+    finally:
+        release_one(link, motor)
+    time.sleep(0.10)
+    after = link.diag(is_right)
+    print_diag("AFTER", after)
+    if samples:
+        print_values("LAST", samples[-1][1])
+    if not samples:
+        print("RESULT: FAIL tidak ada telemetry")
+        return 2
+    if after.fault:
+        print(f"RESULT: FAIL fault={after.fault}")
+        return 2
+    print(f"RESULT: {label} test selesai; lihat target/ref/actual di atas")
+    return 0
+
+
+def cmd_current(args, link: VescDual) -> int:
+    left, right = motor_flags(args.motor)
+    if left and right:
+        raise SystemExit("current test jalankan satu motor: --motor left atau right")
+    motor = "right" if right else "left"
+    raw = round(args.amps * 1000.0)
+    rc = run_motion_test(args, link, motor, COMM_SET_CURRENT, raw, f"CURRENT {args.amps:.3f}A")
+    # Jalur command dianggap PASS bila firmware benar-benar menerima target 3A, terlepas beban mekanik.
+    d = link.diag(right)
+    # setelah release target bisa nol; ambil validasi dari test via run output. Lakukan pulse singkat tanpa menunggu sample.
+    require_arm(args)
+    send_one(link, motor, COMM_SET_CURRENT, raw)
+    time.sleep(0.03)
+    active = link.diag(right)
+    release_one(link, motor)
+    print(f"COMMAND_PATH Iq_target={active.iq_target_a:.3f}A expected={args.amps:.3f}A mode={active.control_mode} ownership={active.override}")
+    if abs(active.iq_target_a - args.amps) > 0.06 or not active.override:
+        print("CURRENT_COMMAND_PATH_FAIL")
+        return 2
+    print("CURRENT_COMMAND_PATH_PASS")
+    return rc
+
+
+def cmd_rpm(args, link: VescDual) -> int:
+    left, right = motor_flags(args.motor)
+    if left and right:
+        raise SystemExit("rpm test jalankan satu motor: --motor left atau right")
+    motor = "right" if right else "left"
+    erpm = int(round(args.erpm if args.erpm is not None else args.mech_rpm * POLE_PAIRS))
+    print(f"RPM target = {erpm} ERPM ({erpm/POLE_PAIRS:.3f} mechanical RPM @ {POLE_PAIRS} pole-pair)")
+    return run_motion_test(args, link, motor, COMM_SET_RPM, erpm, f"RPM {erpm} ERPM")
+
+
+def cmd_pos_vesc(args, link: VescDual) -> int:
+    require_arm(args)
+    if not 0.0 <= args.deg <= 360.0:
+        raise SystemExit("VESC Tool/COMM_SET_POS standard dibatasi 0..360 derajat pada utility ini")
+    left, right = motor_flags(args.motor)
+    if left and right:
+        raise SystemExit("pos-vesc test jalankan satu motor")
+    motor = "right" if right else "left"
+    raw = round(args.deg * 1_000_000.0)
+    return run_motion_test(args, link, motor, COMM_SET_POS, raw, f"VESC POS {args.deg:.3f}deg")
+
+
+def cmd_pos_limits(args, link: VescDual) -> int:
+    if not INT32_MIN <= args.minimum <= INT32_MAX or not INT32_MIN <= args.maximum <= INT32_MAX:
+        raise SystemExit("min/max harus signed int32")
+    if args.minimum > args.maximum:
+        raise SystemExit("min harus <= max")
+    left, right = motor_flags(args.motor)
+    if left:
+        print("L", link.set_position_limits(args.minimum, args.maximum, False))
+    if right:
+        print("R", link.set_position_limits(args.minimum, args.maximum, True))
+    return 0
+
+
+def cmd_pos_state(args, link: VescDual) -> int:
+    left, right = motor_flags(args.motor)
+    if left: print("L", link.position_state(False))
+    if right: print("R", link.position_state(True))
+    return 0
+
+
+def cmd_pos_reset(args, link: VescDual) -> int:
+    left, right = motor_flags(args.motor)
+    if left: print("L", link.reset_position(False))
+    if right: print("R", link.reset_position(True))
+    return 0
+
+
+def cmd_pos_count(args, link: VescDual) -> int:
+    require_arm(args)
+    if not INT32_MIN <= args.count <= INT32_MAX:
+        raise SystemExit("count harus signed int32")
+    left, right = motor_flags(args.motor)
+    if left and right:
+        raise SystemExit("pos-count test jalankan satu motor")
+    is_right = right
+    motor = "right" if right else "left"
+    def sender():
+        link.set_position_counts(args.count, is_right)
+    try:
+        with Refresher(sender, args.hz) as ref:
+            end = time.monotonic() + args.seconds
+            while time.monotonic() < end:
+                st = link.position_state(is_right)
+                d = link.diag(is_right)
+                print(f"{motor}: current={st.current} target={st.target} limits=[{st.minimum},{st.maximum}] Iq={d.iq_a:.3f}A")
+                time.sleep(0.20)
+            print(f"refresh count={ref.count} errors={len(ref.errors)}")
+    finally:
+        release_one(link, motor)
+    return 0
+
+
+def cmd_all(args, link: VescDual) -> int:
+    rc = 0
+    print("=== INFO ===")
+    rc |= cmd_info(args, link)
+    print("=== RT 50 HZ, 3 s ===")
+    class Tmp: pass
+    rt = Tmp(); rt.hz=50.0; rt.seconds=3.0; rt.motor="both"; rt.csv=None
+    rc |= cmd_rt(rt, link)
+    print("=== POSITION API ===")
+    print("L", link.position_state(False)); print("R", link.position_state(True))
+    if args.arm:
+        print("=== HALL DETECT LEFT 1.0 A ===")
+        class H: pass
+        h=H(); h.arm=True; h.motor="left"; h.amps=1.0
+        rc |= cmd_hall(h, link)
+        print("=== CURRENT LEFT 1.0 A ===")
+        class C: pass
+        c=C(); c.arm=True;c.motor="left";c.amps=1.0;c.seconds=2.0;c.hz=50.0
+        rc |= cmd_current(c, link)
+        print("=== RPM LEFT 50 ERPM ===")
+        class R: pass
+        r=R();r.arm=True;r.motor="left";r.erpm=50.0;r.mech_rpm=None;r.seconds=4.0;r.hz=50.0
+        rc |= cmd_rpm(r, link)
+    else:
+        print("Motor-moving tests dilewati; tambahkan --arm untuk Hall/current/RPM.")
+    print("ALL_TESTS_RESULT:", "PASS" if rc == 0 else f"CHECK rc={rc}")
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="VESC 6.00 dual STM32F103 hardware/protocol debugger")
+    p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
+    p.add_argument("command", nargs="?", default="info",
+                   choices=("selftest","info","diag","rt","hall","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
+    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--motor", default="both", choices=("left","right","both"))
+    p.add_argument("--hz", type=float, default=50.0)
+    p.add_argument("--seconds", type=float, default=5.0)
+    p.add_argument("--amps", type=float, default=1.0)
+    p.add_argument("--erpm", type=float)
+    p.add_argument("--mech-rpm", type=float)
+    p.add_argument("--deg", type=float, default=0.0)
+    p.add_argument("--min", dest="minimum", type=int, default=INT32_MIN)
+    p.add_argument("--max", dest="maximum", type=int, default=INT32_MAX)
+    p.add_argument("--count", type=int, default=0)
+    p.add_argument("--csv")
+    p.add_argument("--arm", action="store_true", help="izinkan test yang memberi energi ke motor")
+    return p
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    # shorthand offline: `python3 tools/vesc_debug.py selftest`
+    if argv and argv[0] == "selftest":
+        argv.insert(0, "/dev/ttyUSB0")
+    args = build_parser().parse_args(argv)
+    if args.command == "selftest":
+        return cmd_selftest(args)
+    if args.command == "rpm" and args.erpm is None and args.mech_rpm is None:
+        raise SystemExit("rpm memerlukan --erpm N atau --mech-rpm N")
+    link = VescDual(args.port, args.baud, timeout=0.25)
+    try:
+        if args.command == "info": return cmd_info(args, link)
+        if args.command == "diag": return cmd_diag(args, link)
+        if args.command == "rt": return cmd_rt(args, link)
+        if args.command == "hall": return cmd_hall(args, link)
+        if args.command == "current": return cmd_current(args, link)
+        if args.command == "rpm": return cmd_rpm(args, link)
+        if args.command == "pos-vesc": return cmd_pos_vesc(args, link)
+        if args.command == "pos-limits": return cmd_pos_limits(args, link)
+        if args.command == "pos-state": return cmd_pos_state(args, link)
+        if args.command == "pos-reset": return cmd_pos_reset(args, link)
+        if args.command == "pos-count": return cmd_pos_count(args, link)
+        if args.command == "all": return cmd_all(args, link)
+        raise AssertionError(args.command)
+    finally:
+        link.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,11 +2,12 @@
 from pathlib import Path
 import subprocess,tempfile,shutil,sys
 R=Path(__file__).resolve().parents[1]
-for cc in [c for c in ('gcc','clang') if shutil.which(c)]:
-    with tempfile.TemporaryDirectory(prefix='motor-v10-') as td:
+ccs=[c for c in ('gcc','clang') if shutil.which(c)]
+for cc in ccs:
+    with tempfile.TemporaryDirectory(prefix='eeprom-v14-') as td:
         exe=Path(td)/'t'
         cmd=[cc,'-std=c11','-O2','-Wall','-Wextra','-Werror',f'-I{R}',f'-I{R/"Src"}',f'-I{R/"tools/host_stubs"}',
-             str(R/'tools/test_motor_control_v10.c'),str(R/'Src/motor/mcpwm_foc.c'),str(R/'Src/motor/foc_math.c'),'-lm','-o',str(exe)]
+             str(R/'tools/test_eeprom_persistence.c'),str(R/'Src/motor/mcpwm_foc.c'),str(R/'Src/motor/foc_math.c'),str(R/'Src/motor/mc_interface.c'),'-lm','-o',str(exe)]
         x=subprocess.run(cmd,text=True,capture_output=True)
         if x.returncode:
             print(x.stdout+x.stderr);sys.exit(x.returncode)
@@ -14,4 +15,4 @@ for cc in [c for c in ('gcc','clang') if shutil.which(c)]:
         if x.returncode:
             print(x.stdout+x.stderr);sys.exit(x.returncode)
         print(cc,x.stdout.strip())
-print('MOTOR_CONTROL_V10_GCC_CLANG_PASS')
+print('EEPROM_DUAL_PERSISTENCE_GCC_CLANG_PASS')

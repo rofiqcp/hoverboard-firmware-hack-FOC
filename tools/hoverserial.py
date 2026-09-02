@@ -12,9 +12,10 @@ Normal workflow:
     drive 100,100
     stop
 
-`start` begins CSV logging and starts the motors. `stop` commands 0,0, waits
-for the firmware rate limiter to reach an applied cmdL=0/cmdR=0, then closes
-and saves the CSV automatically.
+`start` begins CSV logging and starts the motors. `stop` is mode-aware:
+VLT/TRQ ramp their command/current to zero and then release the bridge for
+free-running, while SPD ramps its speed setpoint to zero before resetting the
+PI state and releasing the motor.
 """
 from __future__ import annotations
 
@@ -72,12 +73,15 @@ MODE_NAMES = {
     2: "SPD",
     3: "TRQ current (command in cA)",
     4: "SVPWM sensorless Id-current PI (command magnitude in A)",
+    5: "POS multi-turn Hall position",
 }
 
 
 def clamp_cmd(value: int, mode: int | None = None) -> int:
     value = int(value)
-    if mode == 4:
+    if mode == 5:
+        limit = 0
+    elif mode == 4:
         # Mode 4 command magnitude is Id target in whole amperes.
         limit = 15
     elif mode == 3:
@@ -426,14 +430,16 @@ def parse_pair(parts: list[str], mode: int | None) -> tuple[int, int]:
 
 def print_local_help() -> None:
     print("Commands:")
-    print("  mode 1|2|3|4       change mode only while fully stopped")
-    print("                     1=VLT 2=SPD 3=TRQ current 4=SVPWM sensorless Id-current PI")
+    print("  mode 1|2|3|4|5     change mode only while fully stopped")
+    print("                     1=VLT 2=SPD 3=TRQ 4=SVPWM sensorless Id PI 5=POS")
     print("  mode 3 scaling     50=0.50A, 100=1.00A, 1500=15.00A (Iq_ref, Id_ref=0)")
     print("  mode 4 scaling     start 2,2 => Id_ref=2A, Iq_ref=0; sign selects rotation direction")
     print("                     SET SVPWM_RPM 10 is the safe default; change it explicitly if needed")
     print("  start L,R          start CSV + command Left/Right motors")
+    print("  pos L R            set signed int32 position targets in mode 5")
+    print("  reset pos          reset position counters")
     print("  drive L,R          change independent Left/Right command")
-    print("  stop               ramp to zero; TRQ then controlled-brakes and resets PI")
+    print("  stop               VLT/TRQ ramp then free-run; SPD speed-ramp then free-run")
     print("  status             print latest telemetry once")
     print("  get/set/watch/...   pass firmware debug command over USART3")
     print("  quit                safe ramp-down, save CSV, exit")
@@ -477,6 +483,24 @@ def wait_until_motion_stopped(link: HoverSerial, timeout_s: float, rpm_deadband:
                 zero_frames = 0
         time.sleep(0.01)
     return False
+
+def wait_until_current_reference_relaxed(link: HoverSerial, timeout_s: float, current_deadband_cA: int = 20) -> bool:
+    """Wait until measured Iq is small before releasing torque mode to free-run."""
+    deadline = time.monotonic() + timeout_s
+    start_seq, _ = link.snapshot()
+    quiet_frames = 0
+    while time.monotonic() < deadline and not link.stop_event.is_set():
+        seq, tel = link.snapshot()
+        if seq > start_seq and tel is not None:
+            if abs(tel.iq_l_cA) <= current_deadband_cA and abs(tel.iq_r_cA) <= current_deadband_cA:
+                quiet_frames += 1
+                if quiet_frames >= 3:
+                    return True
+            else:
+                quiet_frames = 0
+        time.sleep(0.01)
+    return False
+
 
 def interactive(
     link: HoverSerial,
@@ -522,27 +546,37 @@ def interactive(
             print(f"[CSV] saved {rows} rows -> {path}")
 
     def safe_stop() -> bool:
-        # The host target becomes zero immediately, but firmware cmdL/cmdR ramp
-        # through RATE/FILTER. Keep TX alive until telemetry confirms zero.
+        # Host target becomes zero immediately; firmware has the authoritative
+        # per-mode ramp and release semantics. Keep TX alive until the legacy
+        # command path itself has reached zero.
         set_target(0, 0)
         print("[STOP] target=0,0; waiting for rate-limited cmdL/cmdR to reach 0,0 ...")
         stopped = wait_until_fully_stopped(link, stop_timeout_s)
         if stopped:
             print("[STOP] cmdL=0 cmdR=0 confirmed")
-            # A zero current target in torque mode means coast. Tell firmware
-            # this is an explicit STOP so it applies a bounded opposite-current
-            # brake, then enters zero-voltage and resets the torque PI.
-            link.debug("SET MOT_RUN 0")
-            if selected_mode == 3:
-                print("[STOP] TRQ controlled brake-to-zero active ...")
-                motion_stopped = wait_until_motion_stopped(link, stop_timeout_s)
+
+            if selected_mode == 2:
+                print("[STOP] SPD ramp-to-zero active; waiting near zero RPM before release ...")
+                motion_stopped = wait_until_motion_stopped(link, stop_timeout_s, rpm_deadband=5)
                 if motion_stopped:
-                    print("[STOP] TRQ rpmL/rpmR near zero confirmed")
+                    print("[STOP] SPD near-zero confirmed; PI reset + free-run release")
                 else:
-                    print(
-                        "[WARN] TRQ stop command is active, but Hall RPM did not "
-                        f"settle within {stop_timeout_s:.1f}s"
-                    )
+                    print("[WARN] SPD did not settle within timeout; requesting safe free-run release")
+                link.debug("SET MOT_RUN 0")
+            elif selected_mode == 3:
+                print("[STOP] TRQ Iq ramp-to-zero active; no braking ...")
+                current_relaxed = wait_until_current_reference_relaxed(link, min(stop_timeout_s, 1.5))
+                if current_relaxed:
+                    print("[STOP] TRQ current relaxed; releasing motor to free-run")
+                else:
+                    print("[WARN] TRQ current did not fully settle; requesting free-run release")
+                link.debug("SET MOT_RUN 0")
+            elif selected_mode == 1:
+                print("[STOP] VLT zero reached; releasing bridge to free-run")
+                link.debug("SET MOT_RUN 0")
+            else:
+                # Mode 4 keeps its existing Id ramp-down behavior.
+                link.debug("SET MOT_RUN 0")
         else:
             print(
                 "[WARN] zero target is still being transmitted, but telemetry did not "
@@ -556,7 +590,7 @@ def interactive(
 
     # Allow the first valid 0,0 command/telemetry frames to settle.
     print("Left/Right independent control over USART3")
-    print("mode: 1=VLT 2=SPD 3=TRQ(cA) 4=SVPWM sensorless Id-current PI (A)")
+    print("mode: 1=VLT 2=SPD 3=TRQ(cA) 4=SVPWM Id(A) 5=POS")
     print("example: mode 1 -> start 50,50 -> drive 100,100 -> stop")
     print("type 'help' for commands")
 
@@ -580,10 +614,10 @@ def interactive(
                 try:
                     if op == "mode":
                         if len(parts) != 2 or not parts[1].isdigit():
-                            raise ValueError("usage: mode 1|2|3|4")
+                            raise ValueError("usage: mode 1|2|3|4|5")
                         mode = int(parts[1])
                         if mode not in MODE_NAMES:
-                            raise ValueError("mode must be 1, 2, 3, or 4")
+                            raise ValueError("mode must be 1, 2, 3, 4, or 5")
                         if logger.active:
                             print("[ERR] stop the active run before changing mode")
                             continue
@@ -625,6 +659,17 @@ def interactive(
 
                     elif op == "stop":
                         safe_stop()
+
+                    elif op == "reset" and len(parts)==2 and parts[1].lower()=="pos":
+                        link.debug("RESETPOS"); print("[POS] reset")
+
+                    elif op in {"pos","position"}:
+                        if selected_mode!=5: raise ValueError("select mode 5 first")
+                        if len(parts)!=3: raise ValueError("usage: pos LEFT RIGHT")
+                        pl,pr=int(parts[1]),int(parts[2])
+                        if not(-2147483648<=pl<=2147483647 and -2147483648<=pr<=2147483647): raise ValueError("position must fit int32")
+                        link.debug(f"SET PSETL {pl}"); link.debug(f"SET PSETR {pr}"); link.debug("SET MOT_RUN 1")
+                        print(f"[POS] target={pl},{pr}")
 
                     elif op == "status":
                         _, tel = link.snapshot()

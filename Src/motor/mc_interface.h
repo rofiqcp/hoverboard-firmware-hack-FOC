@@ -19,6 +19,7 @@ mc_state mc_interface_get_state(void);
 mc_control_mode mc_interface_get_control_mode(void);
 void mc_interface_set_duty(float dutyCycle);
 void mc_interface_set_pid_speed(float erpm); /* VESC standard: electrical RPM */
+void mc_interface_set_pid_pos(float position_deg);
 void mc_interface_set_current(float current);
 void mc_interface_set_brake_current(float current);
 void mc_interface_set_openloop_current(float current, float rpm);
@@ -26,6 +27,7 @@ void mc_interface_set_openloop_phase(float current, float phase);
 void mc_interface_release_motor(void);
 float mc_interface_get_duty_cycle_now(void);
 float mc_interface_get_rpm(void); /* VESC standard: electrical RPM */
+float mc_interface_get_pid_pos_now(void);
 float mc_interface_get_tot_current(void);
 float mc_interface_get_tot_current_in(void);
 float mc_interface_get_id(void);
@@ -43,6 +45,11 @@ void mc_interface_get_values_motor(mc_values *values, bool is_second_motor);
 const volatile mc_configuration *mc_interface_get_configuration_motor(bool is_second_motor);
 mc_fault_code mc_interface_get_fault_motor(bool is_second_motor);
 mc_state mc_interface_get_state_motor(bool is_second_motor);
+
+/* EEPROM persistence for the VESC-visible subset that affects this board. */
+bool mc_interface_store_configuration_motor(bool is_second_motor);
+bool mc_interface_load_configuration_motor(bool is_second_motor);
+void mc_interface_restore_default_motor(bool is_second_motor, bool store_to_eeprom);
 
 #ifdef __cplusplus
 }

@@ -25,8 +25,20 @@ typedef struct {
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
     volatile int16_t m_iq_target_q4;    /* requested Iq reference */
     volatile int16_t m_id_set_q4;
-    volatile int16_t m_speed_set_rpm;
+    volatile int16_t m_speed_set_rpm;       /* active/slewed mechanical RPM */
+    volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
+    volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */
     volatile int16_t m_duty_set_permille;
+
+    volatile uint16_t m_kpq_q11, m_kiq_q16;
+    volatile uint16_t m_kpd_q11, m_kid_q16;
+    volatile uint16_t m_kps_q11, m_kis_q16, m_kds_q11;
+    volatile uint16_t m_kpp_q11, m_kip_q16, m_kdp_q11;
+    volatile int32_t m_position_counts;
+    volatile int32_t m_position_target_counts;
+    volatile int32_t m_position_min_counts;
+    volatile int32_t m_position_max_counts;
+    volatile int16_t m_current_limit_q4;
 
     /* Current state, same Q4 current-count unit as the legacy generated FOC. */
     volatile int16_t m_i_alpha_q4;
@@ -42,6 +54,7 @@ typedef struct {
     /* Electrical phase: 0..65535 = 0..360 degrees. */
     volatile uint16_t m_phase;
     volatile uint16_t m_phase_hall;
+    volatile uint16_t m_phase_hall_target;
     volatile uint16_t m_phase_openloop;
     volatile uint8_t m_phase_override;
 
@@ -62,6 +75,13 @@ typedef struct {
     int32_t m_iq_set_ramp_q16;
     int32_t m_id_integrator;
     int32_t m_speed_integrator;
+    int16_t m_speed_prev_error;
+    int32_t m_position_integrator;
+    int16_t m_position_prev_error;
+    uint8_t m_position_sat_hold;
+    int32_t m_speed_set_ramp_q16;
+    uint16_t m_speed_ramp_rpm_s;
+    uint16_t m_speed_release_rpm;
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
@@ -100,6 +120,17 @@ const volatile mc_configuration *mcpwm_foc_get_configuration(bool is_second_moto
 void mcpwm_foc_set_duty(float duty, bool is_second_motor);
 void mcpwm_foc_set_pid_speed(float rpm, bool is_second_motor);
 void mcpwm_foc_set_current(float current, bool is_second_motor);
+void mcpwm_foc_set_pid_pos(float position_deg, bool is_second_motor);
+void mcpwm_foc_set_position_counts(int32_t position_counts, bool is_second_motor);
+/* User-facing long-range position API. Left/right share the same sign convention;
+ * right is mirrored only internally. Values are full signed int32 counts. */
+void mcpwm_foc_set_position_user_counts(int32_t position_counts, bool is_second_motor);
+void mcpwm_foc_set_position_user_limits(int32_t min_counts, int32_t max_counts, bool is_second_motor);
+int32_t mcpwm_foc_get_position_user_counts(bool is_second_motor);
+int32_t mcpwm_foc_get_position_target_user_counts(bool is_second_motor);
+int32_t mcpwm_foc_get_position_min_user_counts(bool is_second_motor);
+int32_t mcpwm_foc_get_position_max_user_counts(bool is_second_motor);
+void mcpwm_foc_reset_position(bool is_second_motor);
 void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
@@ -107,6 +138,7 @@ void mcpwm_foc_release_motor(bool is_second_motor);
 void mcpwm_foc_vesc_override_touch(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active_any(void);
+void mcpwm_foc_vesc_override_clear(bool is_second_motor);
 
 /* Integer API used by the bare-metal command layer. */
 void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
@@ -125,6 +157,11 @@ float mcpwm_foc_get_phase_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
+int32_t mcpwm_foc_get_position_counts(bool is_second_motor);
+void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
+void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
+/* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
+bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);
 
 /* Hardware calibration / ISR diagnostics. */
 bool mcpwm_foc_dc_cal_done(void);

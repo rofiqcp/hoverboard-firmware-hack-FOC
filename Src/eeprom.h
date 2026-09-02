@@ -177,17 +177,20 @@
 /* Define the size of the sectors to be used */
 #define PAGE_SIZE               (uint32_t)FLASH_PAGE_SIZE  /* Page size */
 
-/* EEPROM start address in Flash */
-#define EEPROM_START_ADDRESS  ((uint32_t)ADDR_FLASH_PAGE_64) /* EEPROM emulation start address */
+/* EEPROM emulation uses the last two 1-KiB pages of the 256-KiB
+ * STM32F103RCT6 flash. The linker script reserves these pages by exposing
+ * only 254 KiB to application code, so configuration writes can never erase
+ * executable firmware. */
+#define EEPROM_START_ADDRESS  ((uint32_t)0x0803F800u) /* physical page 254 */
 
 /* Pages 0 and 1 base and end addresses */
-#define PAGE0_BASE_ADDRESS    ((uint32_t)(EEPROM_START_ADDRESS + 0x0000))
-#define PAGE0_END_ADDRESS     ((uint32_t)(EEPROM_START_ADDRESS + (PAGE_SIZE - 1)))
-#define PAGE0_ID               ADDR_FLASH_PAGE_64
+#define PAGE0_BASE_ADDRESS    ((uint32_t)0x0803F800u)
+#define PAGE0_END_ADDRESS     ((uint32_t)(PAGE0_BASE_ADDRESS + (PAGE_SIZE - 1u)))
+#define PAGE0_ID              PAGE0_BASE_ADDRESS
 
-#define PAGE1_BASE_ADDRESS    ((uint32_t)(EEPROM_START_ADDRESS + 0x10000))
-#define PAGE1_END_ADDRESS     ((uint32_t)(EEPROM_START_ADDRESS + 0x10000 + PAGE_SIZE - 1))
-#define PAGE1_ID               ADDR_FLASH_PAGE_96
+#define PAGE1_BASE_ADDRESS    ((uint32_t)0x0803FC00u) /* physical page 255 */
+#define PAGE1_END_ADDRESS     ((uint32_t)(PAGE1_BASE_ADDRESS + (PAGE_SIZE - 1u)))
+#define PAGE1_ID              PAGE1_BASE_ADDRESS
 
 /* Used Flash pages for EEPROM emulation */
 #define PAGE0                 ((uint16_t)0x0000)
@@ -209,7 +212,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)0x03)       /* USART-only profile: key, Imax, Nmax */
+#define NB_OF_VAR             ((uint8_t)0x30)       /* key + dual-motor VESC config/Hall persistence */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

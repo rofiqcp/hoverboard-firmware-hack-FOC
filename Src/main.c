@@ -76,6 +76,7 @@ static int32_t cmdLFixdt = 0;
 static int32_t cmdRFixdt = 0;
 static uint32_t buzzerTimerPrev = 0;
 static uint32_t inactivityTimeoutCounter = 0;
+static uint32_t legacyTelemetryPrevMs = 0u;
 
 static uint16_t feedbackChecksum(const SerialFeedback *f) {
   const uint8_t *p = (const uint8_t *)f;
@@ -166,6 +167,7 @@ int main(void) {
 
     readCommand();
     vesc_protocol_process_pending();
+    vesc_protocol_periodic();
     const bool vescLinkActive = vesc_protocol_link_active();
     calcAvgSpeed();
 
@@ -215,7 +217,15 @@ int main(void) {
 
     if (!vescLinkActive && (main_loop_counter % 25u) == 0u) process_debug();
 
-    if (!vescLinkActive && !timeoutFlgSerial && (main_loop_counter % 2u) == 0u && huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
+    /* Legacy 72-byte telemetry is automatic at 50 Hz when no VESC binary link
+     * owns USART3. There is intentionally no user-controlled live telemetry switch anymore.
+     * When VESC Tool is connected, unsolicited legacy bytes are suppressed and
+     * VESC realtime data is served by its standard GET_VALUES polling. */
+    const uint32_t telemetryNowMs = HAL_GetTick();
+    if (!vescLinkActive && !timeoutFlgSerial &&
+        (uint32_t)(telemetryNowMs - legacyTelemetryPrevMs) >= 20u &&
+        huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
+      legacyTelemetryPrevMs = telemetryNowMs;
       feedback.start = SERIAL_START_FRAME;
       feedback.version = 2u;
       feedback.cmdL = cmdL;
