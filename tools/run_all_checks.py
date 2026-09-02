@@ -21,7 +21,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
+        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_hall_3rev_runtime.py','tools/test_hall_3rev_runtime.c','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -150,5 +150,6 @@ if __name__ == '__main__':
     run([sys.executable,'tools/test_v16_features.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
     run([sys.executable,'tools/test_hall_detect_algorithm.py'])
+    run([sys.executable,'tools/test_hall_3rev_runtime.py'])
     run([sys.executable,'tools/test_eeprom_persistence.py'])
     print('ALL_FINAL_HOST_CHECKS_PASS')
