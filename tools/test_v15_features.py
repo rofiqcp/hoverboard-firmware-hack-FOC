@@ -16,7 +16,8 @@ halltest=(R/'tools/test_hall_detect_algorithm.c').read_text()
 assert re.search(r'#define\s+MCCONF_HALL_TIMEOUT_TICKS\s+8000u',mcc)
 assert 'm_speed_target_rpm_q16' in mch and 'erpm_to_mech_rpm_q16' in mc
 assert 'measured_mech_rpm_q16' in mc
-assert 'const int32_t e_q4_raw=(m->m_speed_set_ramp_q16-measured_q16)>>12;' in mc
+assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
+assert 'measured_mech_rpm_q16(m, second) * pp' in mc
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 
 # Hall detect fixed phase must not be overwritten by rotating mode-4 updater.
@@ -60,4 +61,4 @@ for token in ('current --motor left --amps 3','rpm --motor left --erpm 50','rt -
               'RESULT: PASS realtime polling'):
     assert token in dbg, token
 assert 'DEFAULT_HZ = 50.0' in dbg
-print('V15_FEATURE_STATIC_PASS current3A=1 rpm50_fractional=1 rt50=1 hall_isr_sweep=1 pos_int32=1 live_toggle=removed fw600_exact=1')
+print('V15_FEATURE_STATIC_PASS current3A=1 rpm50_fractional=1 speed_iq_cascade=1 rt50=1 hall_isr_sweep=1 pos_int32=1 live_toggle=removed fw600_exact=1')
