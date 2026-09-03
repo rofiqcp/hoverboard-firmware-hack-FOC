@@ -126,7 +126,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     /* Give reply bytes priority over background DMA arbitration while keeping
      * the 16-kHz FOC ISR itself at the highest NVIC priority. A UART byte DMA
      * transfer is only one byte, so this cannot starve the ADC frame. */
-    hdma_usart3_tx.Init.Priority = DMA_PRIORITY_MEDIUM;
+    hdma_usart3_tx.Init.Priority = DMA_PRIORITY_LOW;
     HAL_DMA_Init(&hdma_usart3_tx);
     __HAL_LINKDMA(uartHandle,hdmatx,hdma_usart3_tx);
 

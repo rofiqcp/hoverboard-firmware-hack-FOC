@@ -76,6 +76,9 @@ void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float br
 void mcpwm_foc_vesc_override_touch(bool second) { touch_count[second?1:0]++; }
 bool mcpwm_foc_vesc_override_active(bool second) { return touch_count[second?1:0] != 0u; }
 const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool second) { return &diag_motors[second?1:0]; }
+float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
+uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
+uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
 float mcpwm_foc_get_erpm_motor(bool second) { return second ? -50.0f : 50.0f; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}
@@ -216,6 +219,24 @@ int main(void){
     }
 
     uint8_t gvr[]={COMM_FORWARD_CAN,2u,COMM_GET_VALUES}; if(!transact(gvr,sizeof(gvr),r,&rn) || check_values_reply(r,rn,true)) return 1;
+    /* Upstream VESC: COMM_SET_DETECT selects a display mode and the 10-ms
+     * periodic thread sends unsolicited COMM_ROTOR_POSITION = deg*100000. */
+    {
+        uint8_t sd[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_OBSERVER};
+        if(!transact(sd,sizeof(sd),r,&rn)||rn!=0u)return fail("set detect local");
+        diag_motors[0].m_phase=16384u; /* 90 electrical deg */
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("rotor stream local packet");
+        int32_t pi=1; if(buffer_get_int32(r,&pi)!=9000000)return fail("rotor stream local value");
+        uint8_t sdr[]={COMM_FORWARD_CAN,2u,COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_OBSERVER};
+        if(!transact(sdr,sizeof(sdr),r,&rn)||rn!=0u)return fail("set detect right");
+        diag_motors[1].m_phase=32768u; /* 180 electrical deg */
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("rotor stream right packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=18000000)return fail("rotor stream right value");
+        uint8_t off[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_NONE};
+        if(!transact(off,sizeof(off),r,&rn))return fail("set detect off");
+    }
     uint8_t duty[5]={COMM_SET_DUTY,0,0,0,0}; k=1; buffer_append_int32(duty,12500,&k);
     if(!transact(duty,sizeof(duty),r,&rn)||rn!=0u||!nearf32(set_duty[0],0.125f,0.0001f)) return fail("local duty");
     uint8_t dutyr[7]={COMM_FORWARD_CAN,2u,COMM_SET_DUTY,0,0,0,0}; k=3; buffer_append_int32(dutyr,12500,&k);

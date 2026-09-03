@@ -46,16 +46,20 @@ for token in ('m->m_i_alpha_q4=0','m->m_i_beta_q4=0','m->m_id_q4=0','m->m_iq_q4=
               'm->m_current_in_counts=0','m->m_current_lpf_q16[0]=0'):
     assert token in off, token
 
-# RX burst handling remains 4-deep. Values traffic follows upstream VESC:
-# one request -> one reply; VESC Tool/host owns the polling cadence.
+# RX burst handling remains 4-deep. GET_VALUES stays strict request/reply;
+# the only standard unsolicited stream is COMM_ROTOR_POSITION after SET_DETECT,
+# matching vedderb/bldc's 10-ms periodic_thread behavior.
 assert re.search(r'#define\s+VESC_RX_QUEUE_DEPTH\s+4u',vp)
 assert 's_pending_payload[VESC_RX_QUEUE_DEPTH][VESC_MAX_PAYLOAD]' in vp
 assert 's_pending_count < VESC_RX_QUEUE_DEPTH' in vp
 assert 'VESC_RT_PERIOD_MS' not in vp and 's_rt_stream' not in vp
-assert 'vesc_protocol_periodic' not in vp and 'vesc_protocol_periodic();' not in main
+assert 'case COMM_SET_DETECT:' in vp and 'COMM_ROTOR_POSITION' in vp
+assert 'vesc_protocol_periodic(uint32_t now_ms)' in vp
+assert 'vesc_protocol_periodic(HAL_GetTick())' in main
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'rx fifo burst' in host and 'request/reply only' in host
+assert 'rotor stream local value' in host and 'rotor stream right value' in host
 
 
 assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'

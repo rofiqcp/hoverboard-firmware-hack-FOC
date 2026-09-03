@@ -21,11 +21,13 @@
 #define MCCONF_FOC_ID_KP_Q11                 819u
 #define MCCONF_FOC_ID_KI_Q16                 737u
 #define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
-/* VESC 6.x speed PID defaults are Kp=0.004, Ki=0.004, Kd=0.
- * These legacy-named integer fields are the persisted gain*1000 representation,
- * not direct Vq-controller coefficients. */
+/* VESC speed PID uses normalized output/current scaling. Hardware step tests at
+ * +/-750 ERPM selected Kp=0.002, Ki=0.002, Kd=0 for this Hall hoverboard: the
+ * doubled Ki removed ~3.3% steady error without excessive current; Kd stays 0
+ * because Hall-speed quantization makes a derivative term noisy. These integer
+ * fields are persisted gain*1000, not direct Vq-controller coefficients. */
 #define MCCONF_SPEED_KP_Q11                     2u
-#define MCCONF_SPEED_KI_Q16                     1u
+#define MCCONF_SPEED_KI_Q16                     2u
 #define MCCONF_SPEED_KD_Q11                     0u
 #define MCCONF_POSITION_KP_Q11                   8u
 #define MCCONF_POSITION_KI_Q16                   0u

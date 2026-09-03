@@ -52,6 +52,12 @@ static volatile uint32_t s_link_last_ms = 0u;
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
 static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
+/* VESC Tool rotor-position display stream. Upstream commands.c stores one
+ * display_position_mode per VESC instance; this dual virtual target stores the
+ * last selected endpoint so COMM_FORWARD_CAN ID2 behaves like a second VESC. */
+static volatile disp_pos_mode s_display_pos_mode = DISP_POS_MODE_NONE;
+static volatile uint8_t s_display_second = 0u;
+static uint32_t s_display_prev_ms = 0u;
 
 static void rx_reset(void) {
     s_rx_active = 0u;
@@ -74,6 +80,9 @@ void vesc_protocol_init(void) {
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
     s_last_hall_store_ok[0] = s_last_hall_store_ok[1] = 0u;
+    s_display_pos_mode = DISP_POS_MODE_NONE;
+    s_display_second = 0u;
+    s_display_prev_ms = 0u;
     app_vesc_init();
 }
 
@@ -205,6 +214,84 @@ static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     if (HAL_UART_Transmit_DMA(&huart3, tx, i) != HAL_OK) {
         (void)HAL_UART_Transmit(&huart3, tx, i, 1000u);
     }
+}
+
+static float wrap_angle_diff_deg(float a, float b) {
+    float d = a - b;
+    while (d > 180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return d;
+}
+
+static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
+    if (!out) return false;
+    const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
+    const float phase = mcpwm_foc_get_phase_motor(second);
+    switch (mode) {
+    case DISP_POS_MODE_OBSERVER:
+        /* Hall-only FOC has no sensorless observer. m_phase is the live
+         * interpolated electrical phase actually used by Park/SVPWM, which is
+         * the correct observer-equivalent display quantity on this hardware. */
+        *out = phase;
+        return true;
+    case DISP_POS_MODE_ENCODER:
+        /* No separate ABI/SPI encoder peripheral exists on this hoverboard
+         * target. Keep VESC Tool's display alive with the measured rotor phase
+         * rather than inventing an independent encoder signal. */
+        *out = phase;
+        return true;
+    case DISP_POS_MODE_PID_POS:
+        *out = phase;
+        return true;
+    case DISP_POS_MODE_PID_POS_ERROR: {
+        const int32_t dc = m->m_position_target_counts - m->m_position_counts;
+        *out = wrap_angle_diff_deg((float)dc * 60.0f, 0.0f);
+        return true;
+    }
+    case DISP_POS_MODE_ENCODER_OBSERVER_ERROR:
+        /* Encoder and observer are the same physical Hall-derived phase on this
+         * board, therefore there is no independent encoder-observer error. */
+        *out = 0.0f;
+        return true;
+    case DISP_POS_MODE_HALL_OBSERVER_ERROR: {
+        const float hall = (float)m->m_phase_hall * (360.0f / 65536.0f);
+        *out = wrap_angle_diff_deg(phase, hall);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void vesc_protocol_periodic(uint32_t now_ms) {
+    const disp_pos_mode mode = s_display_pos_mode;
+    if (mode == DISP_POS_MODE_NONE) return;
+    if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
+    s_display_prev_ms = now_ms;
+    if (!vesc_protocol_link_active()) return;
+    /* Do not delay a solicited VESC Tool reply. Upstream uses a separate packet
+     * transport thread; on this small bare-metal target we skip one 10-ms rotor
+     * sample whenever RX/TX is busy instead of blocking realtime traffic. */
+    if (s_rx_active || s_pending_count != 0u || huart3.gState != HAL_UART_STATE_READY) return;
+    const bool second = s_display_second != 0u;
+    float pos = 0.0f;
+    if (!display_rotor_pos(second, mode, &pos)) return;
+    /* Keep COMM_ROTOR_POSITION in the same user-facing wheel convention as
+     * COMM_GET_VALUES. The right power stage is mirrored, so absolute display
+     * angles are exposed as 360-internal_angle. Error modes are signed
+     * differences and must not receive this absolute-angle transform. */
+    if (second && (mode == DISP_POS_MODE_OBSERVER || mode == DISP_POS_MODE_ENCODER ||
+                   mode == DISP_POS_MODE_PID_POS)) {
+        if (pos > 0.0f) {
+            pos = 360.0f - pos;
+            if (pos >= 360.0f) pos = 0.0f;
+        }
+    }
+    uint8_t b[5];
+    int32_t i = 0;
+    b[i++] = COMM_ROTOR_POSITION;
+    buffer_append_int32(b, (int32_t)(pos * 100000.0f), &i);
+    uart_send_payload(b, (uint16_t)i);
 }
 
 static void read_uuid(uint8_t out[12], bool second) {
@@ -530,7 +617,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[128];
+        uint8_t b[136];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         struct {
@@ -630,6 +717,8 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
               buffer_append_int32(b,(int32_t)(mr>=0.0f?mr*1000.0f+0.5f:mr*1000.0f-0.5f),&i);
               buffer_append_int32(b,(int32_t)(orpm>=0.0f?orpm*1000.0f+0.5f:orpm*1000.0f-0.5f),&i); }
             buffer_append_uint32(b,s_rx_queue_drop,&i);
+            buffer_append_uint32(b,mcpwm_foc_get_isr_cycles(),&i);
+            buffer_append_uint32(b,mcpwm_foc_get_isr_cycles_max(),&i);
         }
         uart_send_payload(b, (uint16_t)i);
     }
@@ -658,6 +747,18 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_GET_VALUES_SETUP_SELECTIVE:
         reply_values_setup(second, true, d, n);
+        break;
+    case COMM_SET_DETECT:
+        if (n >= 1u) {
+            const uint8_t raw_mode = d[0];
+            if (raw_mode <= (uint8_t)DISP_POS_MODE_HALL_OBSERVER_ERROR) {
+                s_display_second = second ? 1u : 0u;
+                s_display_pos_mode = (disp_pos_mode)raw_mode;
+                s_display_prev_ms = HAL_GetTick();
+            } else {
+                s_display_pos_mode = DISP_POS_MODE_NONE;
+            }
+        }
         break;
     case COMM_SET_DUTY:
         if (n >= 4u) {

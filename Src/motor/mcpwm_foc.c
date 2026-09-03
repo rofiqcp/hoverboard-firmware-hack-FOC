@@ -130,12 +130,16 @@ static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
         m->m_hall_ticks <= MCCONF_HALL_TIMEOUT_TICKS) {
         const uint32_t pp = motor_pole_pairs(second);
         if (pp > 0u) {
-            int64_t q16 = ((int64_t)PWM_FREQ * 10LL * 65536LL) /
-                          ((int64_t)m->m_hall_period * (int64_t)pp);
+            /* Cortex-M3 64-bit integer division is a software helper and was
+             * one of the largest speed-loop ISR costs. Q12 mechanical RPM is
+             * already far finer than Hall timing resolution, so compute with a
+             * single 32-bit divide then promote to Q16. Numerator 16000*10*4096
+             * is 655,360,000 and safely fits uint32_t. */
+            const uint32_t den = (uint32_t)m->m_hall_period * pp;
+            uint32_t mag_q12 = ((uint32_t)PWM_FREQ * 10u * 4096u) / den;
+            int32_t q16 = (int32_t)(mag_q12 << 4);
             if (m->m_hall_direction < 0) q16 = -q16;
-            if (q16 > INT32_MAX) q16 = INT32_MAX;
-            if (q16 < INT32_MIN) q16 = INT32_MIN;
-            return (int32_t)q16;
+            return q16;
         }
     }
     return (int32_t)m->m_rpm << 16;
@@ -150,9 +154,6 @@ static int16_t voltage_circle_q_limit(int16_t vd, int16_t vmax) {
     return (int16_t)foc_isqrt_u32(max2 - d2);
 }
 
-static int16_t modulo_i16(int16_t m, int16_t classes) {
-    return (int16_t)(((m % classes) + classes) % classes);
-}
 static void foc_isr_monitor_end(uint32_t start) {
     uint32_t elapsed = DWT->CYCCNT - start;
     foc_isr_cycles = elapsed;
@@ -1120,6 +1121,26 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     m->m_phase=(m->m_phase_override && (m->m_control_mode==CONTROL_MODE_OPENLOOP || m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE)) ?
         m->m_phase_openloop : m->m_phase_hall;
 
+    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
+    if (!source_enabled || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
+        /* Fast OFF path: Hall/phase tracking above remains live for VESC rotor
+         * telemetry, but an undriven bridge does not need Clarke/Park/LPF/PI or
+         * SVPWM every 62.5 us. This preserves idle position while returning most
+         * of the ISR budget to USART3/main-loop processing. */
+        m->m_state=MC_STATE_OFF;
+        reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0;
+        m->m_speed_sat_hold=0; reset_position_pid(m);
+        m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
+        m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
+        m->m_i_alpha_q4=0; m->m_i_beta_q4=0; m->m_id_q4=0; m->m_iq_q4=0;
+        m->m_current_in_counts=0; m->m_current_lpf_q16[0]=0; m->m_current_lpf_q16[1]=0;
+        m->m_vd=0; m->m_vq=0;
+        m->m_pwm_a=0; m->m_pwm_b=0; m->m_pwm_c=0; m->m_duty_now_permille=0;
+        m->m_ccr_a=pwm_res/2u; m->m_ccr_b=pwm_res/2u; m->m_ccr_c=pwm_res/2u;
+        m->m_isr_count++;
+        return;
+    }
+
     const int16_t i0_q4=phase_current_counts_to_q4(i0_counts);
     const int16_t i1_q4=phase_current_counts_to_q4(i1_counts);
     foc_ab_t ab; if(second)foc_clarke_bc_q4(i0_q4,i1_q4,&ab); else foc_clarke_ab_q4(i0_q4,i1_q4,&ab);
@@ -1131,21 +1152,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     m->m_iq_q4=filt.q; m->m_id_q4=filt.d; m->m_current_in_counts=idc_counts;
 
     foc_dq_t v={m->m_vd,m->m_vq};
-    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
-    if (!source_enabled || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
-        m->m_state=MC_STATE_OFF; reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; reset_position_pid(m);
-        m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
-        m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
-        /* With the bridge undriven the phase-current ADC samples are not a
-         * meaningful motor current. VESC 6.00 explicitly reports zero current
-         * in this state; clearing the LPF also prevents stale 30-40 A dq values
-         * from leaking into Realtime Data immediately after Hall detection. */
-        m->m_i_alpha_q4=0; m->m_i_beta_q4=0; m->m_id_q4=0; m->m_iq_q4=0;
-        m->m_current_in_counts=0;
-        m->m_current_lpf_q16[0]=0; m->m_current_lpf_q16[1]=0;
-        v.q=0;v.d=0;
-    } else {
-        m->m_state=MC_STATE_RUNNING;
+    m->m_state=MC_STATE_RUNNING;
         if (m->m_control_mode==CONTROL_MODE_DUTY) {
             /* Mode 1 was already proven good; retain direct-voltage behavior.
              * Mode-2 zero speed also lands here with duty=0, giving Vd=Vq=0. */
@@ -1227,7 +1234,6 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
              * the Iq PI, so its anti-windup sees the real available headroom. */
             foc_vector_limit(&v,v_closed);
         }
-    }
 control_done:
     m->m_vd=v.d; m->m_vq=v.q;
     foc_abc_t pwm; foc_centered_svpwm(&v,m->m_phase,&pwm);
@@ -1270,10 +1276,15 @@ void mcpwm_foc_adc_int_handler(void) {
             mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwmr,motorRunReq!=0u,svpwmOpenloopRpm,true);
         }
     }
-    const bool control_update=(s_foc_control_div==0u);
+    /* Keep each motor at the configured 5.33-kHz regulator cadence, but do
+     * not execute both heavy PI updates on the same 16-kHz ADC interrupt. With
+     * DIV=3: left updates slot 0, right slot 1, slot 2 is estimator/SVPWM only. */
+    const uint8_t control_slot=s_foc_control_div;
     if(++s_foc_control_div>=MCCONF_FOC_CONTROL_DIV)s_foc_control_div=0u;
-    motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,control_update);
-    motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,control_update);
+    const bool update_left=(control_slot==0u);
+    const bool update_right=(MCCONF_FOC_CONTROL_DIV<=1u)?update_left:(control_slot==1u);
+    motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left);
+    motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,update_right);
     foc_iqL_q4=m_motor_1.m_iq_q4;foc_idL_q4=m_motor_1.m_id_q4;
     foc_iqR_q4=m_motor_2.m_iq_q4;foc_idR_q4=m_motor_2.m_id_q4;
     LEFT_TIM->LEFT_TIM_U=m_motor_1.m_ccr_a;LEFT_TIM->LEFT_TIM_V=m_motor_1.m_ccr_b;LEFT_TIM->LEFT_TIM_W=m_motor_1.m_ccr_c;
@@ -1393,10 +1404,18 @@ void DMA1_Channel1_IRQHandler(void) {
     s_overrun=1;
     mcpwm_foc_adc_int_handler();
 
-    /* Odom follows the already validated Hall transition accumulator. Right is
-     * normalized to the same positive vehicle direction as VESC/CAN telemetry. */
-    odom_l = modulo_i16((int16_t)(m_motor_1.m_position_counts % 9000), 9000);
-    odom_r = modulo_i16((int16_t)((-m_motor_2.m_position_counts) % 9000), 9000);
+    /* Odom follows the validated Hall accumulator, but integer division is far
+     * too expensive to execute on every 16-kHz frame. s_foc_control_div==0 here
+     * means the just-finished slot was slot 2 (the no-PI slot), so odom still
+     * updates at 5.33 kHz without extending either motor's regulator peak ISR. */
+    if (s_foc_control_div == 0u) {
+        int32_t ol = m_motor_1.m_position_counts % 9000;
+        int32_t oraw = (-m_motor_2.m_position_counts) % 9000;
+        if (ol < 0) ol += 9000;
+        if (oraw < 0) oraw += 9000;
+        odom_l = (int16_t)ol;
+        odom_r = (int16_t)oraw;
+    }
     s_overrun=0;
     foc_isr_monitor_end(focIsrStartCycles);
 }

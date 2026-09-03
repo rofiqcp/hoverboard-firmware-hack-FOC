@@ -197,6 +197,8 @@ class Diag:
     motor_mech_rpm: float | None = None
     output_rpm: float | None = None
     rx_queue_drops: int | None = None
+    foc_isr_cycles: int | None = None
+    foc_isr_cycles_max: int | None = None
 
     def short(self) -> str:
         return (
@@ -257,6 +259,8 @@ def parse_diag(payload: bytes) -> Diag:
                    motor_mech_rpm=mech_milli/1000.0, output_rpm=out_milli/1000.0)
     if len(payload) >= 128:
         ext["rx_queue_drops"] = struct.unpack_from(">I", payload, 124)[0]
+    if len(payload) >= 136:
+        ext["foc_isr_cycles"], ext["foc_isr_cycles_max"] = struct.unpack_from(">2I", payload, 128)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),

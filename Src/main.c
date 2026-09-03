@@ -76,7 +76,7 @@ static int16_t cmdRRateFixdt = 0;
 static int32_t cmdLFixdt = 0;
 static int32_t cmdRFixdt = 0;
 static uint32_t buzzerTimerPrev = 0;
-static uint32_t inactivityTimeoutCounter = 0;
+// static uint32_t inactivityTimeoutCounter = 0;
 static uint32_t legacyTelemetryPrevMs = 0u;
 
 static uint16_t feedbackChecksum(const SerialFeedback *f) {
@@ -171,6 +171,7 @@ int main(void) {
      * control-loop period of latency to every UART transaction. FOC itself
      * remains interrupt-driven and is not moved into this path. */
     vesc_protocol_process_pending();
+    vesc_protocol_periodic(HAL_GetTick());
 
     if ((buzzerTimer - buzzerTimerPrev) <= (16u * DELAY_IN_MAIN_LOOP)) continue;
 
@@ -294,9 +295,9 @@ int main(void) {
       beepCount(0, 0, 0);
     }
 
-    if (abs(cmdL) > 50 || abs(cmdR) > 50) inactivityTimeoutCounter = 0;
-    else ++inactivityTimeoutCounter;
-    if (inactivityTimeoutCounter > (INACTIVITY_TIMEOUT * 60u * 1000u) / (DELAY_IN_MAIN_LOOP + 1u)) poweroff();
+    // if (abs(cmdL) > 50 || abs(cmdR) > 50) inactivityTimeoutCounter = 0;
+    // else ++inactivityTimeoutCounter;
+    // if (inactivityTimeoutCounter > (INACTIVITY_TIMEOUT * 60u * 1000u) / (DELAY_IN_MAIN_LOOP + 1u)) poweroff();
 
     buzzerTimerPrev = buzzerTimer;
     ++main_loop_counter;

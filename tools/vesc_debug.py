@@ -143,7 +143,8 @@ def print_diag(prefix: str, d: Diag) -> None:
     if d.motor_poles is not None:
         print(f"  CURRENT_OFFSETS phase0={d.current_offset_phase0} phase1={d.current_offset_phase1} dc={d.current_offset_dc} "
               f"DRIVETRAIN poles={d.motor_poles} pp={d.pole_pairs} gear={d.gear_ratio:.3f} "
-              f"motor_rpm={d.motor_mech_rpm:.3f} output_rpm={d.output_rpm:.3f} qdrop={d.rx_queue_drops}")
+              f"motor_rpm={d.motor_mech_rpm:.3f} output_rpm={d.output_rpm:.3f} qdrop={d.rx_queue_drops} "
+              f"isr={d.foc_isr_cycles}/{d.foc_isr_cycles_max}cy")
 
 
 def hall_table_valid(table: list[int]) -> tuple[bool, str]:
@@ -388,7 +389,11 @@ def cmd_rpm(args, link: VescDual) -> int:
     dcfg = link.diag(right)
     pp = dcfg.pole_pairs or POLE_PAIRS
     erpm = int(round(args.erpm if args.erpm is not None else args.mech_rpm * pp))
-    print(f"RPM target = {erpm} ERPM ({erpm/pp:.3f} motor mechanical RPM @ {pp} pole-pair, gear={dcfg.gear_ratio or 1.0:.3f})")
+    gear = dcfg.gear_ratio or 1.0
+    motor_rpm = erpm / pp
+    output_rpm = motor_rpm / gear
+    print(f"RPM target = {erpm} ERPM | poles={2*pp} pp={pp} | "
+          f"motor={motor_rpm:.3f} RPM | gear={gear:.3f} | output={output_rpm:.3f} RPM")
     return run_motion_test(args, link, motor, COMM_SET_RPM, erpm, f"RPM {erpm} ERPM")
 
 
