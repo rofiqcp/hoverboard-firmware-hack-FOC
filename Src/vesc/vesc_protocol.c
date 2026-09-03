@@ -18,7 +18,7 @@
 #define VESC_LINK_HOLD_MS        2000u
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
-#define VESC_RX_QUEUE_DEPTH          4u
+#define VESC_RX_QUEUE_DEPTH          8u
 
 /* Project-specific extensions are transported inside standard
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
@@ -488,6 +488,9 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
         if (c.l_current_max > (float)I_MOT_MAX) c.l_current_max = (float)I_MOT_MAX;
         if (c.l_current_min > -0.1f) c.l_current_min = -0.1f;
         if (c.l_current_min < -(float)I_MOT_MAX) c.l_current_min = -(float)I_MOT_MAX;
+        if (!(c.l_abs_current_max >= c.l_current_max) || c.l_abs_current_max > MCCONF_L_ABS_CURRENT_MAX)
+            c.l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
+        if (!(c.l_max_duty > 0.0f) || c.l_max_duty > MCCONF_L_MAX_DUTY) c.l_max_duty=MCCONF_L_MAX_DUTY;
         /* Physical current sample/PI topology is fixed for this board. Motor
          * poles and drivetrain ratio are standard VESC setup fields and are live. */
         c.foc_sensor_mode = FOC_SENSOR_MODE_HALL;
@@ -521,7 +524,9 @@ static void set_appconf(bool second, const uint8_t *data, uint16_t len) {
     app_configuration tmp = *app_vesc_get_configuration(second);
     const int32_t expected = confgenerator_serialize_appconf(s_config_payload, &tmp);
     if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_appconf(data, &tmp)) {
-        (void)app_vesc_set_configuration(second, &tmp);
+        /* VESC Tool SET_APPCONF is persistent. Apply first, then store only the
+         * implemented application subset into EEPROM-emulation slots. */
+        if (app_vesc_set_configuration(second, &tmp)) (void)app_vesc_store_configuration(second);
     }
     uint8_t ack = COMM_SET_APPCONF;
     uart_send_payload(&ack, 1u);
@@ -617,7 +622,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[136];
+        uint8_t b[176];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         struct {
@@ -627,6 +632,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             int32_t pos,pos_target,pos_min,pos_max;
             uint16_t phase,phase_hall,phase_target,hall_period,hall_ticks;
             uint32_t hall_invalid,current_trips,period_rejects,sequence_rejects;
+            uint32_t phase_trips,dc_trips;
+            uint8_t phase_streak,last_trip_source;
+            int16_t last_trip_p0,last_trip_p1,last_trip_p2,last_trip_dc,last_trip_duty;
+            int16_t driven_off0,driven_off1,driven_offdc;
+            uint16_t driven_samples; uint8_t driven_valid,driven_cal;
         } ds;
         __disable_irq();
         ds.mode=m->m_control_mode; ds.state=m->m_state; ds.fault=m->m_fault;
@@ -640,6 +650,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         ds.hall_period=m->m_hall_period; ds.hall_ticks=m->m_hall_ticks;
         ds.hall_invalid=m->m_hall_invalid_transition_count; ds.current_trips=m->m_current_trip_count;
         ds.period_rejects=m->m_hall_period_reject_count; ds.sequence_rejects=m->m_hall_sequence_reject_count;
+        ds.phase_trips=m->m_phase_trip_count; ds.dc_trips=m->m_dc_trip_count; ds.phase_streak=m->m_phase_overcurrent_streak;
+        ds.last_trip_source=m->m_last_trip_source; ds.last_trip_p0=m->m_last_trip_phase0_counts; ds.last_trip_p1=m->m_last_trip_phase1_counts;
+        ds.last_trip_p2=m->m_last_trip_phase2_counts; ds.last_trip_dc=m->m_last_trip_dc_counts; ds.last_trip_duty=m->m_last_trip_duty_permille;
+        ds.driven_off0=m->m_driven_offset0; ds.driven_off1=m->m_driven_offset1; ds.driven_offdc=m->m_driven_offsetdc;
+        ds.driven_samples=m->m_driven_offset_samples; ds.driven_valid=m->m_driven_offset_valid; ds.driven_cal=m->m_driven_offset_calibrating;
         __enable_irq();
         const uint16_t pp=mcpwm_foc_get_pole_pairs(second);
         float erpm_f=(float)ds.rpm*(float)pp;
@@ -719,6 +734,16 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint32(b,s_rx_queue_drop,&i);
             buffer_append_uint32(b,mcpwm_foc_get_isr_cycles(),&i);
             buffer_append_uint32(b,mcpwm_foc_get_isr_cycles_max(),&i);
+            /* High-duty ABS-overcurrent diagnostics. Keep legacy fields first so
+             * older tools remain compatible; these bytes identify whether the
+             * last FAULT_CODE_ABS_OVER_CURRENT came from phase or DC sensing. */
+            buffer_append_uint32(b,ds.phase_trips,&i); buffer_append_uint32(b,ds.dc_trips,&i);
+            b[i++]=ds.phase_streak; b[i++]=ds.last_trip_source;
+            buffer_append_int16(b,ds.last_trip_p0,&i); buffer_append_int16(b,ds.last_trip_p1,&i);
+            buffer_append_int16(b,ds.last_trip_p2,&i); buffer_append_int16(b,ds.last_trip_dc,&i);
+            buffer_append_int16(b,ds.last_trip_duty,&i);
+            buffer_append_int16(b,ds.driven_off0,&i); buffer_append_int16(b,ds.driven_off1,&i); buffer_append_int16(b,ds.driven_offdc,&i);
+            buffer_append_uint16(b,ds.driven_samples,&i); b[i++]=ds.driven_valid; b[i++]=ds.driven_cal;
         }
         uart_send_payload(b, (uint16_t)i);
     }

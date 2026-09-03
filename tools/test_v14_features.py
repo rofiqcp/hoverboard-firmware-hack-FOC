@@ -50,7 +50,7 @@ assert 'mc_interface_load_configuration_motor(bool second)' in mci
 # EEPROM must never overlap executable flash.
 assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh
 assert 'FLASH_PAGE_SIZE != 0x800U' in eeh
-assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x31\)',eeh)
+assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)123u\)',eeh)
 assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*252K',ld)
 # Stock SET MCCONF ACK and default/read separation.
 assert 'uint8_t ack = COMM_SET_MCCONF' in vp

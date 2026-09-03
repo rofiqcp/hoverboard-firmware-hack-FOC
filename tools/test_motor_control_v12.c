@@ -45,13 +45,13 @@ static void set_halls(uint8_t l,uint8_t r){
 int main(void){
     mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
 
-    /* MODE 1: 100 = 10% direct voltage while running. Explicit stop releases
-     * the motor instead of holding a zero-voltage vector. */
+    /* MODE 1: VESC-style duty limits modulation while inner current PI stays active. */
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
-    mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_vq!=1440)return fail("mode1 100 permille voltage scaling");
-    if(m_motor_1.m_vd!=0)return fail("mode1 Vd must be zero");
-    if(m_motor_2.m_vq!=-1440)return fail("mode1 right internal mirror sign");
+    mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 left current target");
+    if(m_motor_2.m_iq_target_q4!=-MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 right current target");
+    if(abs(m_motor_1.m_vq)>1440 || abs(m_motor_2.m_vq)>1440)return fail("mode1 duty voltage ceiling");
+    if(m_motor_1.m_vd!=0 || m_motor_2.m_vd!=0)return fail("mode1 Vd must be zero");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode1 STOP must release/free-run");
 
@@ -68,6 +68,32 @@ int main(void){
     DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR & TIM_BDTR_MOE)!=0u || (RIGHT_TIM->BDTR & TIM_BDTR_MOE)!=0u)
         return fail("free-run release must disable MOE/high impedance");
+
+    /* Driven current-offset calibration must hold a true zero-modulation vector
+     * before duty/current control is allowed to energize the motor. This guards
+     * against startup-current spikes caused by measuring offsets under torque. */
+    mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    ctrlModReq=VLT_MODE; pwml=100; pwmr=0;
+    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
+    /* Inject a repeatable driven offset different from the undriven 2000 count
+     * baseline. The bridge should be on at 50/50/50 while these samples accrue. */
+    adc_buffer.rlA=2010; adc_buffer.rlB=2020; adc_buffer.dcl=2030;
+    DMA1_Channel1_IRQHandler(); /* latch legacy command into CONTROL_MODE_DUTY */
+    DMA1_Channel1_IRQHandler(); /* enter driven-offset zero-vector phase */
+    if(!m_motor_1.m_driven_offset_calibrating || (LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)
+        return fail("driven offset calibration must arm zero-vector bridge");
+    for(uint32_t i=0;i<MCCONF_DRIVEN_OFFSET_CAL_SAMPLES;i++){
+        if(m_motor_1.m_ccr_a!=1000u || m_motor_1.m_ccr_b!=1000u || m_motor_1.m_ccr_c!=1000u ||
+           m_motor_1.m_duty_now_permille!=0)
+            return fail("driven offset calibration must hold 50pct zero vector");
+        DMA1_Channel1_IRQHandler();
+    }
+    if(!m_motor_1.m_driven_offset_valid || m_motor_1.m_driven_offset_calibrating)
+        return fail("driven offset calibration must complete");
+    if(m_motor_1.m_driven_offset0!=2010 || m_motor_1.m_driven_offset1!=2020 || m_motor_1.m_driven_offsetdc!=2030)
+        return fail("driven offset average mismatch");
 
     /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
      * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
@@ -173,6 +199,48 @@ int main(void){
     ctrlModReq=SVPWM_MODE; pwml=10; pwmr=-10;
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_openloop_id_target_q4!=SVPWM_MAX_ID_A*FOC_CURRENT_Q4_PER_A)return fail("mode4 Id safety clamp");
+
+    /* DUTY 95% regression: VESC/legacy duty sources must clamp at 0.95,
+     * use the current PI, and generate exactly 950 permille modulation without
+     * violating the 100-count ADC sampling margin. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    ctrlModReq=VLT_MODE; pwml=1000; pwmr=0;
+    for(int i=0;i<32000;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_duty_set_permille!=950)return fail("duty command must clamp to 95pct");
+    if(m_motor_1.m_duty_now_permille!=950)return fail("duty actual modulation must reach 95pct");
+    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("duty target must stay current-limited");
+    if(m_motor_1.m_ccr_a<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_a>2000-MCCONF_PWM_MARGIN_COUNTS ||
+       m_motor_1.m_ccr_b<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_b>2000-MCCONF_PWM_MARGIN_COUNTS ||
+       m_motor_1.m_ccr_c<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_c>2000-MCCONF_PWM_MARGIN_COUNTS)
+        return fail("duty95 CCR violates ADC margin");
+
+    /* Above 80% a single low-side shunt glitch must not create a false ABS OC,
+     * but persistent phase over-current must still fault on sample 3. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
+    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
+    for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("duty95 bridge did not arm");
+    adc_buffer.rlA=950; /* +1050 counts = 21 A, above 20 A absolute phase limit */
+    for(int k=1;k<=2;k++){
+        m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
+        if(m_motor_1.m_fault!=FAULT_CODE_NONE)return fail("high-duty phase glitch faulted before qualifier");
+        if(m_motor_1.m_phase_overcurrent_streak!=(uint8_t)k)return fail("high-duty OC streak mismatch");
+    }
+    m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
+    if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("persistent high-duty phase OC must fault");
+    if(m_motor_1.m_phase_trip_count!=1u || m_motor_1.m_dc_trip_count!=0u || m_motor_1.m_last_trip_source!=1u)
+        return fail("phase OC diagnostic split");
+
+    /* DC-link level-2 protection remains immediate even at high duty. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
+    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
+    for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
+    adc_buffer.dcl=1100; /* +900 counts = 18 A > 17 A DC hard limit */
+    m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
+    if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("DC-link OC must fault immediately");
+    if(m_motor_1.m_dc_trip_count!=1u || m_motor_1.m_last_trip_source!=2u)return fail("DC OC diagnostic split");
 
     /* Reverse Hall convention remains the generated-controller pos+1 rule. */
     mcpwm_foc_init(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);

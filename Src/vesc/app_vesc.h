@@ -9,6 +9,8 @@ void app_vesc_init(void);
 void app_vesc_defaults(app_configuration *conf, uint8_t controller_id);
 const app_configuration *app_vesc_get_configuration(bool second);
 bool app_vesc_set_configuration(bool second, const app_configuration *conf);
+bool app_vesc_store_configuration(bool second);
+bool app_vesc_load_configuration(bool second);
 void app_vesc_process(uint32_t now_ms);
 
 float app_vesc_adc_decoded(bool second_channel);

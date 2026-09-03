@@ -47,13 +47,20 @@ static void set_halls(uint8_t l,uint8_t r){
 int main(void){
     mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
 
-    /* MODE 1: 100 = 10% direct voltage while running. Explicit stop releases
-     * the motor instead of holding a zero-voltage vector. */
+    /* MODE 1 follows VESC FOC duty architecture: duty limits modulation while
+     * the inner current PI remains active. It must never bypass l_current_max. */
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
-    mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_vq!=1440)return fail("mode1 100 permille voltage scaling");
-    if(m_motor_1.m_vd!=0)return fail("mode1 Vd must be zero");
-    if(m_motor_2.m_vq!=-1440)return fail("mode1 right internal mirror sign");
+    mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 left current-limit target");
+    if(m_motor_2.m_iq_target_q4!=-MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 right current-limit target");
+    if(abs(m_motor_1.m_vq)>1440 || abs(m_motor_2.m_vq)>1440)return fail("mode1 10pct modulation ceiling");
+    if(m_motor_1.m_vd!=0 || m_motor_2.m_vd!=0)return fail("mode1 Id target must stay zero");
+    mc_configuration duty_conf=m_motor_1.m_conf; duty_conf.l_current_max=2.0f; duty_conf.l_current_min=-2.0f;
+    mcpwm_foc_set_configuration(&duty_conf,false);
+    mcpwm_foc_set_duty(0.20f,false);
+    mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler();
+    if(abs(m_motor_1.m_iq_target_q4)>1600)return fail("mode1 must honor 2A mcconf current limit");
+    if(abs(m_motor_1.m_vq)>2880)return fail("mode1 20pct modulation ceiling");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode1 STOP must release/free-run");
 

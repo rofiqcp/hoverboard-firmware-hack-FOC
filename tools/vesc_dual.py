@@ -199,6 +199,21 @@ class Diag:
     rx_queue_drops: int | None = None
     foc_isr_cycles: int | None = None
     foc_isr_cycles_max: int | None = None
+    phase_trip_count: int | None = None
+    dc_trip_count: int | None = None
+    phase_overcurrent_streak: int | None = None
+    last_trip_source: int | None = None
+    last_trip_phase0_a: float | None = None
+    last_trip_phase1_a: float | None = None
+    last_trip_phase2_a: float | None = None
+    last_trip_dc_a: float | None = None
+    last_trip_duty: float | None = None
+    driven_offset0: int | None = None
+    driven_offset1: int | None = None
+    driven_offset_dc: int | None = None
+    driven_offset_samples: int | None = None
+    driven_offset_valid: bool | None = None
+    driven_offset_calibrating: bool | None = None
 
     def short(self) -> str:
         return (
@@ -261,6 +276,20 @@ def parse_diag(payload: bytes) -> Diag:
         ext["rx_queue_drops"] = struct.unpack_from(">I", payload, 124)[0]
     if len(payload) >= 136:
         ext["foc_isr_cycles"], ext["foc_isr_cycles_max"] = struct.unpack_from(">2I", payload, 128)
+    if len(payload) >= 156:
+        phase_trips, dc_trips = struct.unpack_from(">2I", payload, 136)
+        phase_streak, last_source = struct.unpack_from(">2B", payload, 144)
+        lp0, lp1, lp2, ldc, lduty = struct.unpack_from(">5h", payload, 146)
+        ext.update(phase_trip_count=phase_trips, dc_trip_count=dc_trips,
+                   phase_overcurrent_streak=phase_streak, last_trip_source=last_source,
+                   last_trip_phase0_a=lp0/50.0, last_trip_phase1_a=lp1/50.0,
+                   last_trip_phase2_a=lp2/50.0, last_trip_dc_a=ldc/50.0,
+                   last_trip_duty=lduty/1000.0)
+    if len(payload) >= 166:
+        do0, do1, dodc, dsamp, dvalid, dcal = struct.unpack_from(">3hH2B", payload, 156)
+        ext.update(driven_offset0=do0, driven_offset1=do1, driven_offset_dc=dodc,
+                   driven_offset_samples=dsamp, driven_offset_valid=bool(dvalid),
+                   driven_offset_calibrating=bool(dcal))
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),

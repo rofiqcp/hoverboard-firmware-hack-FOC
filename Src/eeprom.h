@@ -216,7 +216,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)0x31)       /* + runtime poles/gear persistence */
+#define NB_OF_VAR             ((uint8_t)123u)       /* 49 MC slots + 74 App Config slots */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

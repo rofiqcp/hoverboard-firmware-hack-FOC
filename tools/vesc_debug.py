@@ -61,22 +61,30 @@ def send_one(link: VescDual, motor: str, cmd: int, raw: int) -> None:
 
 
 def release_one(link: VescDual, motor: str) -> None:
-    # Kirim zero-current beberapa kali, lalu BERHENTI refresh agar ownership
-    # VESC benar-benar timeout. Tunggu konfirmasi diagnostic sebelum test berikut.
+    # Zero-current lalu berhenti refresh. Firmware sengaja mempertahankan flag
+    # ownership setelah timeout agar input legacy tidak mengambil alih; karena
+    # itu syarat release yang benar adalah state OFF dan telemetry sudah settle,
+    # bukan override==0.
     is_right = motor == "right"
     for _ in range(3):
         send_one(link, motor, COMM_SET_CURRENT, 0)
         time.sleep(0.02)
-    deadline = time.monotonic() + 1.2
+    deadline = time.monotonic() + 1.5
+    settled = 0
     while time.monotonic() < deadline:
         try:
             d = link.diag(is_right)
-            if not d.override and d.state == 0:
-                return
+            v = link.values(is_right)
+            if d.state == 0 and abs(v.duty) < 0.002 and abs(v.current_motor) < 0.6:
+                settled += 1
+                if settled >= 3:
+                    return
+            else:
+                settled = 0
         except Exception:
-            pass
-        time.sleep(0.05)
-    print(f"[WARN] {motor} ownership belum release setelah 1.2 s")
+            settled = 0
+        time.sleep(0.04)
+    print(f"[WARN] {motor} belum OFF/settle setelah 1.5 s")
 
 
 class Refresher:
@@ -145,6 +153,14 @@ def print_diag(prefix: str, d: Diag) -> None:
               f"DRIVETRAIN poles={d.motor_poles} pp={d.pole_pairs} gear={d.gear_ratio:.3f} "
               f"motor_rpm={d.motor_mech_rpm:.3f} output_rpm={d.output_rpm:.3f} qdrop={d.rx_queue_drops} "
               f"isr={d.foc_isr_cycles}/{d.foc_isr_cycles_max}cy")
+        if d.phase_trip_count is not None:
+            print(f"  OC_DIAG total={d.current_trips} phase={d.phase_trip_count} dc={d.dc_trip_count} "
+                  f"streak={d.phase_overcurrent_streak} lastsrc=0x{d.last_trip_source:02x} "
+                  f"lastI=[{d.last_trip_phase0_a:.2f},{d.last_trip_phase1_a:.2f},{d.last_trip_phase2_a:.2f}]A "
+                  f"lastDC={d.last_trip_dc_a:.2f}A lastDuty={100*d.last_trip_duty:.1f}%")
+        if d.driven_offset0 is not None:
+            print(f"  DRIVEN_OFFSETS raw=[{d.driven_offset0},{d.driven_offset1},{d.driven_offset_dc}] "
+                  f"valid={int(d.driven_offset_valid)} calibrating={int(d.driven_offset_calibrating)} samples={d.driven_offset_samples}")
 
 
 def hall_table_valid(table: list[int]) -> tuple[bool, str]:

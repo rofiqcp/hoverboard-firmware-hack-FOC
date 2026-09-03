@@ -3,6 +3,9 @@
 #include "stm32f1xx_hal.h"
 #include "config.h"
 #include "defines.h"
+#ifdef STM32F103xE
+#include "eeprom.h"
+#endif
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
 #include "vesc/app_vesc.h"
@@ -68,6 +71,111 @@ static float throttle_curve(float val, float curve_acc, float curve_brake, int m
     return val < 0.0f ? -ret : ret;
 }
 
+
+#ifdef STM32F103xE
+/* App Config persistence uses EEPROM-emulation slots 49..122. Only the
+ * application fields implemented by this board are stored; unsupported VESC
+ * application families stay at safe defaults. Each motor gets 37 16-bit slots. */
+#define APP_EE_BASE              49u
+#define APP_EE_STRIDE            37u
+#define APP_EE_SIGNATURE         0xA601u
+#define APP_EE_KEY_SLOT          0u
+#define APP_EE_KEY_VALUE         FLASH_WRITE_KEY
+extern uint16_t VirtAddVarTab[NB_OF_VAR];
+
+static bool app_ee_read(uint8_t slot, uint16_t *v) {
+    return slot < NB_OF_VAR && EE_ReadVariable(VirtAddVarTab[slot], v) == 0u;
+}
+static bool app_ee_write_if_changed(uint8_t slot, uint16_t v) {
+    uint16_t old = 0u;
+    if (app_ee_read(slot, &old) && old == v) return true;
+    return slot < NB_OF_VAR && EE_WriteVariable(VirtAddVarTab[slot], v) == HAL_OK;
+}
+static uint32_t float_bits(float f) { uint32_t u=0u; memcpy(&u,&f,sizeof(u)); return u; }
+static float bits_float(uint32_t u) { float f=0.0f; memcpy(&f,&u,sizeof(f)); return f; }
+static bool app_ee_write_u32(uint8_t slot, uint32_t v) {
+    return app_ee_write_if_changed(slot,(uint16_t)(v&0xffffu)) &&
+           app_ee_write_if_changed((uint8_t)(slot+1u),(uint16_t)(v>>16));
+}
+static bool app_ee_read_u32(uint8_t slot, uint32_t *v) {
+    uint16_t lo=0u,hi=0u;
+    if(!app_ee_read(slot,&lo)||!app_ee_read((uint8_t)(slot+1u),&hi))return false;
+    *v=(uint32_t)lo|((uint32_t)hi<<16); return true;
+}
+static uint16_t app_flags_pack(const adc_config *c) {
+    return (uint16_t)((c->use_filter?1u:0u) |
+        (((uint16_t)c->safe_start&3u)<<1) | ((uint16_t)c->buttons<<3) |
+        ((c->voltage_inverted?1u:0u)<<11) | ((c->voltage2_inverted?1u:0u)<<12) |
+        ((c->multi_esc?1u:0u)<<13) | ((c->tc?1u:0u)<<14));
+}
+static void app_flags_unpack(adc_config *c, uint16_t f) {
+    c->use_filter=(f&1u)!=0u; c->safe_start=(SAFE_START_MODE)((f>>1)&3u);
+    c->buttons=(uint8_t)((f>>3)&0xffu); c->voltage_inverted=(f&(1u<<11))!=0u;
+    c->voltage2_inverted=(f&(1u<<12))!=0u; c->multi_esc=(f&(1u<<13))!=0u;
+    c->tc=(f&(1u<<14))!=0u;
+}
+
+bool app_vesc_store_configuration(bool second) {
+    const app_configuration *a=&s_conf[second?1u:0u];
+    const adc_config *c=&a->app_adc_conf; const uint8_t b=(uint8_t)(APP_EE_BASE+(second?APP_EE_STRIDE:0u));
+    bool ok=true; HAL_FLASH_Unlock();
+    ok &= app_ee_write_if_changed((uint8_t)(b+1u),(uint16_t)a->app_to_use);
+    ok &= app_ee_write_u32((uint8_t)(b+2u),a->timeout_msec);
+    ok &= app_ee_write_u32((uint8_t)(b+4u),float_bits(a->timeout_brake_current));
+    ok &= app_ee_write_if_changed((uint8_t)(b+6u),(uint16_t)c->ctrl_type);
+    ok &= app_ee_write_u32((uint8_t)(b+7u),float_bits(c->hyst));
+    ok &= app_ee_write_u32((uint8_t)(b+9u),float_bits(c->voltage_start));
+    ok &= app_ee_write_u32((uint8_t)(b+11u),float_bits(c->voltage_end));
+    ok &= app_ee_write_u32((uint8_t)(b+13u),float_bits(c->voltage_min));
+    ok &= app_ee_write_u32((uint8_t)(b+15u),float_bits(c->voltage_max));
+    ok &= app_ee_write_u32((uint8_t)(b+17u),float_bits(c->voltage_center));
+    ok &= app_ee_write_u32((uint8_t)(b+19u),float_bits(c->voltage2_start));
+    ok &= app_ee_write_u32((uint8_t)(b+21u),float_bits(c->voltage2_end));
+    ok &= app_ee_write_if_changed((uint8_t)(b+23u),app_flags_pack(c));
+    ok &= app_ee_write_u32((uint8_t)(b+24u),float_bits(c->throttle_exp));
+    ok &= app_ee_write_u32((uint8_t)(b+26u),float_bits(c->throttle_exp_brake));
+    ok &= app_ee_write_if_changed((uint8_t)(b+28u),(uint16_t)c->throttle_exp_mode);
+    ok &= app_ee_write_u32((uint8_t)(b+29u),float_bits(c->ramp_time_pos));
+    ok &= app_ee_write_u32((uint8_t)(b+31u),float_bits(c->ramp_time_neg));
+    ok &= app_ee_write_u32((uint8_t)(b+33u),float_bits(c->tc_max_diff));
+    ok &= app_ee_write_u32((uint8_t)(b+35u),c->update_rate_hz);
+    /* Signature and shared key last: interrupted writes never look valid. */
+    ok &= app_ee_write_if_changed(b,APP_EE_SIGNATURE);
+    ok &= app_ee_write_if_changed(APP_EE_KEY_SLOT,(uint16_t)APP_EE_KEY_VALUE);
+    HAL_FLASH_Lock(); return ok;
+}
+
+bool app_vesc_load_configuration(bool second) {
+    const uint8_t b=(uint8_t)(APP_EE_BASE+(second?APP_EE_STRIDE:0u)); uint16_t key=0u,sig=0u,v16=0u,flags=0u; uint32_t u=0u;
+    if(!app_ee_read(APP_EE_KEY_SLOT,&key)||key!=(uint16_t)APP_EE_KEY_VALUE||!app_ee_read(b,&sig)||sig!=APP_EE_SIGNATURE)return false;
+    app_configuration a=s_conf[second?1u:0u]; adc_config *c=&a.app_adc_conf;
+    if(!app_ee_read((uint8_t)(b+1u),&v16)) return false;
+    a.app_to_use=(app_use)v16;
+    if(!app_ee_read_u32((uint8_t)(b+2u),&a.timeout_msec))return false;
+    if(!app_ee_read_u32((uint8_t)(b+4u),&u)) return false;
+    a.timeout_brake_current=bits_float(u);
+    if(!app_ee_read((uint8_t)(b+6u),&v16)) return false;
+    c->ctrl_type=(adc_control_type)v16;
+#define READ_F32(off,field) do{if(!app_ee_read_u32((uint8_t)(b+(off)),&u))return false;(field)=bits_float(u);}while(0)
+    READ_F32(7u,c->hyst); READ_F32(9u,c->voltage_start); READ_F32(11u,c->voltage_end);
+    READ_F32(13u,c->voltage_min); READ_F32(15u,c->voltage_max); READ_F32(17u,c->voltage_center);
+    READ_F32(19u,c->voltage2_start); READ_F32(21u,c->voltage2_end);
+    if(!app_ee_read((uint8_t)(b+23u),&flags)) return false;
+    app_flags_unpack(c,flags);
+    READ_F32(24u,c->throttle_exp); READ_F32(26u,c->throttle_exp_brake);
+    if(!app_ee_read((uint8_t)(b+28u),&v16)) return false;
+    c->throttle_exp_mode=(thr_exp_mode)v16;
+    READ_F32(29u,c->ramp_time_pos); READ_F32(31u,c->ramp_time_neg); READ_F32(33u,c->tc_max_diff);
+#undef READ_F32
+    if(!app_ee_read_u32((uint8_t)(b+35u),&c->update_rate_hz))return false;
+    return app_vesc_set_configuration(second,&a);
+}
+
+#else
+bool app_vesc_store_configuration(bool second) { (void)second; return true; }
+bool app_vesc_load_configuration(bool second) { (void)second; return false; }
+#endif
+
 void app_vesc_defaults(app_configuration *a, uint8_t id) {
     if (!a) return;
     memset(a, 0, sizeof(*a));
@@ -105,12 +213,15 @@ void app_vesc_init(void) {
     memset(s_state, 0, sizeof(s_state));
 }
 
+static bool adc_app_enabled(const app_configuration *a);
+
 const app_configuration *app_vesc_get_configuration(bool second) {
     return &s_conf[second ? 1 : 0];
 }
 
 bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     if (!conf) return false;
+    const app_configuration previous = s_conf[second ? 1u : 0u];
     app_configuration c = *conf;
     c.controller_id = second ? 2u : 1u;
     c.can_mode = CAN_MODE_VESC;
@@ -121,6 +232,18 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     /* This board has one physical VESC UART. Keep its electrical link fixed at
      * 115200 so writing App Config cannot strand VESC Tool on an unknown baud. */
     c.app_uart_baudrate = 115200u;
+    /* Leaving an active ADC controller must release its last motor command once.
+     * In APP_ADC_UART with ctrl_type NONE, subsequent UART SET_* commands remain
+     * authoritative because the ADC app no longer touches the motor at all. */
+#ifdef STM32F103xE
+    if (adc_app_enabled(&previous) && previous.app_adc_conf.ctrl_type != ADC_CTRL_TYPE_NONE &&
+        (!adc_app_enabled(&c) || c.app_adc_conf.ctrl_type == ADC_CTRL_TYPE_NONE)) {
+        mc_interface_select_motor_thread(second ? 2 : 1);
+        mc_interface_release_motor();
+    }
+#else
+    (void)previous;
+#endif
     s_conf[second ? 1 : 0] = c;
     mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current);
     memset(&s_state[second ? 1 : 0], 0, sizeof(s_state[0]));
@@ -207,6 +330,15 @@ static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, 
     if (c->voltage2_inverted) brake = 1.0f - brake;
 
     s_v1 = v1; s_v2 = v2; s_dec1 = pwr; s_dec2 = brake; s_range_ok = range_ok;
+
+    /* ADC_CTRL_TYPE_NONE is telemetry-only. In particular APP_ADC_UART must not
+     * repeatedly issue zero-current/brake commands, because that steals control
+     * from UART and keeps the power bridge switching at a nonzero modulation. */
+    if (c->ctrl_type == ADC_CTRL_TYPE_NONE) {
+        st->ramp = 0.0f;
+        st->zero_ms = 0u;
+        return;
+    }
 
     switch (c->ctrl_type) {
     case ADC_CTRL_TYPE_CURRENT_REV_CENTER:

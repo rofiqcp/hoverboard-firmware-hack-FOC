@@ -15,6 +15,9 @@
 #define MCCONF_L_MIN_DUTY                     0.0f
 #define MCCONF_L_MAX_DUTY                    0.95f
 #define MCCONF_FAULT_STOP_TIME_MS             500u
+#define MCCONF_FOC_DUTY_DOWNRAMP_KP            20.0f
+#define MCCONF_FOC_DUTY_DOWNRAMP_KI           400.0f
+#define MCCONF_DUTY_PI_BUS_NOMINAL_V            42.5f
 #define MCCONF_FOC_SENSOR_MODE      FOC_SENSOR_MODE_HALL
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u
 #define MCCONF_FOC_CURRENT_KI_Q16           1229u
@@ -43,11 +46,14 @@
 #define MCCONF_SPEED_RAMP_ERPMS_S             1500u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
 #define MCCONF_SPEED_STOP_VOLTAGE_MAX          4000   /* gentle stop ceiling; running limit remains 12800 */
-#define MCCONF_FOC_VOLTAGE_MAX              14400
-/* Closed-loop current/speed headroom for the hoverboard two-shunt ADC.
- * V9 logs stay clean below ~80% duty and become noisy around 83..90%.
- * Mode 1 keeps the proven 14400 direct-voltage ceiling. */
+#define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX   12800
+#define MCCONF_FOC_DUTY_VOLTAGE_MAX          15200   /* 95% exact modulation */
+#define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */
+#define MCCONF_PWM_MARGIN_COUNTS                100   /* 5% of ARR=2000 -> 95% gate ceiling */
+#define MCCONF_HIGH_DUTY_OC_THRESHOLD_PERMILLE  800u
+#define MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES          3u /* keep ABS OC active; reject 1-sample shunt glitches */
+#define MCCONF_DRIVEN_OFFSET_CAL_SAMPLES          64u /* 4 ms @ 16 kHz */
 #define MCCONF_CURRENT_SLEW_A_PER_S              10u
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
@@ -68,6 +74,7 @@
  * from first to third sample). This filters switching-edge/metastability
  * glitches without materially shifting a 60-deg sector at steering speeds. */
 #define MCCONF_HALL_DEBOUNCE_SAMPLES              3u
+#define MCCONF_HALL_PHASE_ADVANCE_TICKS       (MCCONF_HALL_DEBOUNCE_SAMPLES - 1u)
 /* After start or a real direction reversal, accept five valid adjacent edges
  * before enabling the period-outlier test. This fully refreshes the four-edge
  * period history so acceleration from near-zero is not mistaken for chatter. */

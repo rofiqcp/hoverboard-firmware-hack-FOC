@@ -59,8 +59,9 @@ def check_static():
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'closed-loop voltage-circle anti-windup missing'
     assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'mode3 current setpoint slew missing'
-    assert 'leftPhaseTrip=leftBridgeWasOn' in mc and 'rightPhaseTrip=rightBridgeWasOn' in mc, 'phase over-current must protect all powered modes'
+    assert 'leftPhaseExceeded=leftBridgeWasOn' in mc and 'rightPhaseExceeded=rightBridgeWasOn' in mc and 'leftPhaseTrip=leftPhaseExceeded' in mc and 'rightPhaseTrip=rightPhaseExceeded' in mc, 'phase over-current must remain active on all powered modes'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
+    assert 'Safety gate phase 2' in mc and 'if(leftDriveRequest && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
     assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)' in mc and 'motor_pole_pairs(second)' in mc, 'VESC mc_values.rpm must be atomic ERPM'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
@@ -69,8 +70,16 @@ def check_static():
     assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'FOC Hall detection/validation missing'
     assert 'gap < 18u || gap > 48u' in mc, 'Hall detect sector-gap rejection missing'
     assert 'MCCONF_HALL_INTERP_ON_RPM' in mc and 'MCCONF_HALL_INTERP_OFF_RPM' in mc, 'low-speed Hall interpolation hysteresis missing'
+    assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
-    assert 'm->m_duty_set_permille*MCCONF_FOC_VOLTAGE_MAX' in mc, 'mode1 permille-to-voltage scaling missing'
+    assert 'duty_control_iq_target_step' in mc and 'm->m_iq_target_q4=duty_control_iq_target_step(m)' in mc, 'mode1 must use VESC-style current-controlled duty'
+    assert 'modulation-vector magnitude' in mc and 'foc_isqrt_u32(mag2)' in mc and '(mag+8u)/16u' in mc, 'VESC FOC duty_now must come from vector magnitude'
+    assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 95pct modulation ceiling missing'
+    assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+0\.95f',mcc), 'VESC duty max must be 0.95'
+    assert re.search(r'#define\s+MCCONF_FOC_DUTY_VOLTAGE_MAX\s+15200',mcc), '95pct SVPWM voltage ceiling must be 15200'
+    assert re.search(r'#define\s+MCCONF_PWM_MARGIN_COUNTS\s+100',mcc), '95pct PWM margin must be 100/2000 counts'
+    assert 'MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES' in mc and 'm_phase_overcurrent_streak' in mc and 'leftDcTrip' in mc and 'm_phase_trip_count' in mc and 'm_dc_trip_count' in mc, 'qualified high-duty ABS current protection/diagnostics missing'
+    assert 'l_abs_current_max' in mc and 'MCCONF_L_ABS_CURRENT_MAX' in mc, 'VESC-style absolute current fault limit missing'
     assert 'trq_ca_to_q4' in mc and 'A2BIT_CONV*16)/100' in mc, 'mode3 centiampere scaling missing'
     assert 'm_openloop_id_ramp_q16' in mc and 'MCCONF_OPENLOOP_ID_SLEW_A_S' in mc, 'mode4 Id slew protection missing'
     assert re.search(r'#define\s+SVPWM_MAX_ID_A\s+6u',cfg), 'mode4 Id safety ceiling must be 6A'
@@ -101,6 +110,7 @@ def check_static():
     appv=(ROOT/'Src/vesc/app_vesc.c').read_text()
     assert 'adc_buffer.adc2_spare4' in appv and 'adc_buffer.adc2_spare5' in appv, 'PA2/PA3 ADC2 app mapping missing'
     assert 'APP_ADC_UART' in appv and 'app_vesc_process' in appv, 'APP_ADC/UART runtime missing'
+    assert 'ADC_CTRL_TYPE_NONE is telemetry-only' in appv and 'if (c->ctrl_type == ADC_CTRL_TYPE_NONE)' in appv, 'ADC NONE must not energize/touch motor'
     assert 'a->timeout_msec = 1000u;' in appv, 'VESC App Config default timeout must be 1000 ms'
     assert 'mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current)' in appv, 'App Config timeout/brake must drive motor watchdog'
     for setter in ('mc_interface_set_duty', 'mc_interface_set_current', 'mc_interface_set_brake_current', 'mc_interface_set_pid_speed'):
@@ -114,11 +124,13 @@ def check_static():
     assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'
+    util=(ROOT/'Src/util.c').read_text()
     eeh=(ROOT/'Src/eeprom.h').read_text()
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x31\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)123u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
     assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'

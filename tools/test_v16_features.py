@@ -49,7 +49,7 @@ for token in ('m->m_i_alpha_q4=0','m->m_i_beta_q4=0','m->m_id_q4=0','m->m_iq_q4=
 # RX burst handling remains 4-deep. GET_VALUES stays strict request/reply;
 # the only standard unsolicited stream is COMM_ROTOR_POSITION after SET_DETECT,
 # matching vedderb/bldc's 10-ms periodic_thread behavior.
-assert re.search(r'#define\s+VESC_RX_QUEUE_DEPTH\s+4u',vp)
+assert re.search(r'#define\s+VESC_RX_QUEUE_DEPTH\s+8u',vp)
 assert 's_pending_payload[VESC_RX_QUEUE_DEPTH][VESC_MAX_PAYLOAD]' in vp
 assert 's_pending_count < VESC_RX_QUEUE_DEPTH' in vp
 assert 'VESC_RT_PERIOD_MS' not in vp and 's_rt_stream' not in vp
@@ -82,4 +82,4 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_brake_current(curr
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo4=1 vesc_request_reply=1 brake_latch=1 position_cap=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo8=1 vesc_request_reply=1 brake_latch=1 position_cap=1')

@@ -30,6 +30,10 @@ typedef struct {
     volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
     volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */
     volatile int16_t m_duty_set_permille;
+    int32_t m_duty_i_q15;
+    uint32_t m_duty_kp_q12_per_permille;
+    uint32_t m_duty_ki_q12_per_permille;
+    uint8_t m_duty_pi_active;
 
     volatile uint16_t m_kpq_q11, m_kiq_q16;
     volatile uint16_t m_kpd_q11, m_kid_q16;
@@ -40,6 +44,8 @@ typedef struct {
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
     volatile int16_t m_current_limit_q4;
+    volatile int16_t m_abs_current_limit_counts; /* precomputed l_abs_current_max * A2BIT_CONV */
+    volatile int16_t m_duty_limit_permille;      /* precomputed l_max_duty * 1000 */
 
     /* Current state, same Q4 current-count unit as the legacy generated FOC. */
     volatile int16_t m_i_alpha_q4;
@@ -51,6 +57,11 @@ typedef struct {
     volatile int16_t m_current_in_counts;
     volatile int16_t m_rpm;
     volatile int16_t m_duty_now_permille;
+    volatile uint8_t m_driven_offset_calibrating;
+    volatile uint8_t m_driven_offset_valid;
+    volatile uint16_t m_driven_offset_samples;
+    int32_t m_driven_offset_sum0, m_driven_offset_sum1, m_driven_offset_sumdc;
+    volatile int16_t m_driven_offset0, m_driven_offset1, m_driven_offsetdc;
 
     /* VESC energy counters since boot. Upstream exposes separate drawn and
      * charged Ah/Wh counters in COMM_GET_VALUES. Updated from the measured
@@ -79,6 +90,8 @@ typedef struct {
     int8_t m_hall_direction;
     uint16_t m_hall_ticks;
     uint16_t m_hall_period;
+    uint32_t m_hall_interp_step_q16; /* electrical phase units/tick in Q16 */
+    uint16_t m_hall_rate_limit_step; /* precomputed Hall phase correction slew */
     uint16_t m_hall_period_hist[4];
     uint8_t m_hall_hist_pos;
     uint8_t m_hall_initialized;
@@ -141,6 +154,15 @@ typedef struct {
     volatile uint32_t m_isr_count;
     volatile uint32_t m_overrun_count;
     volatile uint32_t m_current_trip_count;
+    volatile uint32_t m_phase_trip_count;
+    volatile uint32_t m_dc_trip_count;
+    volatile uint8_t m_phase_overcurrent_streak;
+    volatile uint8_t m_last_trip_source; /* bit0 phase, bit1 DC-link */
+    volatile int16_t m_last_trip_phase0_counts;
+    volatile int16_t m_last_trip_phase1_counts;
+    volatile int16_t m_last_trip_phase2_counts;
+    volatile int16_t m_last_trip_dc_counts;
+    volatile int16_t m_last_trip_duty_permille;
 } mcpwm_foc_motor_t;
 
 extern mcpwm_foc_motor_t m_motor_1;
