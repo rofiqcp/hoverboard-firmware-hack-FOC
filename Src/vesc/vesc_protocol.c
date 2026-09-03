@@ -493,9 +493,18 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
         if (c.l_current_max > (float)I_MOT_MAX) c.l_current_max = (float)I_MOT_MAX;
         if (c.l_current_min > -0.1f) c.l_current_min = -0.1f;
         if (c.l_current_min < -(float)I_MOT_MAX) c.l_current_min = -(float)I_MOT_MAX;
-        if (!(c.l_abs_current_max >= c.l_current_max) || c.l_abs_current_max > MCCONF_L_ABS_CURRENT_MAX)
-            c.l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
+        {
+            float commanded_abs = c.l_current_max;
+            if (-c.l_current_min > commanded_abs) commanded_abs = -c.l_current_min;
+            if (!(c.l_abs_current_max >= commanded_abs) ||
+                c.l_abs_current_max > MCCONF_L_ABS_CURRENT_MAX) {
+                c.l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
+            }
+        }
         if (!(c.l_max_duty > 0.0f) || c.l_max_duty > MCCONF_L_MAX_DUTY) c.l_max_duty=MCCONF_L_MAX_DUTY;
+        if (!(c.l_in_current_max >= 0.1f) || c.l_in_current_max > (float)I_DC_MAX) c.l_in_current_max=MCCONF_L_IN_CURRENT_MAX;
+        if (!(c.l_in_current_min <= -0.1f) || c.l_in_current_min < -(float)I_DC_MAX) c.l_in_current_min=MCCONF_L_IN_CURRENT_MIN;
+        if (!(c.m_duty_ramp_step >= 0.0001f && c.m_duty_ramp_step <= 0.20f)) c.m_duty_ramp_step=MCCONF_DUTY_RAMP_STEP_DEFAULT;
         /* Physical current sample/PI topology is fixed for this board. Motor
          * poles and drivetrain ratio are standard VESC setup fields and are live. */
         c.foc_sensor_mode = FOC_SENSOR_MODE_HALL;
@@ -557,12 +566,21 @@ static void detect_hall_foc(bool second, const uint8_t *data, uint16_t len) {
     reply[9] = 1u;
     if (len >= 4u) current = (float)buffer_get_int32(data, &i) / 1000.0f;
     if (mcpwm_foc_detect_hall(current, second, &reply[1])) {
-        /* VESC result byte reports DETECTION success. Persistence is an
-         * additional project feature and is exposed separately in diagnostics;
-         * a flash-write problem must not be misreported as "bad hall". */
-        s_last_hall_store_ok[second ? 1u : 0u] =
-            mc_interface_store_configuration_motor(second) ? 1u : 0u;
-        reply[9] = 0u;
+        /* This target treats Hall detect + persistence as one transaction.
+         * A detected table is not accepted until EEPROM reload reproduces the
+         * exact eight entries, so VESC Tool cannot receive a false success. */
+        uint8_t detected[8];
+        memcpy(detected, &reply[1], sizeof(detected));
+        bool persisted = mc_interface_store_configuration_motor(second);
+        if (persisted) persisted = mc_interface_load_configuration_motor(second);
+        if (persisted) {
+            const volatile mc_configuration *verify = mc_interface_get_configuration_motor(second);
+            for (uint8_t h = 0u; h < 8u; ++h) {
+                if ((uint8_t)verify->foc_hall_table[h] != detected[h]) { persisted = false; break; }
+            }
+        }
+        s_last_hall_store_ok[second ? 1u : 0u] = persisted ? 1u : 0u;
+        reply[9] = persisted ? 0u : 1u;
     } else {
         s_last_hall_store_ok[second ? 1u : 0u] = 0u;
     }
@@ -664,7 +682,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[176];
+        uint8_t b[192];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         struct {
@@ -679,6 +697,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             int16_t last_trip_p0,last_trip_p1,last_trip_p2,last_trip_dc,last_trip_duty;
             int16_t driven_off0,driven_off1,driven_offdc;
             uint16_t driven_samples; uint8_t driven_valid,driven_cal;
+            int16_t off0,off1,offdc; uint16_t off_samples,off_settle; uint8_t off_valid;
         } ds;
         __disable_irq();
         ds.mode=m->m_control_mode; ds.state=m->m_state; ds.fault=m->m_fault;
@@ -697,6 +716,8 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         ds.last_trip_p2=m->m_last_trip_phase2_counts; ds.last_trip_dc=m->m_last_trip_dc_counts; ds.last_trip_duty=m->m_last_trip_duty_permille;
         ds.driven_off0=m->m_driven_offset0; ds.driven_off1=m->m_driven_offset1; ds.driven_offdc=m->m_driven_offsetdc;
         ds.driven_samples=m->m_driven_offset_samples; ds.driven_valid=m->m_driven_offset_valid; ds.driven_cal=m->m_driven_offset_calibrating;
+        ds.off0=m->m_off_offset0; ds.off1=m->m_off_offset1; ds.offdc=m->m_off_offsetdc;
+        ds.off_samples=m->m_off_offset_samples; ds.off_settle=m->m_off_settle_ticks; ds.off_valid=m->m_off_offset_valid;
         __enable_irq();
         const uint16_t pp=mcpwm_foc_get_pole_pairs(second);
         float erpm_f=(float)ds.rpm*(float)pp;
@@ -791,6 +812,8 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint16(b,adc_buffer.rlA,&i); buffer_append_uint16(b,adc_buffer.rlB,&i);
             buffer_append_uint16(b,adc_buffer.dcl,&i); buffer_append_uint16(b,adc_buffer.rrB,&i);
             buffer_append_uint16(b,adc_buffer.rrC,&i); buffer_append_uint16(b,adc_buffer.dcr,&i);
+            buffer_append_int16(b,ds.off0,&i); buffer_append_int16(b,ds.off1,&i); buffer_append_int16(b,ds.offdc,&i);
+            buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid;
         }
         uart_send_payload(b, (uint16_t)i);
     }

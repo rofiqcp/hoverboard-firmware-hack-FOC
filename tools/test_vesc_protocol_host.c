@@ -12,6 +12,7 @@
 #include "vesc/mcconf_serial.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "motor/mcconf_default.h"
 #include "defines.h"
 
 UART_HandleTypeDef huart3 = {0};
@@ -27,6 +28,7 @@ static float set_duty[2];
 static float set_pos[2];
 static unsigned touch_count[2];
 static unsigned store_count[2];
+static bool store_ok=true, load_ok=true;
 static mc_configuration confs[2];
 static mcpwm_foc_motor_t diag_motors[2];
 static int32_t pos_user[2] = {0,0};
@@ -108,7 +110,8 @@ int32_t mcpwm_foc_get_position_target_user_counts(bool second){return pos_target
 int32_t mcpwm_foc_get_position_min_user_counts(bool second){return pos_min_user[second?1:0];}
 int32_t mcpwm_foc_get_position_max_user_counts(bool second){return pos_max_user[second?1:0];}
 void mcpwm_foc_reset_position(bool second){const int j=second?1:0;pos_user[j]=0;pos_target_user[j]=0;}
-bool mc_interface_store_configuration_motor(bool second) { store_count[second?1:0]++; return true; }
+bool mc_interface_store_configuration_motor(bool second) { store_count[second?1:0]++; return store_ok; }
+bool mc_interface_load_configuration_motor(bool second) { (void)second; return load_ok; }
 bool mcpwm_foc_detect_hall(float current, bool second, uint8_t table[8]) {
     (void)current;
     static const uint8_t t[8]={255u,83u,17u,50u,150u,117u,183u,255u};
@@ -268,13 +271,14 @@ int main(void){
     {int32_t mi=1; if(buffer_get_uint32(r,&mi)!=MCCONF_SIGNATURE) return fail("mcconf default signature");}
     {
         uint8_t sm[700]; mc_configuration c=confs[0];
-        c.l_current_max=9.0f; c.l_current_min=-9.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=20u; c.si_gear_ratio=5.5f;
+        c.l_current_max=9.0f; c.l_current_min=-11.0f; c.l_abs_current_max=10.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=20u; c.si_gear_ratio=5.5f;
         const uint8_t ht[8]={255u,80u,14u,47u,147u,114u,180u,255u};
         for(int q=0;q<8;q++) c.foc_hall_table[q]=(int8_t)ht[q];
         sm[0]=COMM_SET_MCCONF; const int32_t sn=confgenerator_serialize_mcconf(sm+1,&c);
         const unsigned before=store_count[0];
         if(sn<=0 || !transact(sm,(uint16_t)(sn+1),r,&rn)||rn!=1u||r[0]!=COMM_SET_MCCONF) return fail("set mcconf ack");
         if(store_count[0]!=before+1u || !nearf32(confs[0].l_current_max,9.0f,0.01f)) return fail("set mcconf apply/store");
+        if(!nearf32(confs[0].l_abs_current_max,MCCONF_L_ABS_CURRENT_MAX,0.01f)) return fail("SET_MCCONF ABS must cover negative current magnitude");
         if(confs[0].si_motor_poles!=20u || !nearf32(confs[0].si_gear_ratio,5.5f,0.01f)) return fail("set mcconf runtime poles/gear");
         for(int q=0;q<8;q++) if((uint8_t)confs[0].foc_hall_table[q]!=ht[q]) return fail("set mcconf hall table");
 
@@ -350,6 +354,11 @@ int main(void){
     if(!transact(dh,sizeof(dh),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]!=0u||store_count[0]==0u)return fail("local hall detect");
     uint8_t dhr[7]={COMM_FORWARD_CAN,2u,COMM_DETECT_HALL_FOC,0,0,0,0}; k=3; buffer_append_int32(dhr,1000,&k);
     if(!transact(dhr,sizeof(dhr),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]!=0u||store_count[1]==0u)return fail("right hall detect");
+    store_ok=false;
+    if(!transact(dh,sizeof(dh),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]==0u)return fail("hall detect must fail when EEPROM store fails");
+    store_ok=true; load_ok=false;
+    if(!transact(dh,sizeof(dh),r,&rn)||rn!=10u||r[9]==0u)return fail("hall detect must fail when EEPROM reload fails");
+    load_ok=true;
     printf("VESC_PROTOCOL_HOST_PASS fw=6.00 can=2 rightIqInternal=%.2f localRpm=%.0f posL=%.0f posRinternal=%.0f hall=ok values=ok mcconf=rw\n",set_current[1],set_rpm[0],set_pos[0],set_pos[1]);
     return 0;
 }

@@ -24,6 +24,7 @@ extern volatile int pwmr;
 extern volatile int32_t positionCommandL;
 extern volatile int32_t positionCommandR;
 extern int16_t curL_phaA, curL_phaB, curL_DC;
+extern int16_t curR_phaB, curR_phaC, curR_DC;
 
 void DMA1_Channel1_IRQHandler(void);
 
@@ -64,6 +65,27 @@ int main(void){
     if(abs(m_motor_1.m_vq)>2880)return fail("mode1 20pct modulation ceiling");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode1 STOP must release/free-run");
+
+    /* Regression: production profile is 15 A motor / 15 A DC-link with a
+     * VESC-style 0.02 duty ramp. A 95%% command must ramp to 950 permille while
+     * retaining the 15 A current authority that was accidentally left at 1 A
+     * during bench-safe tests. */
+    mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    mc_configuration duty15=m_motor_1.m_conf;
+    duty15.l_current_max=15.0f; duty15.l_current_min=-15.0f;
+    duty15.l_in_current_max=15.0f; duty15.l_in_current_min=-15.0f;
+    duty15.l_max_duty=1.0f; duty15.m_duty_ramp_step=0.02f;
+    mcpwm_foc_set_configuration(&duty15,false);
+    mcpwm_foc_set_duty(1.0f,false);
+    mcpwm_foc_vesc_override_touch(false);
+    curL_phaA=curL_phaB=curL_DC=0;
+    for(int i=0;i<180;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_duty_ramp_permille!=1000)return fail("15A duty ramp must reach normalized 1.0 target");
+    if(m_motor_1.m_duty_ramp_step_permille!=20u)return fail("VESC 0.02 duty ramp scaling");
+    if(m_motor_1.m_current_limit_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production duty current authority must be 15A");
+    if(m_motor_1.m_input_current_max_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production input current limit must be 15A");
+    if(abs(m_motor_1.m_iq_set_q4)>15*FOC_CURRENT_Q4_PER_A)return fail("95pct duty exceeds 15A motor current envelope");
+    if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("95pct duty exceeds voltage ceiling");
 
     /* Verify free-run is electrical high impedance, not merely Vq=0: after the
      * control mode is released the corresponding timer MOE must turn off. */
@@ -223,10 +245,10 @@ int main(void){
     /* Requested 2026-09 current/telemetry/position regression. Standard VESC
      * COMM_SET_CURRENT scaling is mA/1000, so 1.000 A must become exactly 800
      * Q4 units with A2BIT_CONV=50. Closed-loop current must also be allowed to
-     * use the configured 95% modulation rather than the historical 80% cap. */
+     * use the configured full-safe EFeru modulation rather than the historical 80% cap. */
     mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     mc_configuration oneamp=m_motor_1.m_conf;
-    oneamp.l_current_max=1.0f; oneamp.l_current_min=-1.0f; oneamp.l_max_duty=0.95f;
+    oneamp.l_current_max=1.0f; oneamp.l_current_min=-1.0f; oneamp.l_max_duty=1.0f;
     oneamp.foc_current_filter_const=0.10f;
     mcpwm_foc_set_configuration(&oneamp,false);
     if(abs((int)m_motor_1.m_telem_current_filter_q16-6554)>2)return fail("VESC foc_current_filter_const mapping");
@@ -240,11 +262,32 @@ int main(void){
     curL_phaA=curL_phaB=curL_DC=0;
     for(int i=0;i<18000;i++)mcpwm_foc_adc_int_handler();
     if(abs(m_motor_1.m_vq)<=MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX)return fail("1A current PI still hard-capped at 80pct modulation");
-    if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("1A current PI exceeds configured 95pct modulation");
+    if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("1A current PI exceeds EFeru full-safe modulation");
 
-    /* Bridge-OFF telemetry has a separate stationary baseline. It must be near
-     * zero at rest, then show passive/back-drive changes without arming PWM or
-     * feeding the over-current detector. */
+    /* EFeru hoverboard current-sense contract: one ampere is exactly 50 ADC
+     * counts and the driven polarity is offset-ADC. Prove the real DMA/ISR path,
+     * not only conversion helpers: LEFT uses rlA/rlB/dcl and RIGHT rrB/rrC/dcr. */
+    mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
+    mcpwm_foc_vesc_timeout_configure(false,0u,0.0f); mcpwm_foc_vesc_timeout_configure(true,0u,0.0f);
+    mcpwm_foc_set_current(0.10f,false); mcpwm_foc_vesc_override_touch(false);
+    mcpwm_foc_set_current(0.10f,true);  mcpwm_foc_vesc_override_touch(true);
+    for(int i=0;i<100;i++)DMA1_Channel1_IRQHandler();
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u || (RIGHT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("current-scale bridge setup");
+    if(m_motor_1.m_bridge_settle_ticks!=0u || m_motor_2.m_bridge_settle_ticks!=0u)return fail("current-scale bridge settle");
+    adc_buffer.rlA=1950; adc_buffer.rlB=2050; adc_buffer.dcl=1950;
+    adc_buffer.rrB=1950; adc_buffer.rrC=2050; adc_buffer.dcr=1950;
+    DMA1_Channel1_IRQHandler();
+    if(curL_phaA!=50 || curL_phaB!=-50 || curL_DC!=50)return fail("EFeru left offset-ADC 50count/A mapping");
+    if(curR_phaB!=50 || curR_phaC!=-50 || curR_DC!=50)return fail("EFeru right offset-ADC 50count/A mapping");
+    if(A2BIT_CONV!=50 || FOC_CURRENT_Q4_PER_A!=800)return fail("EFeru current unit 50count/A Q4=800/A");
+    mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+
+    /* Match upstream VESC: public motor-current telemetry is exactly zero while
+     * released. The separate high-Z offset/raw ADC state remains diagnostic-only
+     * and must never arm PWM or feed over-current protection. */
     mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     mc_configuration telem=m_motor_1.m_conf; telem.foc_current_filter_const=0.10f;
     mcpwm_foc_set_configuration(&telem,false);
@@ -258,13 +301,15 @@ int main(void){
     if(!m_motor_1.m_off_offset_valid)return fail("OFF telemetry offset did not calibrate");
     mc_values off0; mcpwm_foc_get_values(&off0,false);
     if(fabsf(off0.current_in)>0.05f || fabsf(off0.id)+fabsf(off0.iq)>0.10f)return fail("OFF baseline not near zero");
-    /* Simulate back-drive signal around the frozen OFF baseline. */
+    /* Simulate a manual back-drive/raw ADC change. Standard VESC telemetry must
+     * still remain zero because the motor is released; custom diag owns raw data. */
+    m_motor_1.m_hall_direction=1; m_motor_1.m_hall_ticks=0u; m_motor_1.m_rpm=1;
     adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
     for(int i=0;i<120;i++)DMA1_Channel1_IRQHandler();
     mc_values offv; mcpwm_foc_get_values(&offv,false);
     if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_vd!=0 || m_motor_1.m_vq!=0)return fail("undriven telemetry must keep bridge/control off");
-    if(fabsf(offv.current_in)<0.05f)return fail("OFF Ibattery/passive telemetry forced to zero");
-    if(fabsf(offv.id)+fabsf(offv.iq)<0.10f)return fail("OFF Id/Iq passive telemetry forced to zero");
+    if(fabsf(offv.current_in)>0.001f)return fail("VESC OFF Ibattery must be zero");
+    if(fabsf(offv.id)+fabsf(offv.iq)>0.001f)return fail("VESC OFF Id/Iq must be zero");
     if(m_motor_1.m_current_trip_count!=0u)return fail("OFF telemetry must never feed over-current protection");
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("OFF telemetry must not arm bridge");
     if(m_motor_1.m_telem_avg_samples!=0u)return fail("COMM_GET_VALUES must read/reset current average window");

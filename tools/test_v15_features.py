@@ -44,10 +44,10 @@ fwfun=vp[vp.index('static void reply_fw_version'):vp.index('static void get_valu
 assert 'VESC_FW_MAJOR' in fwfun and 'VESC_FW_MINOR' in fwfun
 assert 'post-6.00 fields' in fwfun and 'buffer_append_uint32' not in fwfun
 
-# Hall result is standard [cmd + 8 table + result], with detector success distinct from EEPROM status.
+# Hall result is standard [cmd + 8 table + result]. This target reports success only after exact EEPROM store+reload verification.
 det=vp[vp.index('static void detect_hall_foc'):vp.index('static int32_t q4_to_milliamps_normalized')]
-assert 'uint8_t reply[10]' in det and 'reply[9] = 0u' in det
-assert 's_last_hall_store_ok' in det and 'uart_send_payload(reply, sizeof(reply))' in det
+assert 'uint8_t reply[10]' in det and 'reply[9] = persisted ? 0u : 1u' in det
+assert 's_last_hall_store_ok' in det and 'mc_interface_load_configuration_motor(second)' in det and 'verify->foc_hall_table' in det and 'uart_send_payload(reply, sizeof(reply))' in det
 
 # Standard VESC position stays single-turn; project multi-turn uses CUSTOM_APP_DATA signed int32.
 assert 'case COMM_SET_POS:' in vp and 'COMM_CUSTOM_APP_DATA' in vp

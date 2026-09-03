@@ -36,19 +36,23 @@ assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrat
 assert 'k < 1000u' in mc and 'HAL_Delay(1u)' in mc
 assert 'pass < 6u' in mc and 'const bool reverse = pass >= 3u' in mc
 assert 'k < 360u' in mc and '359u - k' in mc and 'HAL_Delay(5u)' in mc
-assert 'samples[h] <= 30u' in mc
+assert 'hall_detect_angle200' in mc and 'pass_n[h]' in mc and 'hall_detect_distance200' in mc
+assert 'forward_ref' in mc and 'reverse_ref' in mc and '> 4u' in mc and '> 8u' in mc
+assert 'mc_interface_load_configuration_motor(second)' in vp and 'persisted' in vp
+assert 'm->m_iq_target_q4 != 0 || m->m_iq_set_q4 != 0' in mc and 'm->m_fault != FAULT_CODE_NONE' in mc
+assert 'test_hall_detect_repeat.py' in (R/'tools/run_all_checks.py').read_text()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
 assert 'COMM_DETECT_HALL_FOC, 20.0)' in dual
 
-# Undriven bridge stays electrically OFF, but a separately calibrated high-Z
-# offset keeps passive/manual-backdrive current telemetry live.
+# Upstream VESC reports zero public motor-current telemetry while released.
+# Keep the separately calibrated high-Z/raw ADC path diagnostic-only.
 assert 'leftOffTelemValid' in mc and 'rightOffTelemValid' in mc and 'off_telem_deadband_counts' in mc
 assert 'm_id_telem_q4' in mc and 'm_current_in_telem_counts' in mc
 off=mc[mc.index('if (!source_enabled || m->m_fault!=FAULT_CODE_NONE'):mc.index('return;',mc.index('if (!source_enabled || m->m_fault!=FAULT_CODE_NONE'))]
 for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0'):
     assert token in off, token
 for token in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
-    assert token not in off, token
+    assert token in off, token
 
 # RX burst handling remains 4-deep. GET_VALUES stays strict request/reply;
 # the only standard unsolicited stream is COMM_ROTOR_POSITION after SET_DETECT,
@@ -86,4 +90,4 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_live=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_cap=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_cap=1')

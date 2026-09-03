@@ -76,12 +76,16 @@ def check_static():
     assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
     assert 'duty_control_iq_target_step' in mc and 'm->m_iq_target_q4=duty_control_iq_target_step(m)' in mc, 'mode1 must use VESC-style current-controlled duty'
-    assert 'modulation-vector magnitude' in mc and 'foc_isqrt_u32(mag2)' in mc and '(mag+8u)/16u' in mc, 'VESC FOC duty_now must come from vector magnitude'
-    assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 95pct modulation ceiling missing'
-    assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+0\.95f',mcc), 'VESC duty max must be 0.95'
-    assert re.search(r'#define\s+MCCONF_FOC_DUTY_VOLTAGE_MAX\s+15200',mcc), '95pct SVPWM voltage ceiling must be 15200'
-    assert re.search(r'#define\s+MCCONF_PWM_MARGIN_COUNTS\s+100',mcc), '95pct PWM margin must be 100/2000 counts'
-    assert 'MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES' in mc and 'm_phase_overcurrent_streak' in mc and 'leftDcTrip' in mc and 'm_phase_trip_count' in mc and 'm_dc_trip_count' in mc, 'qualified high-duty ABS current protection/diagnostics missing'
+    assert 'foc_isqrt_u32(mag2)' in mc and 'mag*1000u' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'VESC duty telemetry must normalize EFeru full-safe vector to 1.0'
+    assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 EFeru full-safe modulation ceiling missing'
+    assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+1\.00f',mcc), 'VESC normalized duty max must be 1.00'
+    assert re.search(r'#define\s+MCCONF_L_IN_CURRENT_MAX\s+15\.0f',mcc) and re.search(r'#define\s+MCCONF_L_IN_CURRENT_MIN\s+-15\.0f',mcc), 'DC-link soft limit must be +/-15A'
+    assert 'MCCONF_DUTY_RAMP_STEP_DEFAULT' in mcc and 'm_duty_ramp_permille' in mc and 'duty_setpoint_slew_step' in mc, 'VESC duty ramp path missing'
+    assert re.search(r'#define\s+VESC_DUTY_PHYSICAL_SCALE_PERMILLE\s+960',cfg), 'board VESC duty scale must be 0.960'
+    assert re.search(r'#define\s+FOC_SVPWM_VECTOR_FULL_SAFE\s+14238',cfg), 'EFeru full-safe SVPWM reference vector must be 14238'
+    assert re.search(r'#define\s+FOC_PWM_MARGIN_COUNTS\s+110',cfg), 'EFeru FOC PWM margin must be 110 counts'
+    assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX' in mcc and 'MCCONF_PWM_MARGIN_COUNTS          FOC_PWM_MARGIN_COUNTS' in mcc, 'MC config must consume config.h hardware PWM scaling'
+    assert 'MCCONF_ABS_CURRENT_QUAL_SAMPLES' in mc and 'leftFastMag2' in mc and 'leftSlowMag2' in mc and 'leftDcTrip' in mc and 'm_phase_trip_count' in mc and 'm_dc_trip_count' in mc, 'DQ-qualified ABS/DC hard protection diagnostics missing'
     assert 'MCCONF_BRIDGE_SETTLE_SAMPLES' in mc and 'm_bridge_settle_ticks' in mc and 'leftCurrentSampleValid' in mc, 'OFF-to-RUN current sample blanking missing'
     assert 'm_telem_sum_id_q4' in mc and 'm_telem_avg_samples' in mc and 'telemetry_avg_push' in mc, 'VESC-style read/reset current averaging missing'
     assert 'l_abs_current_max' in mc and 'MCCONF_L_ABS_CURRENT_MAX' in mc, 'VESC-style absolute current fault limit missing'
@@ -108,7 +112,7 @@ def check_static():
     assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and 'EE_CFG_SIGNATURE_V24   0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'EE_L_CC_MIN_CURRENT_CA = 141' in mci and 'EE_R_CC_MIN_CURRENT_CA = 142' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
     assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
     assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
@@ -134,7 +138,7 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)135u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)143u\)', eeh), 'EEPROM virtual variable count mismatch'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
@@ -171,7 +175,7 @@ def config_size_check():
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py','tools/vesc_response_lab.py tools/vesc_manual_spin_monitor.py'])
+    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py','tools/vesc_response_lab.py', 'tools/vesc_manual_spin_monitor.py','tools/test_hall_detect_repeat.py','tools/test_duty_ramp100.py'])
     run([sys.executable,'tools/host_compile_check.py'])
     run([sys.executable,'tools/test_foc_math.py'])
     run([sys.executable,'tools/test_motor_control_v12.py'])

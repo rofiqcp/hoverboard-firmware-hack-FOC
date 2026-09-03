@@ -29,7 +29,9 @@ typedef struct {
     volatile int16_t m_speed_set_rpm;       /* active/slewed mechanical RPM */
     volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
     volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */
-    volatile int16_t m_duty_set_permille;
+    volatile int16_t m_duty_set_permille;      /* requested VESC duty */
+    volatile int16_t m_duty_ramp_permille;     /* active/ramped duty target */
+    uint16_t m_duty_ramp_step_permille;        /* m_duty_ramp_step * 1000 */
     int32_t m_duty_i_q15;
     uint32_t m_duty_kp_q12_per_permille;
     uint32_t m_duty_ki_q12_per_permille;
@@ -49,6 +51,8 @@ typedef struct {
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
     volatile int16_t m_current_limit_q4;
+    volatile int16_t m_input_current_max_q4;   /* positive DC-link draw limit */
+    volatile int16_t m_input_current_regen_q4; /* magnitude of negative DC-link limit */
     volatile int16_t m_abs_current_limit_counts; /* precomputed l_abs_current_max * A2BIT_CONV */
     volatile int16_t m_duty_limit_permille;      /* precomputed l_max_duty * 1000 */
 
@@ -89,6 +93,7 @@ typedef struct {
      * and centered-PWM states on this hoverboard hardware. */
     volatile int16_t m_off_offset0, m_off_offset1, m_off_offsetdc;
     volatile uint16_t m_off_offset_samples;
+    volatile uint16_t m_off_settle_ticks;
     volatile uint8_t m_off_offset_valid;
     int32_t m_off_offset_sum0, m_off_offset_sum1, m_off_offset_sumdc;
 

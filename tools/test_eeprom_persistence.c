@@ -9,6 +9,7 @@
 #include "defines.h"
 #include "eeprom.h"
 #include "motor/mcpwm_foc.h"
+#include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
 
 GPIO_TypeDef _GPIOA={0},_GPIOB={0},_GPIOC={0};
@@ -60,11 +61,31 @@ int main(void){
     memset(ee_valid,0,sizeof(ee_valid));
     mcpwm_foc_init();
 
+    /* ABS current must cover the magnitude of BOTH current directions. A
+     * braking limit larger than the positive motoring limit must not slip past
+     * validation and cause a guaranteed ABS fault during regen. */
+    {
+        mc_configuration bad=m_motor_1.m_conf;
+        bad.l_current_max=1.0f; bad.l_current_min=-12.0f; bad.l_abs_current_max=10.0f;
+        mcpwm_foc_set_configuration(&bad,false);
+        if(fabsf(m_motor_1.m_conf.l_abs_current_max-MCCONF_L_ABS_CURRENT_MAX)>0.001f)
+            return fail("ABS current must cover negative current magnitude");
+        if(m_motor_1.m_abs_current_limit_counts!=(int16_t)(MCCONF_L_ABS_CURRENT_MAX*A2BIT_CONV+0.5f))
+            return fail("ABS runtime count scaling after bidirectional validation");
+        bad.l_abs_current_max=13.0f;
+        mcpwm_foc_set_configuration(&bad,false);
+        if(fabsf(m_motor_1.m_conf.l_abs_current_max-13.0f)>0.001f ||
+           m_motor_1.m_abs_current_limit_counts!=13*A2BIT_CONV)
+            return fail("valid ABS current setting must stay authoritative");
+    }
+
     uint8_t hl[8],hr[8]; fill_table(hl,5u); fill_table(hr,11u);
     mc_configuration cl=m_motor_1.m_conf, cr=m_motor_2.m_conf;
     memcpy(cl.foc_hall_table,hl,8); memcpy(cr.foc_hall_table,hr,8);
-    cl.l_current_max=12.34f; cl.l_current_min=-7.65f; cl.l_abs_current_max=18.25f; cl.l_max_duty=0.9134f;
-    cr.l_current_max=9.87f; cr.l_current_min=-6.54f; cr.l_abs_current_max=17.75f; cr.l_max_duty=0.8765f;
+    cl.l_current_max=12.34f; cl.l_current_min=-7.65f; cl.l_abs_current_max=18.25f; cl.l_max_duty=0.9134f; cl.l_slow_abs_current=true;
+    cr.l_current_max=9.87f; cr.l_current_min=-6.54f; cr.l_abs_current_max=17.75f; cr.l_max_duty=0.8765f; cr.l_slow_abs_current=false;
+    cl.l_in_current_max=14.50f; cl.l_in_current_min=-13.50f; cl.m_duty_ramp_step=0.0312f; cl.cc_min_current=0.17f;
+    cr.l_in_current_max=12.25f; cr.l_in_current_min=-11.75f; cr.m_duty_ramp_step=0.0175f; cr.cc_min_current=0.23f;
     cl.p_pid_kd_filter=0.37f; cr.p_pid_kd_filter=0.63f;
     cl.foc_duty_dowmramp_kp=23.4f; cl.foc_duty_dowmramp_ki=456.7f;
     cr.foc_duty_dowmramp_kp=17.8f; cr.foc_duty_dowmramp_ki=321.2f;
@@ -93,7 +114,15 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.l_current_max-12.34f)>0.011f) return fail("left current persistence");
     if(fabsf(m_motor_2.m_conf.l_current_max-9.87f)>0.011f) return fail("right current persistence");
     if(fabsf(m_motor_1.m_conf.l_current_min+7.65f)>0.011f || fabsf(m_motor_2.m_conf.l_current_min+6.54f)>0.011f) return fail("current min persistence");
+    if(fabsf(m_motor_1.m_conf.l_in_current_max-14.50f)>0.011f || fabsf(m_motor_2.m_conf.l_in_current_max-12.25f)>0.011f) return fail("input current max persistence");
+    if(fabsf(m_motor_1.m_conf.l_in_current_min+13.50f)>0.011f || fabsf(m_motor_2.m_conf.l_in_current_min+11.75f)>0.011f) return fail("input current min persistence");
+    if(fabsf(m_motor_1.m_conf.m_duty_ramp_step-0.0312f)>0.00011f || fabsf(m_motor_2.m_conf.m_duty_ramp_step-0.0175f)>0.00011f) return fail("duty ramp persistence");
+    if(fabsf(m_motor_1.m_conf.cc_min_current-0.17f)>0.011f || fabsf(m_motor_2.m_conf.cc_min_current-0.23f)>0.011f) return fail("cc_min_current persistence");
+    if(m_motor_1.m_input_current_max_q4!=11600 || m_motor_1.m_input_current_regen_q4!=10800 ||
+       m_motor_2.m_input_current_max_q4!=9800 || m_motor_2.m_input_current_regen_q4!=9400) return fail("input current runtime restore");
+    if(m_motor_1.m_duty_ramp_step_permille!=31u || m_motor_2.m_duty_ramp_step_permille!=18u) return fail("duty ramp runtime restore");
     if(fabsf(m_motor_1.m_conf.l_abs_current_max-18.25f)>0.011f || fabsf(m_motor_2.m_conf.l_abs_current_max-17.75f)>0.011f) return fail("abs current persistence");
+    if(!m_motor_1.m_conf.l_slow_abs_current || m_motor_2.m_conf.l_slow_abs_current) return fail("slow ABS current persistence");
     if(fabsf(m_motor_1.m_conf.l_max_duty-0.9134f)>0.00011f || fabsf(m_motor_2.m_conf.l_max_duty-0.8765f)>0.00011f) return fail("max duty persistence");
     if(fabsf(m_motor_1.m_conf.p_pid_kd_filter-0.37f)>0.00011f || fabsf(m_motor_2.m_conf.p_pid_kd_filter-0.63f)>0.00011f) return fail("position D filter persistence");
     if(fabsf(m_motor_1.m_conf.foc_duty_dowmramp_kp-23.4f)>0.051f || fabsf(m_motor_2.m_conf.foc_duty_dowmramp_kp-17.8f)>0.051f) return fail("duty downramp Kp persistence");

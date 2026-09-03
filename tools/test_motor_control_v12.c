@@ -229,38 +229,54 @@ int main(void){
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_openloop_id_target_q4!=SVPWM_MAX_ID_A*FOC_CURRENT_Q4_PER_A)return fail("mode4 Id safety clamp");
 
-    /* DUTY 95% regression: VESC/legacy duty sources must clamp at 0.95,
-     * use the current PI, and generate exactly 950 permille modulation without
-     * violating the 100-count ADC sampling margin. */
+    /* VESC normalized +/-1.0 must reach the exact EFeru FOC hardware ceiling:
+     * ARR=2000 with symmetric 110-count current-sampling margin. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
     ctrlModReq=VLT_MODE; pwml=1000; pwmr=0;
     for(int i=0;i<32000;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_duty_set_permille!=950)return fail("duty command must clamp to 95pct");
-    if(m_motor_1.m_duty_now_permille!=950)return fail("duty actual modulation must reach 95pct");
+    if(m_motor_1.m_duty_set_permille!=1000)return fail("duty +1.0 command scaling");
+    if(m_motor_1.m_duty_now_permille!=1000)return fail("duty +1.0 telemetry scaling");
     if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("duty target must stay current-limited");
-    if(m_motor_1.m_ccr_a<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_a>2000-MCCONF_PWM_MARGIN_COUNTS ||
-       m_motor_1.m_ccr_b<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_b>2000-MCCONF_PWM_MARGIN_COUNTS ||
-       m_motor_1.m_ccr_c<MCCONF_PWM_MARGIN_COUNTS || m_motor_1.m_ccr_c>2000-MCCONF_PWM_MARGIN_COUNTS)
-        return fail("duty95 CCR violates ADC margin");
+    if(m_motor_1.m_ccr_a<110 || m_motor_1.m_ccr_a>1890 ||
+       m_motor_1.m_ccr_b<110 || m_motor_1.m_ccr_b>1890 ||
+       m_motor_1.m_ccr_c<110 || m_motor_1.m_ccr_c>1890)
+        return fail("duty1 CCR violates EFeru 110..1890 margin");
+    mcpwm_foc_set_duty(-1.0f,false); mcpwm_foc_vesc_override_touch(false);
+    if(m_motor_1.m_duty_set_permille!=-1000)return fail("duty -1.0 command scaling");
+    for(int i=0;i<32000;i++){if((i%1000)==0)mcpwm_foc_vesc_override_touch(false);mcpwm_foc_adc_int_handler();}
+    if(m_motor_1.m_duty_now_permille!=-1000)return fail("duty -1.0 telemetry scaling");
+    mcpwm_foc_set_duty(0.0f,false);
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("VESC SET_DUTY zero must immediate free-run");
+    mcpwm_foc_set_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT)return fail("VESC SET_CURRENT 1A entry");
+    mcpwm_foc_set_current(0.0f,false);
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("VESC SET_CURRENT zero must immediate free-run");
 
-    /* Above 80% a single low-side shunt glitch must not create a false ABS OC,
-     * but persistent phase over-current must still fault on sample 3. */
+    /* Two-shunt regression: a raw phase sample can be unobservable near a PWM
+     * boundary and must NOT directly cause VESC ABS_OVER_CURRENT. The ABS source
+     * is D/Q motor-current magnitude; three consecutive over-limit D/Q samples
+     * still must fault. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("duty95 bridge did not arm");
     while(m_motor_1.m_bridge_settle_ticks>0u)DMA1_Channel1_IRQHandler();
-    adc_buffer.rlA=950; /* +1050 counts = 21 A, above 20 A absolute phase limit */
-    for(int k=1;k<=2;k++){
-        m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
-        if(m_motor_1.m_fault!=FAULT_CODE_NONE)return fail("high-duty phase glitch faulted before qualifier");
-        if(m_motor_1.m_phase_overcurrent_streak!=(uint8_t)k)return fail("high-duty OC streak mismatch");
+    adc_buffer.rlA=950; /* raw reconstructed phase >20 A; intentionally ignored as direct ABS source */
+    m_motor_1.m_id_q4=0; m_motor_1.m_iq_q4=0; DMA1_Channel1_IRQHandler();
+    if(m_motor_1.m_fault!=FAULT_CODE_NONE || m_motor_1.m_phase_overcurrent_streak!=0u)
+        return fail("raw two-shunt phase glitch must not trip ABS");
+    adc_buffer.rlA=adc_buffer.rlB=2000;
+    for(int k=1;k<=3;k++){
+        m_motor_1.m_id_q4=(int16_t)(21*FOC_CURRENT_Q4_PER_A); m_motor_1.m_iq_q4=0;
+        DMA1_Channel1_IRQHandler();
+        if(k<3 && m_motor_1.m_fault!=FAULT_CODE_NONE)return fail("DQ ABS faulted before qualifier");
     }
-    m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
-    if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("persistent high-duty phase OC must fault");
+    if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("persistent DQ motor over-current must fault");
     if(m_motor_1.m_phase_trip_count!=1u || m_motor_1.m_dc_trip_count!=0u || m_motor_1.m_last_trip_source!=1u)
-        return fail("phase OC diagnostic split");
+        return fail("DQ ABS diagnostic split");
 
     /* DC-link level-2 protection remains immediate even at high duty. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;

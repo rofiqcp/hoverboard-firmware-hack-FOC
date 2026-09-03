@@ -12,6 +12,16 @@
 #define DEAD_TIME                48
 #define DELAY_IN_MAIN_LOOP       5
 #define A2BIT_CONV               50  /* EFeru ADC current scaling: 50 count/A */
+
+/* Board-specific VESC duty normalization. VESC Tool keeps the standard
+ * [-1.000,+1.000] command range, while 1.000 is mapped to the highest physical
+ * modulation verified stable on this two-shunt hoverboard power stage. Keep
+ * these hardware scaling constants in config.h so they are never confused with
+ * user MC Configuration limits. */
+#define VESC_DUTY_PHYSICAL_SCALE_PERMILLE   960
+#define FOC_PWM_MARGIN_COUNTS               110
+#define FOC_SVPWM_VECTOR_FULL_SAFE        14238
+#define FOC_SVPWM_VECTOR_MAX     ((FOC_SVPWM_VECTOR_FULL_SAFE * VESC_DUTY_PHYSICAL_SCALE_PERMILLE) / 1000)
 #define ADC_CONV_TIME_7C5        20
 #define ADC_CONV_CLOCK_CYCLES    ADC_CONV_TIME_7C5
 #define ADC_CLOCK_DIV            4

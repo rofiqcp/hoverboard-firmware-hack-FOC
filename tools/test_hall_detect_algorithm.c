@@ -117,8 +117,14 @@ int main(void){
     HAL_Delay(1u);
     if(!mcpwm_foc_detect_hall(1.0f,false,tl))return fail("left detector returned false");
     if(validate(tl,left_raw_for_sector,"left"))return 1;
+    { uint8_t t2[8],t3[8];
+      if(!mcpwm_foc_detect_hall(1.0f,false,t2) || !mcpwm_foc_detect_hall(1.0f,false,t3))return fail("left repeated detector false");
+      if(memcmp(tl,t2,8)!=0 || memcmp(tl,t3,8)!=0)return fail("left 3x detector table repeatability"); }
     if(!mcpwm_foc_detect_hall(1.0f,true,tr))return fail("right detector returned false");
     if(validate(tr,right_raw_for_sector,"right"))return 1;
+    { uint8_t t2[8],t3[8];
+      if(!mcpwm_foc_detect_hall(1.0f,true,t2) || !mcpwm_foc_detect_hall(1.0f,true,t3))return fail("right repeated detector false");
+      if(memcmp(tr,t2,8)!=0 || memcmp(tr,t3,8)!=0)return fail("right 3x detector table repeatability"); }
     for(int i=0;i<8;i++){
         if((uint8_t)m_motor_1.m_conf.foc_hall_table[i]!=tl[i])return fail("left active table not applied");
         if((uint8_t)m_motor_2.m_conf.foc_hall_table[i]!=tr[i])return fail("right active table not applied");
@@ -200,7 +206,7 @@ int main(void){
     if(m_motor_1.m_hall_direction!=-1)return fail("reverse Hall direction after warmup");
     if(m_motor_1.m_hall_sequence_reject_count!=0u)return fail("reversal sequence reject");
     if(m_motor_1.m_hall_period_reject_count!=0u)return fail("reversal period reject");
-    printf("HALL_DETECT_ALGORITHM_PASS left=[%u,%u,%u,%u,%u,%u] right=[%u,%u,%u,%u,%u,%u]\n",
+    printf("HALL_DETECT_ALGORITHM_PASS repeats=3x(each detect=3F+3R) left=[%u,%u,%u,%u,%u,%u] right=[%u,%u,%u,%u,%u,%u]\n",
            tl[1],tl[2],tl[3],tl[4],tl[5],tl[6],tr[1],tr[2],tr[3],tr[4],tr[5],tr[6]);
     return 0;
 }

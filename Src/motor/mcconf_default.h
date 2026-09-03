@@ -8,15 +8,17 @@
  * EFeru/hoverboard controller. Runtime FOC math remains integer/fixed-point. */
 #define MCCONF_L_CURRENT_MAX                 15.0f
 #define MCCONF_L_CURRENT_MIN                -15.0f
-#define MCCONF_L_IN_CURRENT_MAX              17.0f
-#define MCCONF_L_IN_CURRENT_MIN             -17.0f
+#define MCCONF_L_IN_CURRENT_MAX              15.0f
+#define MCCONF_L_IN_CURRENT_MIN             -15.0f
 #define MCCONF_L_MAX_ERPM                 15000.0f
 #define MCCONF_L_MIN_ERPM                -15000.0f
 #define MCCONF_L_MIN_DUTY                     0.0f
-#define MCCONF_L_MAX_DUTY                    0.95f
+#define MCCONF_L_MAX_DUTY                    1.00f
 #define MCCONF_FAULT_STOP_TIME_MS             500u
 #define MCCONF_FOC_DUTY_DOWNRAMP_KP            20.0f
 #define MCCONF_FOC_DUTY_DOWNRAMP_KI           400.0f
+#define MCCONF_DUTY_RAMP_STEP_DEFAULT            0.02f /* VESC m_duty_ramp_step */
+#define MCCONF_CC_MIN_CURRENT                     0.05f /* VESC-style release threshold */
 #define MCCONF_DUTY_PI_BUS_NOMINAL_V            42.5f
 #define MCCONF_FOC_SENSOR_MODE      FOC_SENSOR_MODE_HALL
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u
@@ -53,20 +55,20 @@
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX   12800
-#define MCCONF_FOC_DUTY_VOLTAGE_MAX          15200   /* 95% exact modulation */
+#define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */
-#define MCCONF_PWM_MARGIN_COUNTS                100   /* 5% of ARR=2000 -> 95% gate ceiling */
-#define MCCONF_HIGH_DUTY_OC_THRESHOLD_PERMILLE  800u
-#define MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES          3u /* keep ABS OC active; reject 1-sample shunt glitches */
+#define MCCONF_PWM_MARGIN_COUNTS          FOC_PWM_MARGIN_COUNTS
+#define MCCONF_ABS_CURRENT_QUAL_SAMPLES           3u /* ~0.19 ms @16 kHz: reject transient D/Q spikes */
 /* OFF->RUN ADC/gate-driver settling. Unlike the old per-start offset calibration,
  * this never learns a new offset. It only holds a zero vector for 8 PWM frames
  * (0.5 ms @16 kHz) so the first LOW-FET shunt sample belongs to the driven
  * operating point calibrated during the original 2000-sample startup window. */
-#define MCCONF_BRIDGE_SETTLE_SAMPLES                8u
+#define MCCONF_BRIDGE_SETTLE_SAMPLES               80u
 /* OFF/high-impedance telemetry uses its own frozen zero-current ADC baseline.
  * Remove a few ADC counts of amplifier noise without hiding real passive/regen
  * current changes when the wheel is back-driven manually. 4 counts = 0.08 A. */
 #define MCCONF_OFF_TELEM_DEADBAND_COUNTS              4
+#define MCCONF_OFF_TELEM_SETTLE_SAMPLES             800u /* 50 ms @16 kHz after bridge release */
 #define MCCONF_CURRENT_SLEW_A_PER_S              10u
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX

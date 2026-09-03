@@ -92,9 +92,17 @@ enum {
     EE_L_EXT_CURRENT_MIN_CA = 123, EE_L_EXT_ABS_CURRENT_CA, EE_L_EXT_MAX_DUTY_X10000,
     EE_L_EXT_POS_KD_FILTER_X10000, EE_L_EXT_DUTY_KP_X10, EE_L_EXT_DUTY_KI_X10,
     EE_R_EXT_CURRENT_MIN_CA = 129, EE_R_EXT_ABS_CURRENT_CA, EE_R_EXT_MAX_DUTY_X10000,
-    EE_R_EXT_POS_KD_FILTER_X10000, EE_R_EXT_DUTY_KP_X10, EE_R_EXT_DUTY_KI_X10
+    EE_R_EXT_POS_KD_FILTER_X10000, EE_R_EXT_DUTY_KP_X10, EE_R_EXT_DUTY_KI_X10,
+    /* Input-current and duty-ramp extension, appended without moving App Config. */
+    EE_L_EXT_IN_CURRENT_MAX_CA = 135, EE_L_EXT_IN_CURRENT_MIN_CA, EE_L_EXT_DUTY_RAMP_X10000,
+    EE_R_EXT_IN_CURRENT_MAX_CA = 138, EE_R_EXT_IN_CURRENT_MIN_CA, EE_R_EXT_DUTY_RAMP_X10000,
+    /* Standard VESC current-controller release threshold. Appended only; no
+     * historical EEPROM address is moved. Stored in centiamps. */
+    EE_L_CC_MIN_CURRENT_CA = 141, EE_R_CC_MIN_CURRENT_CA = 142
 };
-#define EE_CFG_SIGNATURE_VALUE 0x6016u
+#define EE_CFG_SIGNATURE_VALUE 0x6018u
+#define EE_CFG_SIGNATURE_V25   0x6017u /* before cc_min_current persistence */
+#define EE_CFG_SIGNATURE_V24   0x6016u /* before input-current/duty-ramp extension */
 #define EE_CFG_SIGNATURE_V23   0x6015u /* before MC extension slots */
 #define EE_CFG_SIGNATURE_V22   0x6014u /* position Kp/filter update, telemetry filter not packed yet */
 #define EE_CFG_SIGNATURE_V21   0x6013u /* previous position default Kp=0.008 */
@@ -145,6 +153,8 @@ bool mc_interface_store_configuration_motor(bool second) {
     const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
     const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
     const uint8_t ext_base = second ? EE_R_EXT_CURRENT_MIN_CA : EE_L_EXT_CURRENT_MIN_CA;
+    const uint8_t io_base = second ? EE_R_EXT_IN_CURRENT_MAX_CA : EE_L_EXT_IN_CURRENT_MAX_CA;
+    const uint8_t ccmin_slot = second ? EE_R_CC_MIN_CURRENT_CA : EE_L_CC_MIN_CURRENT_CA;
     const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
     int32_t ca = (int32_t)(m->m_conf.l_current_max * 100.0f + 0.5f);
     if (ca < 1) ca = 1;
@@ -204,10 +214,35 @@ bool mc_interface_store_configuration_motor(bool second) {
         uint32_t dki=(uint32_t)(m->m_conf.foc_duty_dowmramp_ki*10.0f+0.5f); if(dki>65535u)dki=65535u;
         ok &= ee_write_slot(ext_base+0u,(uint16_t)(int16_t)cmin);
         ok &= ee_write_slot(ext_base+1u,(uint16_t)abs_ca);
-        ok &= ee_write_slot(ext_base+2u,(uint16_t)duty);
+        /* ext duty uses only 0..10000, so bit15 safely persists the standard
+         * VESC l_slow_abs_current flag without consuming another EEPROM slot. */
+        const uint16_t duty_flags=(uint16_t)duty | (m->m_conf.l_slow_abs_current?0x8000u:0u);
+        ok &= ee_write_slot(ext_base+2u,duty_flags);
         ok &= ee_write_slot(ext_base+3u,(uint16_t)pdf);
         ok &= ee_write_slot(ext_base+4u,(uint16_t)dkp);
         ok &= ee_write_slot(ext_base+5u,(uint16_t)dki);
+    }
+    {
+        int32_t imax=(int32_t)(m->m_conf.l_in_current_max*100.0f+0.5f);
+        int32_t imin=(int32_t)(m->m_conf.l_in_current_min*100.0f-0.5f);
+        if(imax<10)imax=10;
+        if(imax>I_DC_MAX*100)imax=I_DC_MAX*100;
+        if(imin>-10)imin=-10;
+        if(imin<-(int32_t)I_DC_MAX*100)imin=-(int32_t)I_DC_MAX*100;
+        int32_t dr=(int32_t)(m->m_conf.m_duty_ramp_step*10000.0f+0.5f);
+        if(dr<1)dr=1;
+        if(dr>2000)dr=2000;
+        ok &= ee_write_slot(io_base+0u,(uint16_t)imax);
+        ok &= ee_write_slot(io_base+1u,(uint16_t)(int16_t)imin);
+        ok &= ee_write_slot(io_base+2u,(uint16_t)dr);
+    }
+    {
+        float cc=m->m_conf.cc_min_current;
+        if(!(cc>=0.001f && cc<=1.0f))cc=MCCONF_CC_MIN_CURRENT;
+        uint32_t cca=(uint32_t)(cc*100.0f+0.5f);
+        if(cca<1u)cca=1u;
+        if(cca>100u)cca=100u;
+        ok &= ee_write_slot(ccmin_slot,(uint16_t)cca);
     }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
@@ -222,7 +257,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||
         !ee_read_slot(sig_slot, &sig) ||
-        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V23 && sig != EE_CFG_SIGNATURE_V22 && sig != EE_CFG_SIGNATURE_V21 && sig != EE_CFG_SIGNATURE_V20 && sig != EE_CFG_SIGNATURE_V19 &&
+        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V25 && sig != EE_CFG_SIGNATURE_V24 && sig != EE_CFG_SIGNATURE_V23 && sig != EE_CFG_SIGNATURE_V22 && sig != EE_CFG_SIGNATURE_V21 && sig != EE_CFG_SIGNATURE_V20 && sig != EE_CFG_SIGNATURE_V19 &&
          sig != EE_CFG_SIGNATURE_V18 && sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
         return false;
     }
@@ -240,6 +275,8 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
     const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
     const uint8_t ext_base = second ? EE_R_EXT_CURRENT_MIN_CA : EE_L_EXT_CURRENT_MIN_CA;
+    const uint8_t io_base = second ? EE_R_EXT_IN_CURRENT_MAX_CA : EE_L_EXT_IN_CURRENT_MAX_CA;
+    const uint8_t ccmin_slot = second ? EE_R_CC_MIN_CURRENT_CA : EE_L_CC_MIN_CURRENT_CA;
     uint16_t v = 0u;
     uint8_t hall[8];
     for (uint8_t i = 0u; i < 8u; ++i) {
@@ -249,7 +286,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     if (!hall_table_sane(hall)) return false;
     for (uint8_t i = 0u; i < 8u; ++i) m->m_conf.foc_hall_table[i] = hall[i];
 
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V23) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24 || sig == EE_CFG_SIGNATURE_V23) {
         if (ee_read_slot(pole_slot, &v)) {
             const uint8_t poles=(uint8_t)(v & 0xffu);
             const uint8_t fq=(uint8_t)(v >> 8);
@@ -270,18 +307,37 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.l_current_min = -m->m_conf.l_current_max;
         m->m_current_limit_q4 = (int16_t)((int32_t)v * A2BIT_CONV * 16 / 100);
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24) {
         uint16_t e[6]; bool ext_ok=true;
         for(uint8_t i=0u;i<6u;++i) ext_ok &= ee_read_slot((uint8_t)(ext_base+i),&e[i]);
         if(ext_ok){
             const int16_t cmin=(int16_t)e[0];
             if(cmin<=-10 && cmin>=-(int16_t)(I_MOT_MAX*100))m->m_conf.l_current_min=(float)cmin/100.0f;
             if(e[1]>=10u && e[1]<=(uint16_t)(MCCONF_L_ABS_CURRENT_MAX*100.0f+0.5f))m->m_conf.l_abs_current_max=(float)e[1]/100.0f;
-            if(e[2]>=1u && e[2]<=10000u)m->m_conf.l_max_duty=(float)e[2]/10000.0f;
+            {
+                const uint16_t duty=(uint16_t)(e[2]&0x7fffu);
+                m->m_conf.l_slow_abs_current=(e[2]&0x8000u)!=0u;
+                if(duty>=1u && duty<=10000u)m->m_conf.l_max_duty=(float)duty/10000.0f;
+            }
             if(e[3]<=10000u)m->m_conf.p_pid_kd_filter=(float)e[3]/10000.0f;
             if(e[4]>0u)m->m_conf.foc_duty_dowmramp_kp=(float)e[4]/10.0f;
             if(e[5]>0u)m->m_conf.foc_duty_dowmramp_ki=(float)e[5]/10.0f;
         }
+    }
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V25) {
+        uint16_t x[3]; bool io_ok=true;
+        for(uint8_t i=0u;i<3u;++i)io_ok &= ee_read_slot((uint8_t)(io_base+i),&x[i]);
+        if(io_ok){
+            const int16_t imin=(int16_t)x[1];
+            if(x[0]>=10u && x[0]<=I_DC_MAX*100u)m->m_conf.l_in_current_max=(float)x[0]/100.0f;
+            if(imin<=-10 && imin>=-(int16_t)(I_DC_MAX*100))m->m_conf.l_in_current_min=(float)imin/100.0f;
+            if(x[2]>=1u && x[2]<=2000u)m->m_conf.m_duty_ramp_step=(float)x[2]/10000.0f;
+        }
+    }
+    if (sig == EE_CFG_SIGNATURE_VALUE && ee_read_slot(ccmin_slot,&v) && v>=1u && v<=100u) {
+        m->m_conf.cc_min_current=(float)v/100.0f;
+    } else if (sig != EE_CFG_SIGNATURE_VALUE) {
+        m->m_conf.cc_min_current=MCCONF_CC_MIN_CURRENT;
     }
     volatile uint16_t *gain_dst[10] = {
         &m->m_kpq_q11, &m->m_kiq_q16, &m->m_kpd_q11, &m->m_kid_q16,
@@ -336,8 +392,34 @@ bool mc_interface_load_configuration_motor(bool second) {
      * VESC Tool fields. A value is not considered restored merely because
      * GET_MCCONF shows it; the ISR/controller must use it after reboot too. */
     {
+        float cc=m->m_conf.cc_min_current;
+        if(!(cc>=0.001f && cc<=1.0f))cc=MCCONF_CC_MIN_CURRENT;
+        m->m_conf.cc_min_current=cc;
+        float imax=m->m_conf.l_in_current_max;
+        float imin=m->m_conf.l_in_current_min;
+        if(!(imax>=0.1f) || imax>(float)I_DC_MAX)imax=MCCONF_L_IN_CURRENT_MAX;
+        if(!(imin<=-0.1f) || imin<-(float)I_DC_MAX)imin=MCCONF_L_IN_CURRENT_MIN;
+        m->m_conf.l_in_current_max=imax; m->m_conf.l_in_current_min=imin;
+        int32_t imax_q4=(int32_t)(imax*(float)(A2BIT_CONV*16)+0.5f);
+        int32_t iregen_q4=(int32_t)(-imin*(float)(A2BIT_CONV*16)+0.5f);
+        const int32_t idc_q4_max=I_DC_MAX*A2BIT_CONV*16;
+        if(imax_q4<1)imax_q4=1;
+        if(imax_q4>idc_q4_max)imax_q4=idc_q4_max;
+        if(iregen_q4<1)iregen_q4=1;
+        if(iregen_q4>idc_q4_max)iregen_q4=idc_q4_max;
+        m->m_input_current_max_q4=(int16_t)imax_q4;
+        m->m_input_current_regen_q4=(int16_t)iregen_q4;
+        float dr=m->m_conf.m_duty_ramp_step;
+        if(!(dr>=0.0001f && dr<=0.20f))dr=MCCONF_DUTY_RAMP_STEP_DEFAULT;
+        m->m_conf.m_duty_ramp_step=dr;
+        int32_t drp=(int32_t)(dr*1000.0f+0.5f);
+        if(drp<1)drp=1;
+        if(drp>200)drp=200;
+        m->m_duty_ramp_step_permille=(uint16_t)drp;
         float abs_i=m->m_conf.l_abs_current_max;
-        if(!(abs_i>=m->m_conf.l_current_max) || abs_i>MCCONF_L_ABS_CURRENT_MAX) abs_i=MCCONF_L_ABS_CURRENT_MAX;
+        float commanded_abs=m->m_conf.l_current_max;
+        if(-m->m_conf.l_current_min>commanded_abs)commanded_abs=-m->m_conf.l_current_min;
+        if(!(abs_i>=commanded_abs) || abs_i>MCCONF_L_ABS_CURRENT_MAX) abs_i=MCCONF_L_ABS_CURRENT_MAX;
         m->m_conf.l_abs_current_max=abs_i;
         int32_t ac=(int32_t)(abs_i*(float)A2BIT_CONV+0.5f);
         if(ac<1) ac=1;

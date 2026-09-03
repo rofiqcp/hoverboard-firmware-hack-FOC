@@ -237,6 +237,12 @@ class Diag:
     raw_adc_phase0: int | None = None
     raw_adc_phase1: int | None = None
     raw_adc_dc: int | None = None
+    off_offset0: int | None = None
+    off_offset1: int | None = None
+    off_offset_dc: int | None = None
+    off_offset_samples: int | None = None
+    off_settle_ticks: int | None = None
+    off_offset_valid: bool | None = None
 
     def short(self) -> str:
         return (
@@ -319,6 +325,10 @@ def parse_diag(payload: bytes) -> Diag:
             ext.update(raw_adc_phase0=rla, raw_adc_phase1=rlb, raw_adc_dc=dcl)
         else:
             ext.update(raw_adc_phase0=rrb, raw_adc_phase1=rrc, raw_adc_dc=dcr)
+    if len(payload) >= 189:
+        oo0, oo1, oodc, osamp, osettle, oval = struct.unpack_from(">3hHHB", payload, 178)
+        ext.update(off_offset0=oo0, off_offset1=oo1, off_offset_dc=oodc,
+                   off_offset_samples=osamp, off_settle_ticks=osettle, off_offset_valid=bool(oval))
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),
