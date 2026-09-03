@@ -329,32 +329,38 @@ def run_motion_test(args, link: VescDual, motor: str, cmd: int, raw: int, label:
     samples: list[tuple[float, Values, Diag | None]] = []
     start = time.monotonic()
     try:
-        with Refresher(sender, args.hz) as ref:
-            end = start + args.seconds
-            next_sample = start
-            next_diag = start
-            latest_diag = None
-            while time.monotonic() < end:
-                now = time.monotonic()
-                if now >= next_diag:
-                    latest_diag = link.diag(is_right)
-                    next_diag += 0.20
-                if now >= next_sample:
-                    v = link.values(is_right)
-                    samples.append((now - start, v, latest_diag))
-                    # Hardware safety envelope. A low-energy diagnostic must never
-                    # silently become an unloaded high-speed run.
-                    speed_limit = 2000.0
-                    if cmd == COMM_SET_RPM:
-                        speed_limit = max(1500.0, abs(float(raw)) * 1.8)
-                    if v.fault or abs(v.rpm) > speed_limit or abs(v.current_motor) > 5.0:
-                        print(f"MOTION_SAFETY_ABORT fault={v.fault} erpm={v.rpm:.0f} Imotor={v.current_motor:.2f}A")
-                        return 2
-                    next_sample += 0.05
-                time.sleep(0.002)
-            print(f"setpoint refresh count={ref.count} errors={len(ref.errors)}")
-            if ref.errors:
-                print("refresh errors:", ref.errors[-3:])
+        # Deterministic single-UART scheduler. Do not run a background SET_*
+        # writer concurrently with VESC request/reply transactions: even with a
+        # byte-level lock that can reorder reply expectations under load.
+        end = start + args.seconds
+        next_cmd = start
+        next_sample = start
+        next_diag = start
+        cmd_period = 1.0 / max(args.hz, 1.0)
+        latest_diag = None
+        refresh_count = 0
+        while time.monotonic() < end:
+            now = time.monotonic()
+            if now >= next_cmd:
+                sender(); refresh_count += 1
+                next_cmd = now + cmd_period
+            if now >= next_diag:
+                latest_diag = link.diag(is_right)
+                next_diag = now + 0.20
+            if now >= next_sample:
+                v = link.values(is_right)
+                samples.append((now - start, v, latest_diag))
+                # Hardware safety envelope. A low-energy diagnostic must never
+                # silently become an unloaded high-speed run.
+                speed_limit = 2000.0
+                if cmd == COMM_SET_RPM:
+                    speed_limit = max(1500.0, abs(float(raw)) * 1.8)
+                if v.fault or abs(v.rpm) > speed_limit or abs(v.current_motor) > 5.0:
+                    print(f"MOTION_SAFETY_ABORT fault={v.fault} erpm={v.rpm:.0f} Imotor={v.current_motor:.2f}A")
+                    return 2
+                next_sample = now + 0.05
+            time.sleep(0.002)
+        print(f"setpoint refresh count={refresh_count} errors=0")
     finally:
         release_one(link, motor)
     time.sleep(0.10)
@@ -385,9 +391,11 @@ def cmd_current(args, link: VescDual) -> int:
     # setelah release terlalu singkat dan menghasilkan false-negative pada DMA/queue.
     require_arm(args)
     sender = lambda: send_one(link, motor, COMM_SET_CURRENT, raw)
-    with Refresher(sender, 50.0):
-        time.sleep(0.12)
-        active = link.diag(right)
+    # Same deterministic request/reply rule as run_motion_test: refresh a few
+    # times in-band, then read the active diagnostic without a writer thread.
+    for _ in range(3):
+        sender(); time.sleep(0.025)
+    active = link.diag(right)
     release_one(link, motor)
     print(f"COMMAND_PATH Iq_target={active.iq_target_a:.3f}A expected={args.amps:.3f}A mode={active.control_mode} ownership={active.override}")
     if abs(active.iq_target_a - args.amps) > 0.06 or not active.override:

@@ -3,6 +3,7 @@
 #include "config.h"
 #include "defines.h"
 #include "motor/mcpwm_foc.h"
+#include "motor/foc_math.h"
 #include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
 #include "vesc/datatypes.h"
@@ -57,6 +58,35 @@ static volatile uint32_t s_link_last_ms = 0u;
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
 static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
+
+/* Stock VESC handles COMM_DETECT_HALL_FOC as a blocking command in a dedicated
+ * worker thread. This F103 target is bare-metal, so reproduce the same external
+ * behavior with a cooperative state machine: UART request/reply remains alive
+ * during the ~12 s detection, while only the selected motor is locked. Detect
+ * itself never applies or stores the table; VESC Tool's Apply + SET_MCCONF does. */
+typedef enum {
+    HALL_DETECT_IDLE = 0,
+    HALL_DETECT_ALIGN,
+    HALL_DETECT_SWEEP
+} hall_detect_stage_t;
+
+typedef struct {
+    uint8_t active;
+    uint8_t second;
+    hall_detect_stage_t stage;
+    uint8_t pass;
+    uint8_t waiting_sample;
+    uint16_t align_step;
+    int16_t degree;
+    uint32_t next_ms;
+    float current_a;
+    int64_t sum_s[8];
+    int64_t sum_c[8];
+    uint16_t samples[8];
+} hall_detect_job_t;
+
+static hall_detect_job_t s_hall_detect;
+static void hall_detect_periodic(uint32_t now_ms);
 /* VESC Tool rotor-position display stream. Upstream commands.c stores one
  * display_position_mode per VESC instance; this dual virtual target stores the
  * last selected endpoint so COMM_FORWARD_CAN ID2 behaves like a second VESC. */
@@ -85,6 +115,7 @@ void vesc_protocol_init(void) {
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
     s_last_hall_store_ok[0] = s_last_hall_store_ok[1] = 0u;
+    memset(&s_hall_detect, 0, sizeof(s_hall_detect));
     s_display_pos_mode = DISP_POS_MODE_NONE;
     s_display_second = 0u;
     s_display_prev_ms = 0u;
@@ -269,6 +300,7 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
 }
 
 void vesc_protocol_periodic(uint32_t now_ms) {
+    hall_detect_periodic(now_ms);
     const disp_pos_mode mode = s_display_pos_mode;
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
@@ -557,34 +589,137 @@ static void reply_decoded_adc(void) {
     uart_send_payload(b, (uint16_t)i);
 }
 
-static void detect_hall_foc(bool second, const uint8_t *data, uint16_t len) {
-    uint8_t reply[10];
-    int32_t i = 0;
-    float current = 1.0f;
-    reply[0] = COMM_DETECT_HALL_FOC;
-    for (uint8_t h = 0u; h < 8u; ++h) reply[1u + h] = 255u;
-    reply[9] = 1u;
-    if (len >= 4u) current = (float)buffer_get_int32(data, &i) / 1000.0f;
-    if (mcpwm_foc_detect_hall(current, second, &reply[1])) {
-        /* This target treats Hall detect + persistence as one transaction.
-         * A detected table is not accepted until EEPROM reload reproduces the
-         * exact eight entries, so VESC Tool cannot receive a false success. */
-        uint8_t detected[8];
-        memcpy(detected, &reply[1], sizeof(detected));
-        bool persisted = mc_interface_store_configuration_motor(second);
-        if (persisted) persisted = mc_interface_load_configuration_motor(second);
-        if (persisted) {
-            const volatile mc_configuration *verify = mc_interface_get_configuration_motor(second);
-            for (uint8_t h = 0u; h < 8u; ++h) {
-                if ((uint8_t)verify->foc_hall_table[h] != detected[h]) { persisted = false; break; }
-            }
-        }
-        s_last_hall_store_ok[second ? 1u : 0u] = persisted ? 1u : 0u;
-        reply[9] = persisted ? 0u : 1u;
-    } else {
-        s_last_hall_store_ok[second ? 1u : 0u] = 0u;
+static uint8_t hall_detect_angle200(int64_t sum_s, int64_t sum_c, uint16_t n) {
+    if (n <= 30u) return 255u;
+    int64_t best_dot = INT64_MIN;
+    uint8_t best = 255u;
+    for (uint16_t a = 0u; a < 200u; ++a) {
+        int16_t sn, cs;
+        const uint16_t ph = (uint16_t)(((uint32_t)a * 65536u) / 200u);
+        foc_sin_cos_q15(ph, &sn, &cs);
+        const int64_t dot = sum_s * sn + sum_c * cs;
+        if (dot > best_dot) { best_dot = dot; best = (uint8_t)a; }
     }
+    return best;
+}
+
+static bool hall_detect_motor_locked(bool second) {
+    return s_hall_detect.active && (s_hall_detect.second != 0u) == second;
+}
+
+static void hall_detect_reply_and_stop(bool success) {
+    uint8_t reply[10];
+    reply[0] = COMM_DETECT_HALL_FOC;
+    uint8_t fails = 0u;
+    for (uint8_t h = 0u; h < 8u; ++h) {
+        const uint8_t a = hall_detect_angle200(s_hall_detect.sum_s[h], s_hall_detect.sum_c[h],
+                                               s_hall_detect.samples[h]);
+        reply[1u + h] = a;
+        if (a == 255u) fails++;
+    }
+    if (fails != 2u) success = false;
+    reply[9] = success ? 0u : 1u;
+    const bool second = s_hall_detect.second != 0u;
+    mc_interface_select_motor_thread(second ? 2 : 1);
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(second);
+    mc_interface_select_motor_thread(1);
+    s_last_hall_store_ok[second ? 1u : 0u] = 0u; /* Detect is intentionally not a store. */
+    memset(&s_hall_detect, 0, sizeof(s_hall_detect));
     uart_send_payload(reply, sizeof(reply));
+}
+
+static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
+    if (s_hall_detect.active) return; /* Stock VESC discards a second blocking command. */
+    if (len < 4u) {
+        uint8_t reply[10] = {COMM_DETECT_HALL_FOC,255,255,255,255,255,255,255,255,1};
+        uart_send_payload(reply, sizeof(reply));
+        return;
+    }
+    int32_t ind = 0;
+    float current = (float)buffer_get_int32(data, &ind) / 1000.0f;
+    if (current < 0.0f) current = -current;
+    const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
+    float max_i = m->m_conf.l_current_max;
+    if (max_i <= 0.0f || max_i > (float)I_MOT_MAX) max_i = (float)I_MOT_MAX;
+    /* VESC hall detect itself does not impose an arbitrary 4 A cap. The normal
+     * motor/current limit is the clamp, so VESC Tool's default 10 A behaves as
+     * expected on a 15 A hoverboard configuration. */
+    if (current > max_i) current = max_i;
+
+    memset(&s_hall_detect, 0, sizeof(s_hall_detect));
+    s_hall_detect.active = 1u;
+    s_hall_detect.second = second ? 1u : 0u;
+    s_hall_detect.stage = HALL_DETECT_ALIGN;
+    s_hall_detect.current_a = current;
+    s_hall_detect.next_ms = HAL_GetTick();
+    mc_interface_select_motor_thread(second ? 2 : 1);
+    mcpwm_foc_set_openloop_phase(0.0f, 0.0f, second);
+    mcpwm_foc_vesc_override_touch(second);
+    mc_interface_select_motor_thread(1);
+}
+
+static void hall_detect_periodic(uint32_t now_ms) {
+    if (!s_hall_detect.active) return;
+    if ((int32_t)(now_ms - s_hall_detect.next_ms) < 0) return;
+    const bool second = s_hall_detect.second != 0u;
+    mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
+    if (m->m_fault != FAULT_CODE_NONE) { hall_detect_reply_and_stop(false); return; }
+
+    if (s_hall_detect.stage == HALL_DETECT_ALIGN) {
+        if (s_hall_detect.align_step < 1000u) {
+            s_hall_detect.align_step++;
+            const float i = s_hall_detect.current_a * (float)s_hall_detect.align_step / 1000.0f;
+            mcpwm_foc_set_openloop_phase(i, 0.0f, second);
+            mcpwm_foc_vesc_override_touch(second);
+            s_hall_detect.next_ms = now_ms + 1u;
+            return;
+        }
+        s_hall_detect.stage = HALL_DETECT_SWEEP;
+        s_hall_detect.pass = 0u;
+        s_hall_detect.degree = 0;
+        s_hall_detect.waiting_sample = 0u;
+    }
+
+    if (s_hall_detect.stage != HALL_DETECT_SWEEP) return;
+    if (!s_hall_detect.waiting_sample) {
+        mcpwm_foc_set_openloop_phase(s_hall_detect.current_a, (float)s_hall_detect.degree, second);
+        mcpwm_foc_vesc_override_touch(second);
+        s_hall_detect.waiting_sample = 1u;
+        s_hall_detect.next_ms = now_ms + 5u;
+        return;
+    }
+
+    const uint8_t h = m->m_hall_state & 7u;
+    const int32_t dnorm = (s_hall_detect.degree >= 360) ? 0 : s_hall_detect.degree;
+    int16_t sn, cs;
+    const uint16_t ph = (uint16_t)(((uint32_t)dnorm * 65536u) / 360u);
+    foc_sin_cos_q15(ph, &sn, &cs);
+    s_hall_detect.sum_s[h] += sn;
+    s_hall_detect.sum_c[h] += cs;
+    if (s_hall_detect.samples[h] < 0xffffu) s_hall_detect.samples[h]++;
+    s_hall_detect.waiting_sample = 0u;
+
+    if (s_hall_detect.pass < 3u) {
+        if (s_hall_detect.degree >= 359) {
+            s_hall_detect.pass++;
+            s_hall_detect.degree = (s_hall_detect.pass < 3u) ? 0 : 360;
+        } else {
+            s_hall_detect.degree++;
+        }
+    } else {
+        if (s_hall_detect.degree <= 0) {
+            s_hall_detect.pass++;
+            if (s_hall_detect.pass >= 6u) {
+                hall_detect_reply_and_stop(true);
+                return;
+            }
+            s_hall_detect.degree = 360;
+        } else {
+            s_hall_detect.degree--;
+        }
+    }
+    s_hall_detect.next_ms = now_ms;
 }
 
 static int32_t q4_to_milliamps_normalized(int16_t q4, bool second) {
@@ -856,18 +991,21 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         }
         break;
     case COMM_SET_DUTY:
+        if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float duty = (float)buffer_get_int32(d, &k) / 100000.0f;
             touch_motor(second); mc_interface_set_duty(right_sign(second, duty));
         }
         break;
     case COMM_SET_CURRENT:
+        if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             touch_motor(second); mc_interface_set_current(right_sign(second, current));
         }
         break;
     case COMM_SET_CURRENT_BRAKE:
+        if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             if (current < 0.0f) current = -current;
@@ -875,6 +1013,7 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         }
         break;
     case COMM_SET_HANDBRAKE:
+        if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             if (current < 0.0f) current = -current;
@@ -882,12 +1021,14 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         }
         break;
     case COMM_SET_RPM:
+        if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float rpm = (float)buffer_get_int32(d, &k);
             touch_motor(second); mc_interface_set_pid_speed(right_sign(second, rpm));
         }
         break;
     case COMM_SET_POS:
+        if (hall_detect_motor_locked(second)) break;
         if(n>=4u){const float pos=(float)buffer_get_int32(d,&k)/1000000.0f;touch_motor(second);mc_interface_set_pid_pos(right_sign(second,pos));}
         break;
     case COMM_ALIVE:
@@ -898,6 +1039,7 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         reply_mcconf(second, id);
         break;
     case COMM_SET_MCCONF:
+        if (hall_detect_motor_locked(second)) break;
         set_mcconf(second, d, n);
         break;
     case COMM_GET_APPCONF:
@@ -911,7 +1053,7 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         set_appconf(second, d, n);
         break;
     case COMM_DETECT_HALL_FOC:
-        detect_hall_foc(second, d, n);
+        hall_detect_begin(second, d, n);
         break;
     case COMM_CUSTOM_APP_DATA:
         process_custom_app(second, d, n);

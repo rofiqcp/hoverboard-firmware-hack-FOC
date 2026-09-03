@@ -21,7 +21,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_vesc_tool_rt50.py','tools/test_hall_3rev_runtime.py','tools/test_hall_3rev_runtime.c','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
+        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -70,7 +70,7 @@ def check_static():
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'm->m_phase_openloop : m->m_phase_hall' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
-    assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'FOC Hall detection/validation missing'
+    assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'strict internal Hall detector/validation missing'
     assert 'gap < 18u || gap > 48u' in mc, 'Hall detect sector-gap rejection missing'
     assert 'MCCONF_HALL_INTERP_ON_RPM' in mc and 'MCCONF_HALL_INTERP_OFF_RPM' in mc, 'low-speed Hall interpolation hysteresis missing'
     assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
@@ -101,7 +101,7 @@ def check_static():
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
     assert 'HAL_UART_Transmit_DMA(&huart3, tx, i)' in vp, 'VESC reply path must use USART3 TX DMA'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
-    assert 'COMM_DETECT_HALL_FOC' in vp and 'mcpwm_foc_detect_hall' in vp, 'VESC Hall detect command missing'
+    assert 'COMM_DETECT_HALL_FOC' in vp and 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp, 'VESC-standard async Hall detect command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
     assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'
@@ -169,26 +169,26 @@ def config_size_check():
         for cc in compilers:
             out=Path(td)/f'cfg_{cc}'
             run([cc,'-std=c11','-O0','-Wall','-Wextra','-Werror','-I.','-ISrc',
-                 'tools/test_config_sizes.c','Src/vesc/buffer.c','Src/vesc/mcconf_serial.c','-o',str(out)])
+                 'tools/tests/host/test_config_sizes.c','Src/vesc/buffer.c','Src/vesc/mcconf_serial.c','-o',str(out)])
             run([str(out)])
     print('CONFIG_SERIALIZER_GCC_CLANG_PASS')
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py','tools/vesc_response_lab.py', 'tools/vesc_manual_spin_monitor.py','tools/test_hall_detect_repeat.py','tools/test_duty_ramp100.py'])
-    run([sys.executable,'tools/host_compile_check.py'])
-    run([sys.executable,'tools/test_foc_math.py'])
-    run([sys.executable,'tools/test_motor_control_v12.py'])
-    run([sys.executable,'tools/test_motor_control_v13.py'])
-    run([sys.executable,'tools/test_vesc_protocol_host.py'])
+    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/tests/host/test_vesc_dual.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/hardware/vesc_response_lab.py', 'tools/tests/hardware/vesc_manual_spin_monitor.py','tools/tests/hardware/test_hall_detect_repeat.py','tools/tests/hardware/test_duty_ramp100.py'])
+    run([sys.executable,'tools/tests/host/host_compile_check.py'])
+    run([sys.executable,'tools/tests/host/test_foc_math.py'])
+    run([sys.executable,'tools/tests/host/test_motor_control_v12.py'])
+    run([sys.executable,'tools/tests/host/test_motor_control_v13.py'])
+    run([sys.executable,'tools/tests/host/test_vesc_protocol_host.py'])
     config_size_check()
-    run([sys.executable,'tools/test_vesc_dual.py'])
-    run([sys.executable,'tools/test_v13_features.py'])
-    run([sys.executable,'tools/test_v14_features.py'])
-    run([sys.executable,'tools/test_v15_features.py'])
-    run([sys.executable,'tools/test_v16_features.py'])
+    run([sys.executable,'tools/tests/host/test_vesc_dual.py'])
+    run([sys.executable,'tools/tests/host/test_v13_features.py'])
+    run([sys.executable,'tools/tests/host/test_v14_features.py'])
+    run([sys.executable,'tools/tests/host/test_v15_features.py'])
+    run([sys.executable,'tools/tests/host/test_v16_features.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
-    run([sys.executable,'tools/test_hall_detect_algorithm.py'])
-    run([sys.executable,'tools/test_hall_3rev_runtime.py'])
-    run([sys.executable,'tools/test_eeprom_persistence.py'])
+    run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])
+    run([sys.executable,'tools/tests/host/test_hall_3rev_runtime.py'])
+    run([sys.executable,'tools/tests/host/test_eeprom_persistence.py'])
     print('ALL_FINAL_HOST_CHECKS_PASS')

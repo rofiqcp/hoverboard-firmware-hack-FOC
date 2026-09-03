@@ -1,3 +1,6 @@
 .pio/
 *.pio/build/
 *.pio/
+# Python tool artifacts
+__pycache__/
+*.py[cod]
