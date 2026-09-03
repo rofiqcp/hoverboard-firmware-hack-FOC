@@ -159,7 +159,7 @@ def print_diag(prefix: str, d: Diag) -> None:
                   f"lastI=[{d.last_trip_phase0_a:.2f},{d.last_trip_phase1_a:.2f},{d.last_trip_phase2_a:.2f}]A "
                   f"lastDC={d.last_trip_dc_a:.2f}A lastDuty={100*d.last_trip_duty:.1f}%")
         if d.driven_offset0 is not None:
-            print(f"  DRIVEN_OFFSETS raw=[{d.driven_offset0},{d.driven_offset1},{d.driven_offset_dc}] "
+            print(f"  CONTROL_OFFSETS raw=[{d.driven_offset0},{d.driven_offset1},{d.driven_offset_dc}] "
                   f"valid={int(d.driven_offset_valid)} calibrating={int(d.driven_offset_calibrating)} samples={d.driven_offset_samples}")
 
 

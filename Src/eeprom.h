@@ -216,7 +216,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)123u)       /* 49 MC slots + 74 App Config slots */
+#define NB_OF_VAR             ((uint8_t)135u)       /* legacy 49 MC + 74 App + 12 MC extension slots */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

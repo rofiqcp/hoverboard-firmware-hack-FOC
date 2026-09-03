@@ -44,6 +44,7 @@ void mc_interface_set_pid_speed(float erpm) { mcpwm_foc_set_pid_speed(erpm, sele
 void mc_interface_set_pid_pos(float position_deg) { mcpwm_foc_set_pid_pos(position_deg, selected_second()); }
 void mc_interface_set_current(float current) { mcpwm_foc_set_current(current, selected_second()); }
 void mc_interface_set_brake_current(float current) { mcpwm_foc_set_brake_current(current, selected_second()); }
+void mc_interface_set_handbrake(float current) { mcpwm_foc_set_handbrake(current, selected_second()); }
 void mc_interface_set_openloop_current(float current, float rpm) { mcpwm_foc_set_openloop_current(current, rpm, selected_second()); }
 void mc_interface_set_openloop_phase(float current, float phase) { mcpwm_foc_set_openloop_phase(current, phase, selected_second()); }
 void mc_interface_release_motor(void) { mcpwm_foc_release_motor(selected_second()); }
@@ -84,9 +85,20 @@ enum {
     EE_L_SPEED_REL = 41, EE_R_SPEED_REL,
     EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44,
     EE_L_MOTOR_POLES = 45, EE_R_MOTOR_POLES = 46,
-    EE_L_GEAR_X64 = 47, EE_R_GEAR_X64 = 48
+    EE_L_GEAR_X64 = 47, EE_R_GEAR_X64 = 48,
+
+    /* 49..122 remain App Config forever. MC extension is appended after it so
+     * existing EEPROM images keep their exact addresses. Six slots per motor. */
+    EE_L_EXT_CURRENT_MIN_CA = 123, EE_L_EXT_ABS_CURRENT_CA, EE_L_EXT_MAX_DUTY_X10000,
+    EE_L_EXT_POS_KD_FILTER_X10000, EE_L_EXT_DUTY_KP_X10, EE_L_EXT_DUTY_KI_X10,
+    EE_R_EXT_CURRENT_MIN_CA = 129, EE_R_EXT_ABS_CURRENT_CA, EE_R_EXT_MAX_DUTY_X10000,
+    EE_R_EXT_POS_KD_FILTER_X10000, EE_R_EXT_DUTY_KP_X10, EE_R_EXT_DUTY_KI_X10
 };
-#define EE_CFG_SIGNATURE_VALUE 0x6012u
+#define EE_CFG_SIGNATURE_VALUE 0x6016u
+#define EE_CFG_SIGNATURE_V23   0x6015u /* before MC extension slots */
+#define EE_CFG_SIGNATURE_V22   0x6014u /* position Kp/filter update, telemetry filter not packed yet */
+#define EE_CFG_SIGNATURE_V21   0x6013u /* previous position default Kp=0.008 */
+#define EE_CFG_SIGNATURE_V20   0x6012u /* previous speed gains used x1000 */
 #define EE_CFG_SIGNATURE_V19   0x6011u
 #define EE_CFG_SIGNATURE_V18   0x6010u
 #define EE_CFG_SIGNATURE_V17   0x600Fu
@@ -132,6 +144,7 @@ bool mc_interface_store_configuration_motor(bool second) {
     const uint8_t cur_slot = second ? EE_R_CUR_CA : EE_L_CUR_CA;
     const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
     const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
+    const uint8_t ext_base = second ? EE_R_EXT_CURRENT_MIN_CA : EE_L_EXT_CURRENT_MIN_CA;
     const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
     int32_t ca = (int32_t)(m->m_conf.l_current_max * 100.0f + 0.5f);
     if (ca < 1) ca = 1;
@@ -152,7 +165,18 @@ bool mc_interface_store_configuration_motor(bool second) {
     for (uint8_t i = 0u; i < 10u; ++i) ok &= ee_write_slot((uint8_t)(gain_base + i), gains[i]);
     ok &= ee_write_slot(ramp_slot, ramp10);
     ok &= ee_write_slot(rel_slot, rel_erpm);
-    ok &= ee_write_slot(pole_slot, m->m_conf.si_motor_poles);
+    {
+        /* Keep the original MC EEPROM layout: motor poles need only one byte,
+         * so use the previously-unused high byte for the monitoring current LPF.
+         * q8 gives ~0.004 resolution and avoids shifting the App Config slots. */
+        float tf=m->m_conf.foc_current_filter_const;
+        if (!(tf >= 0.001f && tf <= 1.0f)) tf=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+        uint32_t fq=(uint32_t)(tf*255.0f+0.5f);
+        if(fq<1u)fq=1u;
+        if(fq>255u)fq=255u;
+        const uint16_t packed=(uint16_t)((fq<<8)|(uint16_t)m->m_conf.si_motor_poles);
+        ok &= ee_write_slot(pole_slot, packed);
+    }
     {
         float gr = m->m_conf.si_gear_ratio;
         if (!(gr >= 0.01f && gr <= 1000.0f)) gr = 1.0f;
@@ -160,6 +184,30 @@ bool mc_interface_store_configuration_motor(bool second) {
         if (gx64 < 1u) gx64 = 1u;
         if (gx64 > 65535u) gx64 = 65535u;
         ok &= ee_write_slot(gear_slot, (uint16_t)gx64);
+    }
+    {
+        /* Fields implemented at runtime but historically missing from EEPROM.
+         * Fixed-point persistence is deliberate: deterministic across compiler
+         * versions and enough resolution for VESC Tool round-trip. */
+        int32_t cmin=(int32_t)(m->m_conf.l_current_min*100.0f + (m->m_conf.l_current_min>=0.0f?0.5f:-0.5f));
+        if(cmin < -(int32_t)I_MOT_MAX*100) cmin=-(int32_t)I_MOT_MAX*100;
+        if(cmin > -10) cmin=-10;
+        uint32_t abs_ca=(uint32_t)(m->m_conf.l_abs_current_max*100.0f+0.5f);
+        const uint32_t abs_ca_max=(uint32_t)(MCCONF_L_ABS_CURRENT_MAX*100.0f+0.5f);
+        if(abs_ca<10u) abs_ca=10u;
+        if(abs_ca>abs_ca_max) abs_ca=abs_ca_max;
+        uint32_t duty=(uint32_t)(m->m_conf.l_max_duty*10000.0f+0.5f);
+        if(duty<1u) duty=1u;
+        if(duty>10000u) duty=10000u;
+        uint32_t pdf=(uint32_t)(m->m_conf.p_pid_kd_filter*10000.0f+0.5f); if(pdf>10000u)pdf=10000u;
+        uint32_t dkp=(uint32_t)(m->m_conf.foc_duty_dowmramp_kp*10.0f+0.5f); if(dkp>65535u)dkp=65535u;
+        uint32_t dki=(uint32_t)(m->m_conf.foc_duty_dowmramp_ki*10.0f+0.5f); if(dki>65535u)dki=65535u;
+        ok &= ee_write_slot(ext_base+0u,(uint16_t)(int16_t)cmin);
+        ok &= ee_write_slot(ext_base+1u,(uint16_t)abs_ca);
+        ok &= ee_write_slot(ext_base+2u,(uint16_t)duty);
+        ok &= ee_write_slot(ext_base+3u,(uint16_t)pdf);
+        ok &= ee_write_slot(ext_base+4u,(uint16_t)dkp);
+        ok &= ee_write_slot(ext_base+5u,(uint16_t)dki);
     }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
@@ -174,12 +222,15 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||
         !ee_read_slot(sig_slot, &sig) ||
-        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V19 &&
+        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V23 && sig != EE_CFG_SIGNATURE_V22 && sig != EE_CFG_SIGNATURE_V21 && sig != EE_CFG_SIGNATURE_V20 && sig != EE_CFG_SIGNATURE_V19 &&
          sig != EE_CFG_SIGNATURE_V18 && sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
         return false;
     }
+    const bool migrate_speed_pid_scale = (sig == EE_CFG_SIGNATURE_V20);
     const bool migrate_speed_pid = (sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
-    const bool migrate_position_pid = (sig == EE_CFG_SIGNATURE_V18 || sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
+    const bool migrate_position_pid = (sig == EE_CFG_SIGNATURE_V21 || sig == EE_CFG_SIGNATURE_V18 || sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
+    const bool migrate_telem_filter = (sig != EE_CFG_SIGNATURE_VALUE);
+    const bool migrate_mc_extension = (sig != EE_CFG_SIGNATURE_VALUE);
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
@@ -188,6 +239,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t cur_slot = second ? EE_R_CUR_CA : EE_L_CUR_CA;
     const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
     const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
+    const uint8_t ext_base = second ? EE_R_EXT_CURRENT_MIN_CA : EE_L_EXT_CURRENT_MIN_CA;
     uint16_t v = 0u;
     uint8_t hall[8];
     for (uint8_t i = 0u; i < 8u; ++i) {
@@ -197,9 +249,19 @@ bool mc_interface_load_configuration_motor(bool second) {
     if (!hall_table_sane(hall)) return false;
     for (uint8_t i = 0u; i < 8u; ++i) m->m_conf.foc_hall_table[i] = hall[i];
 
-    if (sig == EE_CFG_SIGNATURE_VALUE) {
-        if (ee_read_slot(pole_slot, &v) && v >= 2u && v <= 254u && (v & 1u) == 0u) m->m_conf.si_motor_poles = (uint8_t)v;
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V23) {
+        if (ee_read_slot(pole_slot, &v)) {
+            const uint8_t poles=(uint8_t)(v & 0xffu);
+            const uint8_t fq=(uint8_t)(v >> 8);
+            if(poles>=2u && (poles&1u)==0u)m->m_conf.si_motor_poles=poles;
+            if(fq>0u)m->m_conf.foc_current_filter_const=(float)fq/255.0f;
+        }
         if (ee_read_slot(gear_slot, &v) && v > 0u) m->m_conf.si_gear_ratio = (float)v / 64.0f;
+    } else if (sig == EE_CFG_SIGNATURE_V22 || sig == EE_CFG_SIGNATURE_V21) {
+        /* V21/V22 stored plain poles in this slot and already had gear ratio. */
+        if (ee_read_slot(pole_slot, &v) && v >= 2u && v <= 254u && (v & 1u) == 0u) m->m_conf.si_motor_poles=(uint8_t)v;
+        if (ee_read_slot(gear_slot, &v) && v > 0u) m->m_conf.si_gear_ratio=(float)v/64.0f;
+        m->m_conf.foc_current_filter_const=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
     }
     const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
 
@@ -207,6 +269,19 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.l_current_max = (float)v / 100.0f;
         m->m_conf.l_current_min = -m->m_conf.l_current_max;
         m->m_current_limit_q4 = (int16_t)((int32_t)v * A2BIT_CONV * 16 / 100);
+    }
+    if (sig == EE_CFG_SIGNATURE_VALUE) {
+        uint16_t e[6]; bool ext_ok=true;
+        for(uint8_t i=0u;i<6u;++i) ext_ok &= ee_read_slot((uint8_t)(ext_base+i),&e[i]);
+        if(ext_ok){
+            const int16_t cmin=(int16_t)e[0];
+            if(cmin<=-10 && cmin>=-(int16_t)(I_MOT_MAX*100))m->m_conf.l_current_min=(float)cmin/100.0f;
+            if(e[1]>=10u && e[1]<=(uint16_t)(MCCONF_L_ABS_CURRENT_MAX*100.0f+0.5f))m->m_conf.l_abs_current_max=(float)e[1]/100.0f;
+            if(e[2]>=1u && e[2]<=10000u)m->m_conf.l_max_duty=(float)e[2]/10000.0f;
+            if(e[3]<=10000u)m->m_conf.p_pid_kd_filter=(float)e[3]/10000.0f;
+            if(e[4]>0u)m->m_conf.foc_duty_dowmramp_kp=(float)e[4]/10.0f;
+            if(e[5]>0u)m->m_conf.foc_duty_dowmramp_ki=(float)e[5]/10.0f;
+        }
     }
     volatile uint16_t *gain_dst[10] = {
         &m->m_kpq_q11, &m->m_kiq_q16, &m->m_kpd_q11, &m->m_kid_q16,
@@ -219,8 +294,15 @@ bool mc_interface_load_configuration_motor(bool second) {
              * cascade defaults (0.004/0.004). Both are superseded by the
              * hardware-tested hoverboard cascade defaults. Preserve every
              * other persisted field and migrate only speed PID gains. */
-            if (!(migrate_speed_pid && i >= 4u && i <= 6u) &&
-                !(migrate_position_pid && i >= 7u && i <= 9u)) {
+            if (migrate_speed_pid_scale && i >= 4u && i <= 6u) {
+                /* V20 stored speed gains as gain*1000. New format stores
+                 * gain*100000 so VESC Tool changes down to 1e-5 affect the
+                 * live fixed-point regulator. */
+                uint32_t sv=(uint32_t)v*100u;
+                if(sv>65535u)sv=65535u;
+                *gain_dst[i]=(uint16_t)sv;
+            } else if (!(migrate_speed_pid && i >= 4u && i <= 6u) &&
+                       !(migrate_position_pid && i >= 7u && i <= 9u)) {
                 *gain_dst[i] = v;
             }
         }
@@ -241,7 +323,52 @@ bool mc_interface_load_configuration_motor(bool second) {
     mcpwm_foc_sync_tuning_to_conf(second);
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
     m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);
-    if (migrate_speed_pid || migrate_position_pid) {
+    {
+        float tf=m->m_conf.foc_current_filter_const;
+        if (!(tf>=0.001f && tf<=1.0f)) tf=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+        int32_t a=(int32_t)(tf*65535.0f+0.5f);
+        if(a<1)a=1;
+        if(a>65535)a=65535;
+        m->m_telem_current_filter_q16=(uint16_t)a;
+        m->m_conf.foc_current_filter_const=tf;
+    }
+    /* Rebuild every derived runtime coefficient that corresponds to persisted
+     * VESC Tool fields. A value is not considered restored merely because
+     * GET_MCCONF shows it; the ISR/controller must use it after reboot too. */
+    {
+        float abs_i=m->m_conf.l_abs_current_max;
+        if(!(abs_i>=m->m_conf.l_current_max) || abs_i>MCCONF_L_ABS_CURRENT_MAX) abs_i=MCCONF_L_ABS_CURRENT_MAX;
+        m->m_conf.l_abs_current_max=abs_i;
+        int32_t ac=(int32_t)(abs_i*(float)A2BIT_CONV+0.5f);
+        if(ac<1) ac=1;
+        if(ac>32767) ac=32767;
+        m->m_abs_current_limit_counts=(int16_t)ac;
+
+        float md=m->m_conf.l_max_duty;
+        if(!(md>0.0f) || md>MCCONF_L_MAX_DUTY)md=MCCONF_L_MAX_DUTY;
+        m->m_conf.l_max_duty=md;
+        int32_t dp=(int32_t)(md*1000.0f+0.5f);
+        if(dp<1) dp=1;
+        if(dp>1000) dp=1000;
+        m->m_duty_limit_permille=(int16_t)dp;
+
+        float pdf=m->m_conf.p_pid_kd_filter;
+        if(!(pdf>=0.0f && pdf<=1.0f))pdf=(float)MCCONF_POSITION_KD_FILTER_Q16/65536.0f;
+        m->m_conf.p_pid_kd_filter=pdf;
+        int32_t pf=(int32_t)(pdf*65535.0f+0.5f);
+        if(pf<0) pf=0;
+        if(pf>65535) pf=65535;
+        m->m_position_kd_filter_q16=(uint16_t)pf;
+
+        float dkp=m->m_conf.foc_duty_dowmramp_kp; if(!(dkp>0.0f))dkp=MCCONF_FOC_DUTY_DOWNRAMP_KP;
+        float dki=m->m_conf.foc_duty_dowmramp_ki; if(!(dki>0.0f))dki=MCCONF_FOC_DUTY_DOWNRAMP_KI;
+        m->m_conf.foc_duty_dowmramp_kp=dkp; m->m_conf.foc_duty_dowmramp_ki=dki;
+        const float kscale=(32768.0f*4096.0f)/(1000.0f*MCCONF_DUTY_PI_BUS_NOMINAL_V);
+        const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
+        m->m_duty_kp_q12_per_permille=(uint32_t)(dkp*kscale+0.5f);
+        m->m_duty_ki_q12_per_permille=(uint32_t)(dki*dt*kscale+0.5f);
+    }
+    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension) {
         /* Rewrite only after a complete successful load; signature is written last. */
         (void)mc_interface_store_configuration_motor(second);
     }

@@ -45,6 +45,9 @@ HB_GET_POS_STATE = 2
 HB_SET_POS_LIMITS = 3
 HB_SET_POS_TARGET = 4
 HB_RESET_POSITION = 5
+HB_GET_TUNING = 6
+HB_SET_TUNING = 7
+HB_SET_ID_TEST = 8
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -150,6 +153,23 @@ class PositionState:
 
 
 @dataclass
+class Tuning:
+    kpq: int; kiq: int; kpd: int; kid: int
+    kps: int; kis: int; kds: int
+    kpp: int; kip: int; kdp: int
+    telem_filter_q16: int = 6553
+    current_limit_q4: int = 800
+
+    @property
+    def physical(self):
+        return dict(foc_q_kp=self.kpq/1536.0, foc_q_ki=self.kiq/4.608,
+                    foc_d_kp=self.kpd/1536.0, foc_d_ki=self.kid/4.608,
+                    speed_kp=self.kps/100000.0, speed_ki=self.kis/100000.0, speed_kd=self.kds/100000.0,
+                    pos_kp=self.kpp/1000.0, pos_ki=self.kip/1000.0, pos_kd=self.kdp/1000.0,
+                    telemetry_filter=self.telem_filter_q16/65535.0, current_limit_a=self.current_limit_q4/800.0)
+
+
+@dataclass
 class Diag:
     vesc_id: int
     control_mode: int
@@ -214,6 +234,9 @@ class Diag:
     driven_offset_samples: int | None = None
     driven_offset_valid: bool | None = None
     driven_offset_calibrating: bool | None = None
+    raw_adc_phase0: int | None = None
+    raw_adc_phase1: int | None = None
+    raw_adc_dc: int | None = None
 
     def short(self) -> str:
         return (
@@ -290,6 +313,12 @@ def parse_diag(payload: bytes) -> Diag:
         ext.update(driven_offset0=do0, driven_offset1=do1, driven_offset_dc=dodc,
                    driven_offset_samples=dsamp, driven_offset_valid=bool(dvalid),
                    driven_offset_calibrating=bool(dcal))
+    if len(payload) >= 178:
+        rla, rlb, dcl, rrb, rrc, dcr = struct.unpack_from(">6H", payload, 166)
+        if vid == 1:
+            ext.update(raw_adc_phase0=rla, raw_adc_phase1=rlb, raw_adc_dc=dcl)
+        else:
+            ext.update(raw_adc_phase0=rrb, raw_adc_phase1=rrc, raw_adc_dc=dcr)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),
@@ -464,6 +493,29 @@ class VescDual:
                         timeout: float | None = None) -> bytes:
         req = self._custom(op, data)
         return self.transact(self.fwd(req) if right else req, COMM_CUSTOM_APP_DATA, timeout)
+
+    def get_tuning(self, right: bool = False) -> Tuning:
+        p=self.custom_transact(HB_GET_TUNING, right=right)
+        status=parse_custom_header(p,HB_GET_TUNING)
+        if status or len(p)<30: raise RuntimeError(f"get_tuning status={status} len={len(p)}")
+        vals=struct.unpack_from(">10H",p,6)
+        filt,ilim=struct.unpack_from(">Hh",p,26)
+        return Tuning(*vals,telem_filter_q16=filt,current_limit_q4=ilim)
+
+    def set_tuning(self, tune: Tuning, right: bool = False, store: bool = False) -> Tuning:
+        vals=(tune.kpq,tune.kiq,tune.kpd,tune.kid,tune.kps,tune.kis,tune.kds,tune.kpp,tune.kip,tune.kdp)
+        data=struct.pack(">10HHB",*vals,max(1,min(65535,int(tune.telem_filter_q16))),1 if store else 0)
+        p=self.custom_transact(HB_SET_TUNING,data,right=right)
+        status=parse_custom_header(p,HB_SET_TUNING)
+        if status or len(p)<30: raise RuntimeError(f"set_tuning status={status} len={len(p)}")
+        vals2=struct.unpack_from(">10H",p,6); filt,ilim=struct.unpack_from(">Hh",p,26)
+        return Tuning(*vals2,telem_filter_q16=filt,current_limit_q4=ilim)
+
+    def set_id_test(self, current_a: float, phase_deg: float = 0.0, right: bool = False):
+        data=struct.pack(">ii",round(current_a*1000.0),round(phase_deg*1000.0))
+        p=self.custom_transact(HB_SET_ID_TEST,data,right=right)
+        status=parse_custom_header(p,HB_SET_ID_TEST)
+        if status: raise RuntimeError(f"set_id_test status={status}")
 
     def position_state(self, right: bool = False) -> PositionState:
         return parse_position_state(self.custom_transact(HB_GET_POS_STATE, right=right), HB_GET_POS_STATE)

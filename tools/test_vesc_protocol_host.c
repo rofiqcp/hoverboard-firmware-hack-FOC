@@ -60,6 +60,7 @@ void mc_interface_get_values_motor(mc_values *v, bool second) {
 }
 void mc_interface_set_current(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_brake_current(float c) { set_current[selected_motor==2?1:0]=c; }
+void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
 void mcpwm_foc_sync_tuning_to_conf(bool second) { (void)second; }
@@ -75,7 +76,13 @@ void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float br
 }
 void mcpwm_foc_vesc_override_touch(bool second) { touch_count[second?1:0]++; }
 bool mcpwm_foc_vesc_override_active(bool second) { return touch_count[second?1:0] != 0u; }
+mcpwm_foc_motor_t *mcpwm_foc_get_motor(bool second) { return &diag_motors[second?1:0]; }
 const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool second) { return &diag_motors[second?1:0]; }
+void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
+    (void)phase; diag_motors[second?1:0].m_openloop_id_target_q4=(int16_t)lroundf(fabsf(current)*800.0f);
+    diag_motors[second?1:0].m_control_mode=CONTROL_MODE_OPENLOOP_PHASE;
+}
+void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
 float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
@@ -316,9 +323,28 @@ int main(void){
 
         uint8_t dg[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,1u};
         if(!transact(dg,sizeof(dg),r,&rn)||rn<78u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=1u||r[5]!=0u) return fail("custom diag");
+
         if(r[6]!=1u || r[10]!=5u) return fail("custom diag id/hall");
         int32_t di=14;
         if(buffer_get_int32(r,&di)!=3000) return fail("custom diag iq target 3A");
+
+        /* Project tuning extension remains inside COMM_CUSTOM_APP_DATA. */
+        {
+            uint8_t gt[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,6u};
+            if(!transact(gt,sizeof(gt),r,&rn)||rn!=30u||r[4]!=6u||r[5]!=0u) return fail("custom get tuning");
+            uint8_t st[40]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,7u}; int32_t si=5;
+            const uint16_t tv[10]={1300,1400,900,1000,950,2000,3,60,1,2};
+            for(int z=0;z<10;z++)buffer_append_uint16(st,tv[z],&si);
+            buffer_append_uint16(st,3277u,&si); st[si++]=1u;
+            unsigned before_store=store_count[0];
+            if(!transact(st,(uint16_t)si,r,&rn)||rn!=30u||r[4]!=7u||r[5]!=0u) return fail("custom set tuning");
+            if(diag_motors[0].m_kpq_q11!=1300u||diag_motors[0].m_kid_q16!=1000u||diag_motors[0].m_kps_q11!=950u||diag_motors[0].m_kpp_q11!=60u) return fail("custom tuning apply");
+            if(diag_motors[0].m_telem_current_filter_q16!=3277u||store_count[0]!=(before_store+1u)) return fail("custom tuning filter/store");
+            uint8_t idt[20]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,8u}; si=5; buffer_append_int32(idt,300,&si); buffer_append_int32(idt,0,&si);
+            if(!transact(idt,(uint16_t)si,r,&rn)||rn!=6u||diag_motors[0].m_openloop_id_target_q4!=240||diag_motors[0].m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE) return fail("custom id test");
+            si=5; buffer_append_int32(idt,0,&si); buffer_append_int32(idt,0,&si);
+            if(!transact(idt,(uint16_t)si,r,&rn)||diag_motors[0].m_control_mode!=CONTROL_MODE_NONE) return fail("custom id release");
+        }
     }
     uint8_t dh[5]={COMM_DETECT_HALL_FOC,0,0,0,0}; k=1; buffer_append_int32(dh,1000,&k);
     if(!transact(dh,sizeof(dh),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]!=0u||store_count[0]==0u)return fail("local hall detect");

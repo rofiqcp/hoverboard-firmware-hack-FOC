@@ -23,6 +23,7 @@ extern volatile int pwml;
 extern volatile int pwmr;
 extern volatile int32_t positionCommandL;
 extern volatile int32_t positionCommandR;
+extern int16_t curL_phaA, curL_phaB, curL_DC;
 
 void DMA1_Channel1_IRQHandler(void);
 
@@ -111,7 +112,6 @@ int main(void){
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
     for(int i=0;i<3500;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
-    if(abs(m_motor_1.m_vq)>MCCONF_SPEED_STOP_VOLTAGE_MAX)return fail("mode2 STOP Vq ceiling");
     for(int i=0;i<5000;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode2 STOP must release near zero");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
@@ -220,17 +220,82 @@ int main(void){
     if(m_motor_1.m_kpp_q11!=MCCONF_POSITION_KP_Q11 || m_motor_1.m_kip_q16!=MCCONF_POSITION_KI_Q16 || m_motor_1.m_kdp_q11!=MCCONF_POSITION_KD_Q11)
         return fail("V13 position PID defaults");
 
+    /* Requested 2026-09 current/telemetry/position regression. Standard VESC
+     * COMM_SET_CURRENT scaling is mA/1000, so 1.000 A must become exactly 800
+     * Q4 units with A2BIT_CONV=50. Closed-loop current must also be allowed to
+     * use the configured 95% modulation rather than the historical 80% cap. */
+    mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    mc_configuration oneamp=m_motor_1.m_conf;
+    oneamp.l_current_max=1.0f; oneamp.l_current_min=-1.0f; oneamp.l_max_duty=0.95f;
+    oneamp.foc_current_filter_const=0.10f;
+    mcpwm_foc_set_configuration(&oneamp,false);
+    if(abs((int)m_motor_1.m_telem_current_filter_q16-6554)>2)return fail("VESC foc_current_filter_const mapping");
+    mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
+    /* Low-side phase current is not observable while the bridge is released.
+     * A bogus OFF measurement must never seed the next torque reference. */
+    m_motor_1.m_iq_q4=(int16_t)(-5*FOC_CURRENT_Q4_PER_A);
+    mcpwm_foc_set_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
+    if(m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_iq_set_ramp_q16!=0)return fail("SET_CURRENT seeded from OFF measured Iq");
+    if(m_motor_1.m_iq_target_q4!=FOC_CURRENT_Q4_PER_A)return fail("VESC SET_CURRENT 1A exact Q4 scaling");
+    curL_phaA=curL_phaB=curL_DC=0;
+    for(int i=0;i<18000;i++)mcpwm_foc_adc_int_handler();
+    if(abs(m_motor_1.m_vq)<=MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX)return fail("1A current PI still hard-capped at 80pct modulation");
+    if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("1A current PI exceeds configured 95pct modulation");
+
+    /* Bridge-OFF telemetry has a separate stationary baseline. It must be near
+     * zero at rest, then show passive/back-drive changes without arming PWM or
+     * feeding the over-current detector. */
+    mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    mc_configuration telem=m_motor_1.m_conf; telem.foc_current_filter_const=0.10f;
+    mcpwm_foc_set_configuration(&telem,false);
+    adc_buffer.rlA=1977; adc_buffer.rlB=1994; adc_buffer.dcl=1925;
+    adc_buffer.rrB=1965; adc_buffer.rrC=1939; adc_buffer.dcr=1862; adc_buffer.batt1=2000;
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
+    LEFT_TIM->BDTR&=~TIM_BDTR_MOE; RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
+    /* Learn the actual high-Z amplifier zero after startup. */
+    adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
+    for(int i=0;i<280;i++)DMA1_Channel1_IRQHandler();
+    if(!m_motor_1.m_off_offset_valid)return fail("OFF telemetry offset did not calibrate");
+    mc_values off0; mcpwm_foc_get_values(&off0,false);
+    if(fabsf(off0.current_in)>0.05f || fabsf(off0.id)+fabsf(off0.iq)>0.10f)return fail("OFF baseline not near zero");
+    /* Simulate back-drive signal around the frozen OFF baseline. */
+    adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
+    for(int i=0;i<120;i++)DMA1_Channel1_IRQHandler();
+    mc_values offv; mcpwm_foc_get_values(&offv,false);
+    if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_vd!=0 || m_motor_1.m_vq!=0)return fail("undriven telemetry must keep bridge/control off");
+    if(fabsf(offv.current_in)<0.05f)return fail("OFF Ibattery/passive telemetry forced to zero");
+    if(fabsf(offv.id)+fabsf(offv.iq)<0.10f)return fail("OFF Id/Iq passive telemetry forced to zero");
+    if(m_motor_1.m_current_trip_count!=0u)return fail("OFF telemetry must never feed over-current protection");
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("OFF telemetry must not arm bridge");
+    if(m_motor_1.m_telem_avg_samples!=0u)return fail("COMM_GET_VALUES must read/reset current average window");
+
+    /* One Hall count is four mechanical degrees at 15 pole-pairs. With the new
+     * steering Kp=0.060 and an active 1 A current limit it should request about
+     * 0.24 A, enough to approach breakaway without immediately saturating. */
+    mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    mc_configuration pos1=m_motor_1.m_conf; pos1.l_current_max=1.0f; pos1.l_current_min=-1.0f;
+    pos1.p_pid_kp=0.060f; pos1.p_pid_ki=0.0f; pos1.p_pid_kd=0.0f; pos1.p_pid_kd_filter=0.20f;
+    mcpwm_foc_set_configuration(&pos1,false);
+    mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
+    mcpwm_foc_set_position_counts(1,false); mcpwm_foc_vesc_override_touch(false);
+    curL_phaA=curL_phaB=curL_DC=0;
+    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_iq_target_q4<170 || m_motor_1.m_iq_target_q4>215)return fail("position 1-count Kp0.060 current request");
+    if(m_motor_1.m_position_kd_filter_q16<13000u || m_motor_1.m_position_kd_filter_q16>13200u)return fail("position D filter config mapping");
+
     /* A stock VESC mc_configuration has one common current Kp/Ki. Writing it
      * through VESC Tool intentionally applies that pair to both D and Q, while
      * the custom KPQ/KIQ/KPD/KID terminal parameters may separate them later. */
     mc_configuration tune=m_motor_1.m_conf;
     tune.foc_current_kp=1.0f; tune.foc_current_ki=100.0f;
-    tune.s_pid_kp=2.0f; tune.s_pid_ki=0.5f; tune.s_pid_kd=0.25f;
+    tune.s_pid_kp=0.01234f; tune.s_pid_ki=0.02345f; tune.s_pid_kd=0.00067f;
     tune.p_pid_kp=3.0f; tune.p_pid_ki=0.1f; tune.p_pid_kd=0.05f;
     mcpwm_foc_set_configuration(&tune,false);
     if(m_motor_1.m_kpq_q11!=1536u || m_motor_1.m_kpd_q11!=1536u)return fail("VESC current Kp maps D/Q");
     if(abs((int)m_motor_1.m_kiq_q16-461)>1 || m_motor_1.m_kiq_q16!=m_motor_1.m_kid_q16)return fail("VESC current Ki maps D/Q");
-    if(m_motor_1.m_kps_q11!=2000u || m_motor_1.m_kis_q16!=500u || m_motor_1.m_kds_q11!=250u)return fail("VESC speed PID mapping");
+    if(m_motor_1.m_kps_q11!=1234u || m_motor_1.m_kis_q16!=2345u || m_motor_1.m_kds_q11!=67u)return fail("VESC speed PID mapping");
+    mcpwm_foc_sync_tuning_to_conf(false);
+    if(fabsf(m_motor_1.m_conf.s_pid_kp-0.01234f)>0.000006f || fabsf(m_motor_1.m_conf.s_pid_ki-0.02345f)>0.000006f)return fail("VESC speed PID 1e-5 readback precision");
     if(m_motor_1.m_kpp_q11!=3000u || m_motor_1.m_kip_q16!=100u || m_motor_1.m_kdp_q11!=50u)return fail("VESC position PID mapping");
 
     /* Legacy mode 5 is multi-turn Hall position: 15 pole pairs * 6 sectors =
@@ -272,14 +337,18 @@ int main(void){
 
     /* VESC current semantics: current_motor is SIGN(Ibus)*sqrt(Id^2+Iq^2),
      * current_in is battery/DC-bus current, and Id/Iq remain separate. */
-    m_motor_1.m_id_q4=600;   /* 0.75 A */
-    m_motor_1.m_iq_q4=800;   /* 1.00 A -> |Idq|=1.25 A */
-    m_motor_1.m_current_in_counts=-50; /* EFeru raw polarity => +1.00 A Ibus */
+    m_motor_1.m_id_q4=600;   /* raw/control 0.75 A */
+    m_motor_1.m_iq_q4=800;   /* raw/control 1.00 A */
+    m_motor_1.m_current_in_counts=-50;
+    m_motor_1.m_id_telem_q4=600;   /* monitoring LPF output */
+    m_motor_1.m_iq_telem_q4=800;
+    m_motor_1.m_current_in_telem_counts=-50; /* EFeru polarity => +1.00 A Ibus */
     mcpwm_foc_get_values(&pvals,false);
     if(fabsf(pvals.current_motor-1.25f)>0.01f)return fail("VESC Imotor signed DQ magnitude positive");
     if(fabsf(pvals.current_in-1.00f)>0.01f)return fail("VESC Ibattery positive scaling");
     if(fabsf(pvals.id-0.75f)>0.01f || fabsf(pvals.iq-1.00f)>0.01f)return fail("VESC Id/Iq scaling");
     m_motor_1.m_current_in_counts=50;
+    m_motor_1.m_current_in_telem_counts=50;
     mcpwm_foc_get_values(&pvals,false);
     if(fabsf(pvals.current_motor+1.25f)>0.01f || fabsf(pvals.current_in+1.00f)>0.01f)return fail("VESC regenerative current signs");
 

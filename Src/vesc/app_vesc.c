@@ -73,9 +73,9 @@ static float throttle_curve(float val, float curve_acc, float curve_brake, int m
 
 
 #ifdef STM32F103xE
-/* App Config persistence uses EEPROM-emulation slots 49..122. Only the
- * application fields implemented by this board are stored; unsupported VESC
- * application families stay at safe defaults. Each motor gets 37 16-bit slots. */
+/* App Config persistence remains permanently at EEPROM-emulation slots
+ * 49..122. MC extension slots were appended at 123+, so legacy App Config
+ * addresses never move. Each motor gets 37 16-bit App slots. */
 #define APP_EE_BASE              49u
 #define APP_EE_STRIDE            37u
 #define APP_EE_SIGNATURE         0xA601u

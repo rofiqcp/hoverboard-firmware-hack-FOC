@@ -24,28 +24,33 @@
 #define MCCONF_FOC_ID_KP_Q11                 819u
 #define MCCONF_FOC_ID_KI_Q16                 737u
 #define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
+/* VESC default foc_current_filter_const is 0.1. This port keeps the proven
+ * 0.12 fixed-point feedback filter above, while the standard runtime config
+ * field controls a separate monitoring LPF exactly as upstream intends. */
+#define MCCONF_FOC_TELEMETRY_FILTER_DEFAULT     0.10f
 /* VESC speed PID uses normalized output/current scaling. Hardware step tests at
  * +/-750 ERPM selected Kp=0.002, Ki=0.002, Kd=0 for this Hall hoverboard: the
  * doubled Ki removed ~3.3% steady error without excessive current; Kd stays 0
  * because Hall-speed quantization makes a derivative term noisy. These integer
  * fields are persisted gain*1000, not direct Vq-controller coefficients. */
-#define MCCONF_SPEED_KP_Q11                     2u
-#define MCCONF_SPEED_KI_Q16                     2u
+#define MCCONF_SPEED_GAIN_SCALE             100000u /* 1e-5 resolution; fits standard VESC speed gains in uint16 */
+#define MCCONF_SPEED_KP_Q11                   200u /* 0.00200 */
+#define MCCONF_SPEED_KI_Q16                   200u /* 0.00200 */
 #define MCCONF_SPEED_KD_Q11                     0u
-#define MCCONF_POSITION_KP_Q11                   8u
+#define MCCONF_POSITION_KP_Q11                  60u /* 0.060: ~0.24 A per 1 Hall count at 1 A limit */
 #define MCCONF_POSITION_KI_Q16                   0u
 #define MCCONF_POSITION_KD_Q11                   0u
+#define MCCONF_POSITION_KD_FILTER_Q16         13107u /* 0.20, VESC default D filter */
 /* Hall-count position safety/tuning. Position PID follows VESC normalized
  * current-output architecture, but this low-resolution steering actuator gets a
  * hard current cap and velocity damping so one-sector commands cannot run away. */
-#define MCCONF_POSITION_CURRENT_MAX_MA          600u
+#define MCCONF_POSITION_CURRENT_MAX_MA         1000u
 #define MCCONF_POSITION_SETTLE_CURRENT_MA        150u
 #define MCCONF_POSITION_SETTLE_MS                120u
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
  * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
 #define MCCONF_SPEED_RAMP_ERPMS_S             1500u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
-#define MCCONF_SPEED_STOP_VOLTAGE_MAX          4000   /* gentle stop ceiling; running limit remains 12800 */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX   12800
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          15200   /* 95% exact modulation */
@@ -53,7 +58,15 @@
 #define MCCONF_PWM_MARGIN_COUNTS                100   /* 5% of ARR=2000 -> 95% gate ceiling */
 #define MCCONF_HIGH_DUTY_OC_THRESHOLD_PERMILLE  800u
 #define MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES          3u /* keep ABS OC active; reject 1-sample shunt glitches */
-#define MCCONF_DRIVEN_OFFSET_CAL_SAMPLES          64u /* 4 ms @ 16 kHz */
+/* OFF->RUN ADC/gate-driver settling. Unlike the old per-start offset calibration,
+ * this never learns a new offset. It only holds a zero vector for 8 PWM frames
+ * (0.5 ms @16 kHz) so the first LOW-FET shunt sample belongs to the driven
+ * operating point calibrated during the original 2000-sample startup window. */
+#define MCCONF_BRIDGE_SETTLE_SAMPLES                8u
+/* OFF/high-impedance telemetry uses its own frozen zero-current ADC baseline.
+ * Remove a few ADC counts of amplifier noise without hiding real passive/regen
+ * current changes when the wheel is back-driven manually. 4 counts = 0.08 A. */
+#define MCCONF_OFF_TELEM_DEADBAND_COUNTS              4
 #define MCCONF_CURRENT_SLEW_A_PER_S              10u
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX

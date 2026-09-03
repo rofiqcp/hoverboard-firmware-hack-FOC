@@ -1,6 +1,7 @@
 #include <string.h>
 #include "stm32f1xx_hal.h"
 #include "config.h"
+#include "defines.h"
 #include "motor/mcpwm_foc.h"
 #include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
@@ -30,9 +31,13 @@
 #define HB_CUSTOM_SET_POS_LIMITS         3u
 #define HB_CUSTOM_SET_POS_TARGET         4u
 #define HB_CUSTOM_RESET_POSITION         5u
+#define HB_CUSTOM_GET_TUNING             6u
+#define HB_CUSTOM_SET_TUNING             7u
+#define HB_CUSTOM_SET_ID_TEST            8u
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
+extern volatile adc_buf_t adc_buffer;
 
 static volatile uint8_t s_rx_active = 0u;
 static volatile uint16_t s_rx_index = 0u;
@@ -621,6 +626,43 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         reply_custom_pos_state(second, op, 0u);
         return;
     }
+    if (op == HB_CUSTOM_GET_TUNING || op == HB_CUSTOM_SET_TUNING) {
+        mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+        if (op == HB_CUSTOM_SET_TUNING) {
+            if (n < 20u) { uint8_t e[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,1u}; uart_send_payload(e,6u); return; }
+            m->m_kpq_q11=buffer_get_uint16(d,&k); m->m_kiq_q16=buffer_get_uint16(d,&k);
+            m->m_kpd_q11=buffer_get_uint16(d,&k); m->m_kid_q16=buffer_get_uint16(d,&k);
+            m->m_kps_q11=buffer_get_uint16(d,&k); m->m_kis_q16=buffer_get_uint16(d,&k); m->m_kds_q11=buffer_get_uint16(d,&k);
+            m->m_kpp_q11=buffer_get_uint16(d,&k); m->m_kip_q16=buffer_get_uint16(d,&k); m->m_kdp_q11=buffer_get_uint16(d,&k);
+            mcpwm_foc_sync_tuning_to_conf(second);
+            bool store=false;
+            if (n >= 22u) {
+                uint16_t fa=buffer_get_uint16(d,&k);
+                if(fa<1u)fa=1u;
+                m->m_telem_current_filter_q16=fa;
+                m->m_conf.foc_current_filter_const=(float)fa/65535.0f;
+                if(n>=23u)store=d[22]!=0u;
+            } else if (n >= 21u) store=d[20]!=0u;
+            if (store) (void)mc_interface_store_configuration_motor(second);
+        }
+        uint8_t b[40]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1; b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        buffer_append_uint16(b,m->m_kpq_q11,&j); buffer_append_uint16(b,m->m_kiq_q16,&j);
+        buffer_append_uint16(b,m->m_kpd_q11,&j); buffer_append_uint16(b,m->m_kid_q16,&j);
+        buffer_append_uint16(b,m->m_kps_q11,&j); buffer_append_uint16(b,m->m_kis_q16,&j); buffer_append_uint16(b,m->m_kds_q11,&j);
+        buffer_append_uint16(b,m->m_kpp_q11,&j); buffer_append_uint16(b,m->m_kip_q16,&j); buffer_append_uint16(b,m->m_kdp_q11,&j);
+        buffer_append_uint16(b,m->m_telem_current_filter_q16,&j); buffer_append_int16(b,m->m_current_limit_q4,&j);
+        uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_SET_ID_TEST) {
+        if (n < 8u) { uint8_t e[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,1u}; uart_send_payload(e,6u); return; }
+        const int32_t ma=buffer_get_int32(d,&k); const int32_t mdeg=buffer_get_int32(d,&k);
+        touch_motor(second);
+        if (ma == 0) mc_interface_release_motor();
+        else mcpwm_foc_set_openloop_phase((float)(ma<0?-ma:ma)/1000.0f,(float)mdeg/1000.0f,second);
+        { uint8_t a[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u}; uart_send_payload(a,6u); }
+        return;
+    }
     if (op == HB_CUSTOM_GET_DIAG) {
         uint8_t b[176];
         int32_t i = 0;
@@ -744,6 +786,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_int16(b,ds.last_trip_duty,&i);
             buffer_append_int16(b,ds.driven_off0,&i); buffer_append_int16(b,ds.driven_off1,&i); buffer_append_int16(b,ds.driven_offdc,&i);
             buffer_append_uint16(b,ds.driven_samples,&i); b[i++]=ds.driven_valid; b[i++]=ds.driven_cal;
+            /* Raw ADC snapshot for calibration/telemetry validation. This is
+             * diagnostic-only and never participates in VESC standard packets. */
+            buffer_append_uint16(b,adc_buffer.rlA,&i); buffer_append_uint16(b,adc_buffer.rlB,&i);
+            buffer_append_uint16(b,adc_buffer.dcl,&i); buffer_append_uint16(b,adc_buffer.rrB,&i);
+            buffer_append_uint16(b,adc_buffer.rrC,&i); buffer_append_uint16(b,adc_buffer.dcr,&i);
         }
         uart_send_payload(b, (uint16_t)i);
     }
@@ -806,12 +853,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_SET_HANDBRAKE:
         if (n >= 4u) {
-            /* This hardware has no separate mechanical/electromagnetic handbrake
-             * actuator. Match the VESC command contract by applying the requested
-             * holding current through the FOC brake-current path. */
             float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             if (current < 0.0f) current = -current;
-            touch_motor(second); mc_interface_set_brake_current(current);
+            touch_motor(second); mc_interface_set_handbrake(current);
         }
         break;
     case COMM_SET_RPM:

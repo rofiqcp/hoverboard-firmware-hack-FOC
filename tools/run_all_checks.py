@@ -54,12 +54,15 @@ def check_static():
     assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
     assert 'v.q=pi_run_state(eq,m->m_kpq_q11,m->m_kiq_q16' in mc, 'mode2 must close inner Iq PI before Vq'
     assert 'speed_setpoint_slew_step' in mc and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp missing'
-    assert 'MCCONF_SPEED_STOP_VOLTAGE_MAX' in mc, 'mode2 gentle stop voltage ceiling missing'
-    assert 'mcpwm_foc_release_motor(second)' in mc and 'stop_reached' in mc, 'mode2 low-speed release missing'
+    assert 'stop_zone' in mc and 'iq_setpoint_slew_step(m)' in mc, 'mode2 STOP must slew Iq to zero before release'
+    assert 'mcpwm_foc_release_motor(second)' in mc and 'm->m_iq_set_q4==0' in mc, 'mode2 low-speed release must wait for zero Iq'
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
-    assert 'MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'closed-loop voltage-circle anti-windup missing'
-    assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'mode3 current setpoint slew missing'
-    assert 'leftPhaseExceeded=leftBridgeWasOn' in mc and 'rightPhaseExceeded=rightBridgeWasOn' in mc and 'leftPhaseTrip=leftPhaseExceeded' in mc and 'rightPhaseTrip=rightPhaseExceeded' in mc, 'phase over-current must remain active on all powered modes'
+    assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'
+    assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'current setpoint slew missing'
+    assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
+    assert 'm_brake_current_q4' in mc and 'same_motion' in mc and 'm_hall_ticks<=fresh' in mc and 'm_brake_direction==0' in mc, 'VESC Hall-safe brake latch/freshness missing'
+    assert 'CONTROL_MODE_HANDBRAKE' in mc and 'm->m_phase=0u' in mc and 'mcpwm_foc_set_handbrake' in mc, 'VESC handbrake fixed-phase mode missing'
+    assert 'leftPhaseExceeded=leftCurrentSampleValid' in mc and 'rightPhaseExceeded=rightCurrentSampleValid' in mc and 'leftPhaseTrip=leftPhaseExceeded' in mc and 'rightPhaseTrip=rightPhaseExceeded' in mc, 'phase over-current must remain active on all valid driven samples'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
     assert 'Safety gate phase 2' in mc and 'if(leftDriveRequest && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
@@ -79,6 +82,8 @@ def check_static():
     assert re.search(r'#define\s+MCCONF_FOC_DUTY_VOLTAGE_MAX\s+15200',mcc), '95pct SVPWM voltage ceiling must be 15200'
     assert re.search(r'#define\s+MCCONF_PWM_MARGIN_COUNTS\s+100',mcc), '95pct PWM margin must be 100/2000 counts'
     assert 'MCCONF_HIGH_DUTY_OC_QUAL_SAMPLES' in mc and 'm_phase_overcurrent_streak' in mc and 'leftDcTrip' in mc and 'm_phase_trip_count' in mc and 'm_dc_trip_count' in mc, 'qualified high-duty ABS current protection/diagnostics missing'
+    assert 'MCCONF_BRIDGE_SETTLE_SAMPLES' in mc and 'm_bridge_settle_ticks' in mc and 'leftCurrentSampleValid' in mc, 'OFF-to-RUN current sample blanking missing'
+    assert 'm_telem_sum_id_q4' in mc and 'm_telem_avg_samples' in mc and 'telemetry_avg_push' in mc, 'VESC-style read/reset current averaging missing'
     assert 'l_abs_current_max' in mc and 'MCCONF_L_ABS_CURRENT_MAX' in mc, 'VESC-style absolute current fault limit missing'
     assert 'trq_ca_to_q4' in mc and 'A2BIT_CONV*16)/100' in mc, 'mode3 centiampere scaling missing'
     assert 'm_openloop_id_ramp_q16' in mc and 'MCCONF_OPENLOOP_ID_SLEW_A_S' in mc, 'mode4 Id slew protection missing'
@@ -103,7 +108,7 @@ def check_static():
     assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
     assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
     assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
@@ -129,7 +134,7 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)123u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)135u\)', eeh), 'EEPROM virtual variable count mismatch'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
@@ -166,7 +171,7 @@ def config_size_check():
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py'])
+    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py','tools/vesc_response_lab.py tools/vesc_manual_spin_monitor.py'])
     run([sys.executable,'tools/host_compile_check.py'])
     run([sys.executable,'tools/test_foc_math.py'])
     run([sys.executable,'tools/test_motor_control_v12.py'])

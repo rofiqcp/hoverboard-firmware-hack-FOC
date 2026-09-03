@@ -69,31 +69,26 @@ int main(void){
     if((LEFT_TIM->BDTR & TIM_BDTR_MOE)!=0u || (RIGHT_TIM->BDTR & TIM_BDTR_MOE)!=0u)
         return fail("free-run release must disable MOE/high impedance");
 
-    /* Driven current-offset calibration must hold a true zero-modulation vector
-     * before duty/current control is allowed to energize the motor. This guards
-     * against startup-current spikes caused by measuring offsets under torque. */
+    /* Upstream EFeru contract: current-control offset is calibrated once during
+     * the first 2000 synchronized ADC frames. Starting a new command must NOT
+     * enter a second driven-offset calibration or suppress the command. */
     mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
     ctrlModReq=VLT_MODE; pwml=100; pwmr=0;
-    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
-    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
-    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
-    /* Inject a repeatable driven offset different from the undriven 2000 count
-     * baseline. The bridge should be on at 50/50/50 while these samples accrue. */
     adc_buffer.rlA=2010; adc_buffer.rlB=2020; adc_buffer.dcl=2030;
-    DMA1_Channel1_IRQHandler(); /* latch legacy command into CONTROL_MODE_DUTY */
-    DMA1_Channel1_IRQHandler(); /* enter driven-offset zero-vector phase */
-    if(!m_motor_1.m_driven_offset_calibrating || (LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)
-        return fail("driven offset calibration must arm zero-vector bridge");
-    for(uint32_t i=0;i<MCCONF_DRIVEN_OFFSET_CAL_SAMPLES;i++){
-        if(m_motor_1.m_ccr_a!=1000u || m_motor_1.m_ccr_b!=1000u || m_motor_1.m_ccr_c!=1000u ||
-           m_motor_1.m_duty_now_permille!=0)
-            return fail("driven offset calibration must hold 50pct zero vector");
-        DMA1_Channel1_IRQHandler();
-    }
+    adc_buffer.rrB=1990; adc_buffer.rrC=1980; adc_buffer.dcr=1970; adc_buffer.batt1=2000;
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
     if(!m_motor_1.m_driven_offset_valid || m_motor_1.m_driven_offset_calibrating)
-        return fail("driven offset calibration must complete");
-    if(m_motor_1.m_driven_offset0!=2010 || m_motor_1.m_driven_offset1!=2020 || m_motor_1.m_driven_offsetdc!=2030)
-        return fail("driven offset average mismatch");
+        return fail("startup control offset must become valid once");
+    const int16_t off0=m_motor_1.m_driven_offset0, off1=m_motor_1.m_driven_offset1, offdc=m_motor_1.m_driven_offsetdc;
+    /* Change ADC values after calibration: these are real current samples and
+     * must not be re-learned as an offset when OFF->RUN occurs. */
+    adc_buffer.rlA=2050; adc_buffer.rlB=2060; adc_buffer.dcl=2035;
+    DMA1_Channel1_IRQHandler();
+    DMA1_Channel1_IRQHandler();
+    if(m_motor_1.m_driven_offset_calibrating) return fail("OFF-to-RUN must not recalibrate current offset");
+    if(m_motor_1.m_driven_offset0!=off0 || m_motor_1.m_driven_offset1!=off1 || m_motor_1.m_driven_offsetdc!=offdc)
+        return fail("control offset must stay fixed after startup");
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u) return fail("OFF-to-RUN must arm bridge without calibration delay");
 
     /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
      * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
@@ -128,7 +123,6 @@ int main(void){
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
     for(int i=0;i<3500;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
-    if(abs(m_motor_1.m_vq)>MCCONF_SPEED_STOP_VOLTAGE_MAX)return fail("mode2 STOP Vq ceiling");
     for(int i=0;i<5000;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode2 STOP must release near zero");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
@@ -157,6 +151,41 @@ int main(void){
     mc_values vals;
     mcpwm_foc_get_values(&vals,false);
     if(fabsf(vals.rpm-750.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
+
+    /* Smooth speed STOP handoff: once the ramp enters the release zone,
+     * non-zero Iq must be slewed to zero before the bridge is released. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    mcpwm_foc_set_pid_speed(300.0f,false); mcpwm_foc_vesc_override_touch(false);
+    m_motor_1.m_speed_set_ramp_q16=(int32_t)4<<16;
+    m_motor_1.m_speed_target_rpm_q16=0; m_motor_1.m_speed_target_rpm=0;
+    m_motor_1.m_iq_set_q4=800; m_motor_1.m_iq_target_q4=800; m_motor_1.m_iq_set_ramp_q16=(int32_t)800<<16;
+    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("speed STOP must not release with nonzero Iq");
+    if(m_motor_1.m_iq_set_q4>=800)return fail("speed STOP must ramp Iq toward zero");
+    for(int i=0;i<4000 && m_motor_1.m_control_mode!=CONTROL_MODE_NONE;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zero-Iq release");
+
+    /* VESC current brake: always oppose fresh rotor speed and never command a
+     * reverse rotation from a stale Hall sign. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1; m_motor_1.m_hall_period=200u; m_motor_1.m_hall_ticks=20u; m_motor_1.m_rpm=53;
+    mcpwm_foc_set_brake_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
+    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT_BRAKE || m_motor_1.m_iq_target_q4>=0)return fail("brake must oppose positive speed");
+    m_motor_1.m_hall_ticks=1200u;
+    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_iq_target_q4!=0)return fail("stale brake speed must command zero torque");
+    for(int i=0;i<1200 && m_motor_1.m_control_mode!=CONTROL_MODE_NONE;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_set_q4!=0)return fail("brake must release after zero-Iq handoff");
+
+    /* VESC handbrake is not current-brake. It creates a stationary electrical
+     * field at phase zero so the rotor is held rather than continuously driven. */
+    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    mcpwm_foc_set_handbrake(1.0f,false); mcpwm_foc_vesc_override_touch(false);
+    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_HANDBRAKE)return fail("handbrake control mode");
+    if(m_motor_1.m_phase!=0u)return fail("handbrake must lock phase zero");
+    if(m_motor_1.m_iq_target_q4<=0)return fail("handbrake current missing");
 
     /* MODE 3 scaling remains exact: 50 cA = 0.50 A, 1500 cA = 15 A. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
@@ -221,6 +250,7 @@ int main(void){
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("duty95 bridge did not arm");
+    while(m_motor_1.m_bridge_settle_ticks>0u)DMA1_Channel1_IRQHandler();
     adc_buffer.rlA=950; /* +1050 counts = 21 A, above 20 A absolute phase limit */
     for(int k=1;k<=2;k++){
         m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
@@ -237,6 +267,7 @@ int main(void){
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
+    while(m_motor_1.m_bridge_settle_ticks>0u)DMA1_Channel1_IRQHandler();
     adc_buffer.dcl=1100; /* +900 counts = 18 A > 17 A DC hard limit */
     m_motor_1.m_duty_now_permille=900; DMA1_Channel1_IRQHandler();
     if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("DC-link OC must fault immediately");

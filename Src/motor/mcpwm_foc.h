@@ -38,6 +38,11 @@ typedef struct {
     volatile uint16_t m_kpq_q11, m_kiq_q16;
     volatile uint16_t m_kpd_q11, m_kid_q16;
     volatile uint16_t m_kps_q11, m_kis_q16, m_kds_q11;
+    /* Precomputed speed-PID coefficients. Configuration may use float, but the
+     * 16-kHz ISR executes multiply+shift only (no __aeabi_ldivmod). */
+    uint32_t m_speed_kp_coeff_q16;
+    uint32_t m_speed_ki_coeff_q16;
+    uint32_t m_speed_kd_coeff_q8;
     volatile uint16_t m_kpp_q11, m_kip_q16, m_kdp_q11;
     volatile int32_t m_position_counts;
     volatile int32_t m_position_target_counts;
@@ -55,6 +60,23 @@ typedef struct {
     volatile int16_t m_vd;
     volatile int16_t m_vq;
     volatile int16_t m_current_in_counts;
+    /* Monitoring-only filtered currents. Upstream VESC keeps a separate current
+     * filter for non-time-critical telemetry so the fast current controller is
+     * not slowed down by display smoothing. */
+    volatile int16_t m_id_telem_q4;
+    volatile int16_t m_iq_telem_q4;
+    volatile int16_t m_current_in_telem_counts;
+    int32_t m_telem_current_lpf_q16[3];
+    uint16_t m_telem_current_filter_q16;
+    /* VESC-style read/reset telemetry averages. These are accumulated at the
+     * 5.33-kHz control cadence and atomically consumed by COMM_GET_VALUES. */
+    volatile int32_t m_telem_sum_id_q4;
+    volatile int32_t m_telem_sum_iq_q4;
+    volatile int32_t m_telem_sum_ibus_counts;
+    volatile uint16_t m_telem_avg_samples;
+    /* Short OFF->RUN sample blanking; fixed startup control offsets are never
+     * modified here. */
+    volatile uint16_t m_bridge_settle_ticks;
     volatile int16_t m_rpm;
     volatile int16_t m_duty_now_permille;
     volatile uint8_t m_driven_offset_calibrating;
@@ -62,6 +84,13 @@ typedef struct {
     volatile uint16_t m_driven_offset_samples;
     int32_t m_driven_offset_sum0, m_driven_offset_sum1, m_driven_offset_sumdc;
     volatile int16_t m_driven_offset0, m_driven_offset1, m_driven_offsetdc;
+    /* Separate zero-current ADC offsets while the bridge is high-impedance.
+     * The low-side current amplifiers shift operating point between bridge-OFF
+     * and centered-PWM states on this hoverboard hardware. */
+    volatile int16_t m_off_offset0, m_off_offset1, m_off_offsetdc;
+    volatile uint16_t m_off_offset_samples;
+    volatile uint8_t m_off_offset_valid;
+    int32_t m_off_offset_sum0, m_off_offset_sum1, m_off_offset_sumdc;
 
     /* VESC energy counters since boot. Upstream exposes separate drawn and
      * charged Ah/Wh counters in COMM_GET_VALUES. Updated from the measured
@@ -120,6 +149,9 @@ typedef struct {
     int32_t m_speed_prev_error;
     int32_t m_position_integrator;
     int16_t m_position_prev_error;
+    uint16_t m_position_dt_ticks;
+    int32_t m_position_d_filter_q15;
+    uint16_t m_position_kd_filter_q16;
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
@@ -129,11 +161,12 @@ typedef struct {
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
-    /* Brake direction is latched on entry: +1 means rotor was moving positive
-     * and brake must apply negative Iq, -1 vice versa. Once the rotor reaches
-     * the stop deadband it is cleared to 0 and cannot reverse torque until a
-     * new brake-mode entry. */
-    int8_t m_brake_direction;
+    /* Brake current is stored as a magnitude. CONTROL_MODE_CURRENT_BRAKE
+     * recomputes its sign from fresh Hall speed every control update, matching
+     * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */
+    int8_t m_brake_direction; /* diagnostic: current applied direction, 0 at stop/stale speed */
+    int16_t m_brake_current_q4;
+    int16_t m_handbrake_current_q4;
     int32_t m_current_lpf_q16[2];
 
     uint32_t m_openloop_phase_acc_q32;
@@ -190,6 +223,7 @@ int32_t mcpwm_foc_get_position_min_user_counts(bool is_second_motor);
 int32_t mcpwm_foc_get_position_max_user_counts(bool is_second_motor);
 void mcpwm_foc_reset_position(bool is_second_motor);
 void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
+void mcpwm_foc_set_handbrake(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
 void mcpwm_foc_release_motor(bool is_second_motor);
