@@ -20,6 +20,7 @@ typedef struct {
     mc_state m_state;
     mc_control_mode m_control_mode;
     mc_fault_code m_fault;
+    volatile uint32_t m_fault_recovery_ticks;
 
     /* VESC-style setpoints. Fixed-point values are authoritative in the ISR. */
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
@@ -50,6 +51,14 @@ typedef struct {
     volatile int16_t m_current_in_counts;
     volatile int16_t m_rpm;
     volatile int16_t m_duty_now_permille;
+
+    /* VESC energy counters since boot. Upstream exposes separate drawn and
+     * charged Ah/Wh counters in COMM_GET_VALUES. Updated from the measured
+     * DC-link current at the 5-ms housekeeping cadence, never from telemetry. */
+    float m_amp_seconds;
+    float m_amp_seconds_charged;
+    float m_watt_seconds;
+    float m_watt_seconds_charged;
 
     /* Electrical phase: 0..65535 = 0..360 degrees. */
     volatile uint16_t m_phase;
@@ -162,10 +171,13 @@ void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
 void mcpwm_foc_release_motor(bool is_second_motor);
+void mcpwm_foc_vesc_timeout_configure(bool is_second_motor, uint32_t timeout_ms, float brake_current);
 void mcpwm_foc_vesc_override_touch(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active_any(void);
+bool mcpwm_foc_vesc_command_live(bool is_second_motor);
 void mcpwm_foc_vesc_override_clear(bool is_second_motor);
+void mcpwm_foc_energy_update(uint32_t now_ms);
 
 /* Integer API used by the bare-metal command layer. */
 void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
@@ -173,8 +185,12 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
 
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
 float mcpwm_foc_get_tot_current_in_motor(bool is_second_motor);
-float mcpwm_foc_get_rpm_motor(bool is_second_motor); /* mechanical RPM */
+float mcpwm_foc_get_rpm_motor(bool is_second_motor); /* integer Hall mechanical RPM estimator */
 float mcpwm_foc_get_erpm_motor(bool is_second_motor);  /* VESC electrical RPM */
+float mcpwm_foc_get_motor_mechanical_rpm(bool is_second_motor);
+float mcpwm_foc_get_output_rpm(bool is_second_motor); /* after si_gear_ratio */
+uint16_t mcpwm_foc_get_pole_pairs(bool is_second_motor);
+float mcpwm_foc_get_gear_ratio(bool is_second_motor);
 float mcpwm_foc_get_duty_cycle_motor(bool is_second_motor);
 float mcpwm_foc_get_id_motor(bool is_second_motor);
 float mcpwm_foc_get_iq_motor(bool is_second_motor);

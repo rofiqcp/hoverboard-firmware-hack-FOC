@@ -36,8 +36,13 @@ static void hold_left_hall(uint8_t h,uint16_t ticks){
 
 /* Deliberately non-default Hall/phase permutations. Index is 60-degree
  * electrical sector in applied board phase coordinates. */
-static const uint8_t left_raw_for_sector[6]  ={5u,1u,3u,2u,6u,4u};
-static const uint8_t right_raw_for_sector[6] ={2u,6u,4u,5u,1u,3u};
+static uint8_t left_raw_for_sector[6]  ={5u,1u,3u,2u,6u,4u};
+static uint8_t right_raw_for_sector[6] ={2u,6u,4u,5u,1u,3u};
+
+static uint8_t permute_hall_bits(uint8_t h,const uint8_t p[3]){
+    const uint8_t bits[3]={(uint8_t)((h>>2)&1u),(uint8_t)((h>>1)&1u),(uint8_t)(h&1u)};
+    return (uint8_t)((bits[p[0]]<<2)|(bits[p[1]]<<1)|bits[p[2]]);
+}
 
 static uint8_t raw_for_phase(uint16_t phase,const uint8_t map[6]){
     /* sector center 0,60,...; boundaries +/-30 deg */
@@ -85,6 +90,29 @@ static int validate(const uint8_t t[8],const uint8_t map[6],const char *which){
 
 int main(void){
     uint8_t tl[8],tr[8];
+
+    /* Wiring robustness: any permutation of the three Hall signal wires, plus
+     * a reversed motor phase sequence, must still be learnable by Hall detect.
+     * This models the practical phase/Hall swaps users make at the connector. */
+    {
+        static const uint8_t perms[6][3]={{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+        static const uint8_t base[6]={5u,1u,3u,2u,6u,4u};
+        uint8_t testtab[8]; unsigned cases=0u;
+        for(unsigned pi=0;pi<6u;pi++) for(unsigned rev=0;rev<2u;rev++){
+            for(unsigned sec=0;sec<6u;sec++){
+                const unsigned src=rev?((6u-sec)%6u):sec;
+                left_raw_for_sector[sec]=permute_hall_bits(base[src],perms[pi]);
+            }
+            mcpwm_foc_init();
+            if(!mcpwm_foc_detect_hall(1.0f,false,testtab))return fail("permuted Hall/phase detector returned false");
+            if(validate(testtab,left_raw_for_sector,"permuted"))return 1;
+            cases++;
+        }
+        { const uint8_t l0[6]={5u,1u,3u,2u,6u,4u}; const uint8_t r0[6]={2u,6u,4u,5u,1u,3u};
+          memcpy(left_raw_for_sector,l0,6); memcpy(right_raw_for_sector,r0,6); }
+        printf("HALL_WIRING_PERMUTATION_PASS cases=%u\n",cases);
+    }
+
     mcpwm_foc_init();
     HAL_Delay(1u);
     if(!mcpwm_foc_detect_hall(1.0f,false,tl))return fail("left detector returned false");

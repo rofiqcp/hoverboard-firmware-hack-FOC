@@ -37,6 +37,12 @@
 #define TEMP_POWEROFF_ENABLE     0
 #define TEMP_POWEROFF            650
 
+/* Development profile: keep board latched on and ignore the momentary power
+ * button while VESC Tool/UART integration is under test. Safety faults still
+ * disable the PWM bridge; only the physical OFF latch is bypassed. */
+#define POWER_OFF_ENABLE          0
+#define POWER_BUTTON_BYPASS       1
+
 #define COM_CTRL                 0
 #define SIN_CTRL                 1
 #define FOC_CTRL                 2

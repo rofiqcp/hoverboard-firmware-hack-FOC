@@ -10,6 +10,7 @@
 #include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
 #include "vesc/vesc_protocol.h"
+#include "vesc/app_vesc.h"
 #include "comms.h"
 
 void SystemClock_Config(void);
@@ -160,7 +161,9 @@ int main(void) {
 
   int32_t boardTempAdcFixdt = adc_buffer.temp << 16;
   int16_t boardTempAdcFilt = adc_buffer.temp;
+#if !POWER_BUTTON_BYPASS
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) HAL_Delay(10);
+#endif
 
   while (1) {
     /* Service VESC request/reply traffic as soon as DMA/IDLE has queued it.
@@ -174,6 +177,8 @@ int main(void) {
     readCommand();
     const bool vescLinkActive = vesc_protocol_link_active();
     calcAvgSpeed();
+    app_vesc_process(HAL_GetTick());
+    mcpwm_foc_energy_update(HAL_GetTick());
 
     if (!timeoutFlgSerial && enable == 0 && !controllerFaultActive() &&
         input1[0].cmd > -50 && input1[0].cmd < 50 && input2[0].cmd > -50 && input2[0].cmd < 50) {

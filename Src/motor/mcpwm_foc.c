@@ -61,7 +61,16 @@ static int16_t curPha_max = (I_MOT_MAX * A2BIT_CONV);
 
 int16_t odom_l = 0, odom_r = 0;
 static volatile uint8_t s_overrun = 0;
-static volatile uint16_t s_vesc_override_ticks[2] = {0u, 0u};
+/* VESC command ownership is separate from its safety timeout. Upstream VESC
+ * keeps the last motor setpoint while COMM_ALIVE resets timeout_reset(); when
+ * the timeout expires the motor is stopped/braked, but an unrelated legacy
+ * input source must not immediately overwrite that VESC state. */
+static volatile uint8_t s_vesc_owned[2] = {0u, 0u};
+static volatile uint8_t s_vesc_timeout_braking[2] = {0u, 0u};
+static volatile uint32_t s_vesc_timeout_ticks[2] = {0u, 0u};
+static volatile uint32_t s_vesc_timeout_ms[2] = {1000u, 1000u};
+static volatile float s_vesc_timeout_brake_a[2] = {0.0f, 0.0f};
+static uint32_t s_energy_last_ms = 0u;
 static uint8_t s_foc_control_div = 0u;
 
 /* VESC FOC Hall table: 0..199 = 0..360 electrical degrees, 255 = invalid.
@@ -69,7 +78,17 @@ static uint8_t s_foc_control_div = 0u;
 static const uint8_t s_default_foc_hall_table[8] = {255u, 83u, 17u, 50u, 150u, 117u, 183u, 255u};
 
 static uint16_t motor_pole_pairs(bool second) {
-    return second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT;
+    const mc_configuration *c = second ? &m_motor_2.m_conf : &m_motor_1.m_conf;
+    uint16_t poles = c->si_motor_poles;
+    if (poles < 2u || (poles & 1u)) {
+        poles = (uint16_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+    }
+    return (uint16_t)(poles / 2u);
+}
+
+static float motor_gear_ratio(bool second) {
+    const float ratio = (second ? m_motor_2.m_conf.si_gear_ratio : m_motor_1.m_conf.si_gear_ratio);
+    return (ratio >= 0.01f && ratio <= 1000.0f) ? ratio : 1.0f;
 }
 
 static int32_t user_position_to_internal(int32_t position_counts, bool second) {
@@ -147,6 +166,9 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_sensor_mode = FOC_SENSOR_MODE_HALL;
     c->l_current_max = MCCONF_L_CURRENT_MAX;
     c->l_current_min = MCCONF_L_CURRENT_MIN;
+    c->l_min_duty = MCCONF_L_MIN_DUTY;
+    c->l_max_duty = MCCONF_L_MAX_DUTY;
+    c->m_fault_stop_time_ms = (int32_t)MCCONF_FAULT_STOP_TIME_MS;
     c->l_in_current_max = MCCONF_L_IN_CURRENT_MAX;
     c->l_in_current_min = MCCONF_L_IN_CURRENT_MIN;
     c->l_max_erpm = MCCONF_L_MAX_ERPM;
@@ -169,6 +191,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->p_pid_kd = (float)MCCONF_POSITION_KD_Q11 / 1000.0f;
     c->p_pid_ang_div = 1.0f;
     c->si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+    c->si_gear_ratio = 1.0f; /* direct drive; set >1 in VESC Tool for a gearbox */
     for (int i=0;i<8;i++) c->foc_hall_table[i] = (int8_t)s_default_foc_hall_table[i];
 }
 
@@ -190,6 +213,23 @@ static bool hall_table_runtime_sane(const uint8_t t[8]) {
     return true;
 }
 
+static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
+    uint32_t ms = m->m_conf.m_fault_stop_time_ms > 0 ? (uint32_t)m->m_conf.m_fault_stop_time_ms : MCCONF_FAULT_STOP_TIME_MS;
+    if (ms < 50u) ms = 50u;
+    m->m_fault = code;
+    m->m_fault_recovery_ticks = (uint32_t)(((uint64_t)ms * (uint64_t)PWM_FREQ + 999u) / 1000u);
+    if (m->m_fault_recovery_ticks == 0u) m->m_fault_recovery_ticks = 1u;
+}
+
+static void motor_fault_recovery_tick(mcpwm_foc_motor_t *m) {
+    if (m->m_fault == FAULT_CODE_NONE) return;
+    if (m->m_fault_recovery_ticks > 0u) m->m_fault_recovery_ticks--;
+    if (m->m_fault_recovery_ticks == 0u) {
+        m->m_fault = FAULT_CODE_NONE;
+        m->m_state = MC_STATE_OFF;
+    }
+}
+
 static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     memset(m, 0, sizeof(*m));
     conf_defaults(&m->m_conf, second);
@@ -203,7 +243,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_position_min_counts=INT32_MIN; m->m_position_max_counts=INT32_MAX;
     m->m_current_limit_q4=MCCONF_MOTOR_CURRENT_MAX_Q4;
     {
-        const uint16_t pp = second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT;
+        const uint16_t pp = motor_pole_pairs(second);
         m->m_speed_ramp_rpm_s = (uint16_t)(MCCONF_SPEED_RAMP_ERPMS_S / pp);
         if (m->m_speed_ramp_rpm_s == 0u) m->m_speed_ramp_rpm_s = 1u;
         m->m_speed_release_rpm = (uint16_t)(MCCONF_SPEED_RELEASE_ERPM / pp);
@@ -224,7 +264,12 @@ void mcpwm_foc_init(void) {
     offsetrlA = offsetrlB = offsetrrB = offsetrrC = offsetdcl = offsetdcr = 2000;
     foc_isr_cycles = foc_isr_cycles_max = 0;
     s_overrun = 0;
-    s_vesc_override_ticks[0] = s_vesc_override_ticks[1] = 0u;
+    s_vesc_owned[0]=s_vesc_owned[1]=0u;
+    s_vesc_timeout_braking[0]=s_vesc_timeout_braking[1]=0u;
+    s_vesc_timeout_ticks[0]=s_vesc_timeout_ticks[1]=0u;
+    s_vesc_timeout_ms[0]=s_vesc_timeout_ms[1]=1000u;
+    s_vesc_timeout_brake_a[0]=s_vesc_timeout_brake_a[1]=0.0f;
+    s_energy_last_ms = 0u;
     s_foc_control_div = 0u;
 }
 
@@ -237,6 +282,16 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (!conf) return;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     mc_configuration next = *conf;
+    /* VESC stores the number of motor poles (not pole-pairs). FOC speed math
+     * uses this value at runtime, so changing Motor Poles in VESC Tool really
+     * changes ERPM <-> mechanical RPM conversion without recompiling. */
+    if (next.si_motor_poles < 2u || (next.si_motor_poles & 1u)) {
+        next.si_motor_poles = m->m_conf.si_motor_poles;
+        if (next.si_motor_poles < 2u || (next.si_motor_poles & 1u))
+            next.si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+    }
+    if (!(next.si_gear_ratio >= 0.01f && next.si_gear_ratio <= 1000.0f)) next.si_gear_ratio = 1.0f;
+    const bool poles_changed = m->m_conf.si_motor_poles != next.si_motor_poles;
     /* Never let a malformed VESC Tool/EEPROM Hall table become the live FOC
      * angle source. Preserve the last known-good table while still accepting
      * the other configuration fields. */
@@ -244,16 +299,25 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         for (uint8_t h=0u;h<8u;++h) next.foc_hall_table[h]=m->m_conf.foc_hall_table[h];
     }
     m->m_conf = next;
+    if (poles_changed) {
+        /* A live pole-count change would instantly rescale the speed loop.
+         * Release first, matching upstream's stop-on-structural-config-change policy. */
+        mcpwm_foc_release_motor(second);
+        m->m_speed_set_rpm = 0;
+        m->m_speed_target_rpm = 0;
+        m->m_speed_target_rpm_q16 = 0;
+        m->m_speed_set_ramp_q16 = 0;
+    }
 
     /* VESC configuration uses electrical units. Convert once outside the ISR
      * and keep the actual speed-loop ramp integer/fixed-point. */
-    const float pp = (float)(second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT);
-    float ramp_mech = conf->s_pid_ramp_erpms_s / pp;
+    const float pp = (float)motor_pole_pairs(second);
+    float ramp_mech = next.s_pid_ramp_erpms_s / pp;
     if (ramp_mech < 1.0f) ramp_mech = 1.0f;
     if (ramp_mech > 5000.0f) ramp_mech = 5000.0f;
     m->m_speed_ramp_rpm_s = (uint16_t)(ramp_mech + 0.5f);
 
-    float release_mech = conf->s_pid_min_erpm / pp;
+    float release_mech = next.s_pid_min_erpm / pp;
     if (release_mech < 1.0f) release_mech = 1.0f;
     if (release_mech > 100.0f) release_mech = 100.0f;
     m->m_speed_release_rpm = (uint16_t)(release_mech + 0.5f);
@@ -687,57 +751,45 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                      m->m_hall_direction_stable_edges >= MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES &&
                      m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS &&
                      ((uint32_t)period * MCCONF_HALL_PERIOD_OUTLIER_RATIO) < m->m_hall_period);
+                uint16_t period_for_filter = period;
                 if (period_outlier) {
-                    /* Period comparison is meaningful only while continuing in
-                     * the same direction. A legitimate reversal deliberately
-                     * resets the Hall period history and must not inherit the old
-                     * direction's short/long-period rejection threshold.
-                     * Keep re-evaluating a persistent candidate as m_hall_ticks
-                     * grows, but count this raw edge only once. The old code
-                     * incremented this counter on every 16-kHz ISR until the
-                     * hold time elapsed, turning one chatter/outlier edge into
-                     * hundreds of reported invalid transitions. */
+                    /* Never reject an electrically valid adjacent Hall state just
+                     * because its timing changed quickly. During acceleration that
+                     * creates a false skipped-state cascade on the next edge. VESC
+                     * uses Hall state for phase correction; timing is an estimator
+                     * input. Accept the state, but slew-limit the period estimate. */
                     if (m->m_hall_reject_counted_state != h) {
-                        /* Period rejection is a timing/filter event, not an
-                         * impossible Hall electrical sequence. Track it
-                         * separately so hall_bad means an actual mapping/state
-                         * error. */
                         m->m_hall_period_reject_count++;
                         m->m_hall_last_reject_reason = 1u;
                         m->m_hall_last_reject_from = 0xffu;
                         for(uint8_t rh=1u;rh<=6u;++rh) if(hall_table_angle(m,rh)==m->m_hall_pos_prev){m->m_hall_last_reject_from=rh;break;}
                         m->m_hall_last_reject_to = h;
-                        m->m_hall_reject_counted_state = h;
                     }
-                } else {
-                    m->m_hall_reject_counted_state = 0xffu;
-                    const bool direction_reset =
-                        (m->m_hall_direction == 0 || m->m_hall_direction != dir ||
-                         m->m_hall_period_hist[0] == MCCONF_HALL_TIMEOUT_TICKS);
-                    if (direction_reset) {
-                        for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = period;
-                        m->m_hall_hist_pos = 0u;
-                        m->m_hall_direction_stable_edges = 0u;
-                    } else {
-                        m->m_hall_period_hist[m->m_hall_hist_pos++ & 3u] = period;
-                    }
-                    uint32_t sum = 0u;
-                    for (int i = 0; i < 4; i++) sum += m->m_hall_period_hist[i];
-                    m->m_hall_period = (uint16_t)(sum / 4u);
-                    if (!m->m_hall_period) m->m_hall_period = 1u;
-                    m->m_hall_ticks = 0u;
-                    m->m_hall_direction = dir;
-                    if (m->m_hall_direction_stable_edges < 0xffu) m->m_hall_direction_stable_edges++;
-                    if (dir > 0 && m->m_position_counts < INT32_MAX) m->m_position_counts++;
-                    else if (dir < 0 && m->m_position_counts > INT32_MIN) m->m_position_counts--;
-                    /* VESC Hall tables contain SECTOR CENTERS. At an edge the
-                     * rotor is halfway between old and new centers. Starting
-                     * interpolation at the new center (old V15 behavior) adds
-                     * an erroneous +30 electrical degrees immediately, then
-                     * another sector during interpolation. */
-                    m->m_hall_pos = hall_midpoint200(previous_center, ad);
-                    m->m_hall_pos_prev = angle;
+                    const uint16_t floor_period=(uint16_t)(m->m_hall_period/MCCONF_HALL_PERIOD_OUTLIER_RATIO);
+                    if(floor_period>0u && period_for_filter<floor_period) period_for_filter=floor_period;
                 }
+                m->m_hall_reject_counted_state = 0xffu;
+                const bool direction_reset =
+                    (m->m_hall_direction == 0 || m->m_hall_direction != dir ||
+                     m->m_hall_period_hist[0] == MCCONF_HALL_TIMEOUT_TICKS);
+                if (direction_reset) {
+                    for (int i = 0; i < 4; i++) m->m_hall_period_hist[i] = period_for_filter;
+                    m->m_hall_hist_pos = 0u;
+                    m->m_hall_direction_stable_edges = 0u;
+                } else {
+                    m->m_hall_period_hist[m->m_hall_hist_pos++ & 3u] = period_for_filter;
+                }
+                uint32_t sum = 0u;
+                for (int i = 0; i < 4; i++) sum += m->m_hall_period_hist[i];
+                m->m_hall_period = (uint16_t)(sum / 4u);
+                if (!m->m_hall_period) m->m_hall_period = 1u;
+                m->m_hall_ticks = 0u;
+                m->m_hall_direction = dir;
+                if (m->m_hall_direction_stable_edges < 0xffu) m->m_hall_direction_stable_edges++;
+                if (dir > 0 && m->m_position_counts < INT32_MAX) m->m_position_counts++;
+                else if (dir < 0 && m->m_position_counts > INT32_MIN) m->m_position_counts--;
+                m->m_hall_pos = hall_midpoint200(previous_center, ad);
+                m->m_hall_pos_prev = angle;
             } else {
                 if (m->m_hall_reject_counted_state != h) {
                     m->m_hall_invalid_transition_count++;
@@ -1079,7 +1131,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     m->m_iq_q4=filt.q; m->m_id_q4=filt.d; m->m_current_in_counts=idc_counts;
 
     foc_dq_t v={m->m_vd,m->m_vq};
-    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_override_active(second);
+    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
     if (!source_enabled || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
         m->m_state=MC_STATE_OFF; reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; reset_position_pid(m);
         m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
@@ -1189,18 +1241,34 @@ control_done:
 }
 
 void mcpwm_foc_adc_int_handler(void) {
-    /* Source arbitration: direct VESC packets own each motor independently for
-     * MCCONF_VESC_TIMEOUT_MS. While owned, the legacy dual command stream must
-     * not overwrite the VESC setpoint on the next 16 kHz ISR. */
-    if (s_vesc_override_ticks[0] != 0u) {
-        if (--s_vesc_override_ticks[0] == 0u) mcpwm_foc_release_motor(false);
-    } else {
-        mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwml,motorRunReq!=0u,svpwmOpenloopRpm,false);
-    }
-    if (s_vesc_override_ticks[1] != 0u) {
-        if (--s_vesc_override_ticks[1] == 0u) mcpwm_foc_release_motor(true);
-    } else {
-        mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwmr,motorRunReq!=0u,svpwmOpenloopRpm,true);
+    motor_fault_recovery_tick(&m_motor_1);
+    motor_fault_recovery_tick(&m_motor_2);
+    /* Source arbitration follows VESC timeout semantics. A SET_* packet claims
+     * the motor; COMM_ALIVE only refreshes that command timeout. Expiry stops or
+     * brakes the motor but deliberately keeps VESC ownership, preventing stale
+     * legacy pwml/pwmr data from taking over immediately after a timeout. */
+    for (uint8_t vi=0u; vi<2u; ++vi) {
+        if (s_vesc_owned[vi]) {
+            uint32_t t=s_vesc_timeout_ticks[vi];
+            if (t != 0u && t != UINT32_MAX) {
+                t--; s_vesc_timeout_ticks[vi]=t;
+                if (t == 0u) {
+                    const bool second=(vi!=0u);
+                    const float brake=s_vesc_timeout_brake_a[vi];
+                    if (brake > 0.001f) {
+                        mcpwm_foc_set_brake_current(brake,second);
+                        s_vesc_timeout_braking[vi]=1u;
+                    } else {
+                        mcpwm_foc_release_motor(second);
+                        s_vesc_timeout_braking[vi]=0u;
+                    }
+                }
+            }
+        } else if (vi==0u) {
+            mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwml,motorRunReq!=0u,svpwmOpenloopRpm,false);
+        } else {
+            mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwmr,motorRunReq!=0u,svpwmOpenloopRpm,true);
+        }
     }
     const bool control_update=(s_foc_control_div==0u);
     if(++s_foc_control_div>=MCCONF_FOC_CONTROL_DIV)s_foc_control_div=0u;
@@ -1212,13 +1280,40 @@ void mcpwm_foc_adc_int_handler(void) {
     RIGHT_TIM->RIGHT_TIM_U=m_motor_2.m_ccr_a;RIGHT_TIM->RIGHT_TIM_V=m_motor_2.m_ccr_b;RIGHT_TIM->RIGHT_TIM_W=m_motor_2.m_ccr_c;
 }
 
-void mcpwm_foc_vesc_override_touch(bool second) {
-    const uint32_t ticks = ((uint32_t)PWM_FREQ * MCCONF_VESC_TIMEOUT_MS) / 1000u;
-    s_vesc_override_ticks[second ? 1u : 0u] = (uint16_t)(ticks > 0xffffu ? 0xffffu : ticks);
+void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float brake_current) {
+    const uint8_t i=second?1u:0u;
+    if (brake_current < 0.0f) brake_current=-brake_current;
+    if (brake_current > (float)I_MOT_MAX) brake_current=(float)I_MOT_MAX;
+    s_vesc_timeout_ms[i]=timeout_ms;
+    s_vesc_timeout_brake_a[i]=brake_current;
+    if (s_vesc_owned[i]) mcpwm_foc_vesc_override_touch(second);
 }
-bool mcpwm_foc_vesc_override_active(bool second) { return s_vesc_override_ticks[second ? 1u : 0u] != 0u; }
-bool mcpwm_foc_vesc_override_active_any(void) { return (s_vesc_override_ticks[0] != 0u) || (s_vesc_override_ticks[1] != 0u); }
-void mcpwm_foc_vesc_override_clear(bool second) { s_vesc_override_ticks[second ? 1u : 0u] = 0u; }
+
+void mcpwm_foc_vesc_override_touch(bool second) {
+    const uint8_t i=second?1u:0u;
+    const uint32_t ms=s_vesc_timeout_ms[i];
+    s_vesc_owned[i]=1u;
+    s_vesc_timeout_braking[i]=0u;
+    if (ms == 0u) {
+        /* VESC App Config timeout_msec=0 explicitly disables the timeout. */
+        s_vesc_timeout_ticks[i]=UINT32_MAX;
+    } else {
+        uint64_t ticks=((uint64_t)PWM_FREQ*(uint64_t)ms+999u)/1000u;
+        if (ticks == 0u) ticks=1u;
+        if (ticks >= (uint64_t)UINT32_MAX) ticks=(uint64_t)UINT32_MAX-1u;
+        s_vesc_timeout_ticks[i]=(uint32_t)ticks;
+    }
+}
+bool mcpwm_foc_vesc_override_active(bool second) { return s_vesc_owned[second?1u:0u] != 0u; }
+bool mcpwm_foc_vesc_override_active_any(void) { return (s_vesc_owned[0] != 0u) || (s_vesc_owned[1] != 0u); }
+bool mcpwm_foc_vesc_command_live(bool second) {
+    const uint8_t i=second?1u:0u;
+    return s_vesc_owned[i] && (s_vesc_timeout_ticks[i] != 0u || s_vesc_timeout_braking[i]);
+}
+void mcpwm_foc_vesc_override_clear(bool second) {
+    const uint8_t i=second?1u:0u;
+    s_vesc_owned[i]=0u; s_vesc_timeout_braking[i]=0u; s_vesc_timeout_ticks[i]=0u;
+}
 
 /* ========================================================================== */
 /* Original EFeru ADC DMA ISR timing/calibration path                          */
@@ -1275,8 +1370,18 @@ void DMA1_Channel1_IRQHandler(void) {
     const uint8_t rightPhaseTrip=rightBridgeWasOn&&(ABS(curR_phaB)>rightPhaseLimit||ABS(curR_phaC)>rightPhaseLimit||ABS(curR_phaA)>rightPhaseLimit);
     const int32_t leftDcLimit=leftOpenloop?((int32_t)SVPWM_DC_LIMIT_A*A2BIT_CONV):curDC_max;
     const int32_t rightDcLimit=rightOpenloop?((int32_t)SVPWM_DC_LIMIT_A*A2BIT_CONV):curDC_max;
-    if(ABS(curL_DC)>leftDcLimit||leftPhaseTrip||leftDriveRequest==0u){LEFT_TIM->BDTR&=~TIM_BDTR_MOE;if(leftPhaseTrip)m_motor_1.m_current_trip_count++;}else LEFT_TIM->BDTR|=TIM_BDTR_MOE;
-    if(ABS(curR_DC)>rightDcLimit||rightPhaseTrip||rightDriveRequest==0u){RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;if(rightPhaseTrip)m_motor_2.m_current_trip_count++;}else RIGHT_TIM->BDTR|=TIM_BDTR_MOE;
+    const uint8_t leftDcTrip = leftBridgeWasOn && (ABS(curL_DC) > leftDcLimit);
+    const uint8_t rightDcTrip = rightBridgeWasOn && (ABS(curR_DC) > rightDcLimit);
+    const uint8_t leftCurrentTrip = leftPhaseTrip || leftDcTrip;
+    const uint8_t rightCurrentTrip = rightPhaseTrip || rightDcTrip;
+    if(leftCurrentTrip || leftDriveRequest==0u || m_motor_1.m_fault!=FAULT_CODE_NONE){
+        LEFT_TIM->BDTR&=~TIM_BDTR_MOE;
+        if(leftCurrentTrip){m_motor_1.m_current_trip_count++;motor_fault_set(&m_motor_1,FAULT_CODE_ABS_OVER_CURRENT);}
+    }else LEFT_TIM->BDTR|=TIM_BDTR_MOE;
+    if(rightCurrentTrip || rightDriveRequest==0u || m_motor_2.m_fault!=FAULT_CODE_NONE){
+        RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
+        if(rightCurrentTrip){m_motor_2.m_current_trip_count++;motor_fault_set(&m_motor_2,FAULT_CODE_ABS_OVER_CURRENT);}
+    }else RIGHT_TIM->BDTR|=TIM_BDTR_MOE;
 
     buzzerTimer++;
     if (buzzerFreq != 0 && (buzzerTimer / 5000) % (buzzerPattern + 1) == 0) {
@@ -1406,6 +1511,13 @@ static float motor_current_vesc_a(const mcpwm_foc_motor_t *m){
 float mcpwm_foc_get_tot_current_motor(bool s){return motor_current_vesc_a(mcpwm_foc_get_motor_const(s));}
 float mcpwm_foc_get_tot_current_in_motor(bool s){return -(float)mcpwm_foc_get_motor_const(s)->m_current_in_counts/(float)A2BIT_CONV;}
 float mcpwm_foc_get_rpm_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_rpm;}
+float mcpwm_foc_get_motor_mechanical_rpm(bool s){
+    const float pp=(float)motor_pole_pairs(s);
+    return pp>0.0f ? mcpwm_foc_get_erpm_motor(s)/pp : 0.0f;
+}
+float mcpwm_foc_get_output_rpm(bool s){return mcpwm_foc_get_motor_mechanical_rpm(s)/motor_gear_ratio(s);}
+uint16_t mcpwm_foc_get_pole_pairs(bool s){return motor_pole_pairs(s);}
+float mcpwm_foc_get_gear_ratio(bool s){return motor_gear_ratio(s);}
 float mcpwm_foc_get_erpm_motor(bool s){
     const mcpwm_foc_motor_t*m=mcpwm_foc_get_motor_const(s);
     /* One Hall edge is 60 electrical degrees. Derive ERPM directly from edge
@@ -1422,6 +1534,31 @@ float mcpwm_foc_get_erpm_motor(bool s){
 float mcpwm_foc_get_duty_cycle_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_duty_now_permille/1000.0f;}
 float mcpwm_foc_get_id_motor(bool s){return q4_to_amp(mcpwm_foc_get_motor_const(s)->m_id_q4);}float mcpwm_foc_get_iq_motor(bool s){return q4_to_amp(mcpwm_foc_get_motor_const(s)->m_iq_q4);}
 static float bus_voltage_now(void){return (float)(batVoltage*BAT_CALIB_REAL_VOLTAGE/BAT_CALIB_ADC)/100.0f;}
+
+void mcpwm_foc_energy_update(uint32_t now_ms) {
+    if (s_energy_last_ms == 0u) { s_energy_last_ms = now_ms; return; }
+    uint32_t dt_ms = (uint32_t)(now_ms - s_energy_last_ms);
+    if (dt_ms == 0u) return;
+    s_energy_last_ms = now_ms;
+    /* Do not integrate a long debugger/power-stall gap as real energy. */
+    if (dt_ms > 100u) dt_ms = 100u;
+    const float dt_s = (float)dt_ms * 0.001f;
+    const float vin = bus_voltage_now();
+    mcpwm_foc_motor_t *motors[2] = {&m_motor_1, &m_motor_2};
+    for (uint8_t k = 0u; k < 2u; ++k) {
+        mcpwm_foc_motor_t *m = motors[k];
+        const float current_in = -(float)m->m_current_in_counts / (float)A2BIT_CONV;
+        const float amp_s = current_in * dt_s;
+        const float watt_s = current_in * vin * dt_s;
+        if (current_in >= 0.0f) {
+            m->m_amp_seconds += amp_s;
+            m->m_watt_seconds += watt_s;
+        } else {
+            m->m_amp_seconds_charged -= amp_s;
+            m->m_watt_seconds_charged -= watt_s;
+        }
+    }
+}
 float mcpwm_foc_get_vd_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vd*(bus_voltage_now()/(float)MCCONF_FOC_VOLTAGE_MAX);}
 float mcpwm_foc_get_vq_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vq*(bus_voltage_now()/(float)MCCONF_FOC_VOLTAGE_MAX);}
 float mcpwm_foc_get_phase_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_phase*(360.0f/65536.0f);}
@@ -1431,17 +1568,41 @@ void mcpwm_foc_get_values(mc_values *v,bool second){
     if (!v) return;
     memset(v, 0, sizeof(*v));
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
-    v->v_in = bus_voltage_now();
-    v->id = q4_to_amp(m->m_id_q4);
-    v->iq = q4_to_amp(m->m_iq_q4);
-    v->current_motor = mcpwm_foc_get_tot_current_motor(second);
-    v->current_in = mcpwm_foc_get_tot_current_in_motor(second);
-    /* VESC mc_values.rpm is ERPM, not mechanical RPM. Tachometer remains the
-     * Hall-transition accumulator, while position follows stock FOC semantics:
-     * normalized rotor electrical angle in degrees. */
-    v->rpm=mcpwm_foc_get_erpm_motor(second);
-    v->tachometer=m->m_position_counts;
-    v->tachometer_abs=m->m_position_counts<0?-m->m_position_counts:m->m_position_counts;
-    v->position=mcpwm_foc_get_phase_motor(second);
-    v->duty_now=(float)m->m_duty_now_permille/1000.0f;v->fault_code=m->m_fault;v->vesc_id=second?2:1;v->vd=mcpwm_foc_get_vd_motor(second);v->vq=mcpwm_foc_get_vq_motor(second);
+    /* Snapshot every ISR-owned field in one very short critical section. Do
+     * all floating-point conversion afterwards, so one VESC telemetry packet
+     * can never mix Id/Iq/RPM/phase values from different 16-kHz frames. */
+    int16_t id_q4,iq_q4,ibus_counts,rpm_i,duty_i,vd_i,vq_i;
+    int32_t pos_i;
+    uint16_t phase_i,hall_period_i,hall_ticks_i;
+    uint8_t hall_init_i;
+    int8_t hall_dir_i;
+    mc_fault_code fault_i;
+    __disable_irq();
+    id_q4=m->m_id_q4; iq_q4=m->m_iq_q4; ibus_counts=m->m_current_in_counts;
+    rpm_i=m->m_rpm; duty_i=m->m_duty_now_permille; vd_i=m->m_vd; vq_i=m->m_vq;
+    pos_i=m->m_position_counts; phase_i=m->m_phase; fault_i=m->m_fault;
+    hall_init_i=m->m_hall_initialized; hall_dir_i=m->m_hall_direction;
+    hall_period_i=m->m_hall_period; hall_ticks_i=m->m_hall_ticks;
+    __enable_irq();
+
+    const float vin=bus_voltage_now();
+    v->v_in=vin;
+    v->amp_hours=m->m_amp_seconds/3600.0f;
+    v->amp_hours_charged=m->m_amp_seconds_charged/3600.0f;
+    v->watt_hours=m->m_watt_seconds/3600.0f;
+    v->watt_hours_charged=m->m_watt_seconds_charged/3600.0f;
+    v->id=q4_to_amp(id_q4); v->iq=q4_to_amp(iq_q4);
+    { uint32_t mag2=(uint32_t)((int32_t)id_q4*id_q4)+(uint32_t)((int32_t)iq_q4*iq_q4);
+      int32_t mag=(int32_t)foc_isqrt_u32(mag2); if(ibus_counts>0)mag=-mag;
+      v->current_motor=(float)mag/(float)FOC_CURRENT_Q4_PER_A; }
+    v->current_in=-(float)ibus_counts/(float)A2BIT_CONV;
+    if(hall_init_i && hall_dir_i!=0 && hall_period_i>0u && hall_period_i<MCCONF_HALL_TIMEOUT_TICKS && hall_ticks_i<=MCCONF_HALL_TIMEOUT_TICKS)
+        v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)*(float)hall_dir_i;
+    else v->rpm=(float)rpm_i*(float)motor_pole_pairs(second);
+    v->tachometer=pos_i;
+    v->tachometer_abs=(pos_i==INT32_MIN)?INT32_MAX:(pos_i<0?-pos_i:pos_i);
+    v->position=(float)phase_i*(360.0f/65536.0f);
+    v->duty_now=(float)duty_i/1000.0f; v->fault_code=fault_i; v->vesc_id=second?2:1;
+    v->vd=(float)vd_i*(vin/(float)MCCONF_FOC_VOLTAGE_MAX);
+    v->vq=(float)vq_i*(vin/(float)MCCONF_FOC_VOLTAGE_MAX);
 }

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Hardware RT-data audit matching VESC Tool COMM_GET_VALUES parser semantics."""
+import argparse, math, statistics, struct, sys, time
+from dataclasses import dataclass
+import serial
+from vesc_dual import frame, PacketDecoder, parse_fw, parse_diag, HB_MAGIC, HB_VERSION, HB_GET_DIAG
+
+COMM_FW_VERSION=0
+COMM_GET_VALUES=4
+COMM_FORWARD_CAN=34
+COMM_CUSTOM_APP_DATA=36
+COMM_GET_VALUES_SELECTIVE=50
+RIGHT_ID=2
+ALL_VALUE_MASK=(1<<22)-1
+
+@dataclass
+class RtValues:
+    temp_mos:float=0.0; temp_motor:float=0.0
+    current_motor:float=0.0; current_in:float=0.0
+    id:float=0.0; iq:float=0.0; duty:float=0.0; rpm:float=0.0; vin:float=0.0
+    ah_used:float=0.0; ah_charged:float=0.0; wh_used:float=0.0; wh_charged:float=0.0
+    tachometer:int=0; tachometer_abs:int=0; fault:int=0; position:float=0.0; vesc_id:int=255
+    temp_mos_1:float=0.0; temp_mos_2:float=0.0; temp_mos_3:float=0.0; vd:float=0.0; vq:float=0.0
+    has_timeout:bool=False; kill_sw_active:bool=False
+
+def parse_values(payload:bytes, selective=True)->RtValues:
+    expected=COMM_GET_VALUES_SELECTIVE if selective else COMM_GET_VALUES
+    if not payload or payload[0]!=expected: raise ValueError(f'wrong reply id {payload[:1].hex()}')
+    i=1; mask=0xffffffff
+    if selective:
+        if len(payload)<5: raise ValueError('short selective reply')
+        mask=struct.unpack_from('>I',payload,i)[0]; i+=4
+        if mask!=ALL_VALUE_MASK: raise ValueError(f'mask 0x{mask:08x}')
+    v=RtValues()
+    def i16(scale):
+        nonlocal i
+        x=struct.unpack_from('>h',payload,i)[0]/scale; i+=2; return x
+    def i32(scale):
+        nonlocal i
+        x=struct.unpack_from('>i',payload,i)[0]/scale; i+=4; return x
+    for b in range(22):
+        if not(mask&(1<<b)): continue
+        if b==0:v.temp_mos=i16(10)
+        elif b==1:v.temp_motor=i16(10)
+        elif b==2:v.current_motor=i32(100)
+        elif b==3:v.current_in=i32(100)
+        elif b==4:v.id=i32(100)
+        elif b==5:v.iq=i32(100)
+        elif b==6:v.duty=i16(1000)
+        elif b==7:v.rpm=i32(1)
+        elif b==8:v.vin=i16(10)
+        elif b==9:v.ah_used=i32(10000)
+        elif b==10:v.ah_charged=i32(10000)
+        elif b==11:v.wh_used=i32(10000)
+        elif b==12:v.wh_charged=i32(10000)
+        elif b==13:v.tachometer=int(i32(1))
+        elif b==14:v.tachometer_abs=int(i32(1))
+        elif b==15:v.fault=payload[i]; i+=1
+        elif b==16:v.position=i32(1000000)
+        elif b==17:v.vesc_id=payload[i]; i+=1
+        elif b==18:v.temp_mos_1=i16(10); v.temp_mos_2=i16(10); v.temp_mos_3=i16(10)
+        elif b==19:v.vd=i32(1000)
+        elif b==20:v.vq=i32(1000)
+        elif b==21:
+            st=payload[i]; i+=1; v.has_timeout=bool(st&1); v.kill_sw_active=bool(st&2)
+    if i!=len(payload): raise ValueError(f'VESC parser consumed {i}, packet has {len(payload)} bytes')
+    return v
+
+class Link:
+    def __init__(self,port,baud=115200,timeout=.06):
+        self.ser=serial.Serial(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
+        self.ser.reset_input_buffer()
+    def close(self): self.ser.close()
+    @staticmethod
+    def fwd(p): return bytes((COMM_FORWARD_CAN,RIGHT_ID))+p
+    def send(self,p,right=False): self.ser.write(frame(self.fwd(p) if right else p))
+    def recv(self,cmd,deadline):
+        while time.monotonic()<deadline:
+            d=self.ser.read(self.ser.in_waiting or 1)
+            for p in self.dec.feed(d):
+                if p and p[0]==cmd:return p
+        raise TimeoutError(f'no COMM {cmd}')
+    def request(self,p,cmd,right=False):
+        self.send(p,right); return self.recv(cmd,time.monotonic()+self.timeout)
+    def fw(self,right=False): return parse_fw(self.request(bytes((COMM_FW_VERSION,)),COMM_FW_VERSION,right))
+    def values(self,right=False):
+        # VESC Tool realtime page uses Commands::getValues(): COMM_GET_VALUES.
+        # Keep selective parsing support above for protocol regression only.
+        p=bytes((COMM_GET_VALUES,))
+        return parse_values(self.request(p,COMM_GET_VALUES,right),False)
+    def diag(self,right=False):
+        p=bytes((COMM_CUSTOM_APP_DATA,))+HB_MAGIC+bytes((HB_VERSION,HB_GET_DIAG))
+        return parse_diag(self.request(p,COMM_CUSTOM_APP_DATA,right))
+
+def validate(v:RtValues,vid:int):
+    nums=(v.temp_mos,v.temp_motor,v.current_motor,v.current_in,v.id,v.iq,v.duty,v.rpm,v.vin,
+          v.ah_used,v.ah_charged,v.wh_used,v.wh_charged,v.position,v.vd,v.vq)
+    if not all(math.isfinite(x) for x in nums): raise ValueError('non-finite RT field')
+    if v.vesc_id!=vid: raise ValueError(f'VESC ID {v.vesc_id}, expected {vid}')
+    if not -40.0<=v.temp_mos<=150.0: raise ValueError(f'temp_mos implausible {v.temp_mos}')
+    if not 5.0<=v.vin<=60.0: raise ValueError(f'Vin implausible {v.vin}')
+    if not -1.05<=v.duty<=1.05: raise ValueError(f'duty {v.duty}')
+
+def poll_one(link,right,count,hz):
+    period=1.0/hz; lat=[]; last=None; fail=[]
+    d0=link.diag(right)
+    started=time.monotonic(); next_t=started
+    for n in range(count):
+        next_t+=period; t0=time.monotonic()
+        try:
+            last=link.values(right); validate(last,RIGHT_ID if right else 1); lat.append((time.monotonic()-t0)*1000)
+        except Exception as e: fail.append(str(e))
+        delay=next_t-time.monotonic()
+        if delay>0: time.sleep(delay)
+    finished=time.monotonic(); d1=link.diag(right); elapsed=finished-started
+    return last,lat,fail,d0,d1,elapsed
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
+    a=ap.parse_args(); count=max(1,round(a.hz*a.seconds)); link=Link(a.port)
+    try:
+        print('FW:',link.fw(False),'|',link.fw(True))
+        for right in (False,True):
+            name='RIGHT-ID2' if right else 'LEFT-ID1'; last,lat,fail,d0,d1,elapsed=poll_one(link,right,count,a.hz)
+            rate=(len(lat)/elapsed); p99=sorted(lat)[max(0,int(len(lat)*.99)-1)] if lat else 0
+            print(f'{name}: {len(lat)}/{count} PASS, {rate:.2f}Hz, avg={statistics.mean(lat):.2f}ms p99={p99:.2f}ms, qdrop {d0.rx_queue_drops}->{d1.rx_queue_drops}, crc {d0.rx_crc_errors}->{d1.rx_crc_errors}')
+            if last: print(f'  Imotor={last.current_motor:.2f}A Ibatt={last.current_in:.2f}A Id={last.id:.2f}A Iq={last.iq:.2f}A Vd={last.vd:.2f}V Vq={last.vq:.2f}V ERPM={last.rpm:.0f} duty={100*last.duty:.2f}% Vin={last.vin:.1f}V T={last.temp_mos:.1f}C rotor={last.position:.2f}deg hall={d1.hall} fault={last.fault} Ah={last.ah_used:.4f}/{last.ah_charged:.4f} Wh={last.wh_used:.4f}/{last.wh_charged:.4f}')
+            if fail: print('  errors:',fail[:3])
+            if rate < a.hz * 0.98:
+                print(f'  ERROR actual polling rate too low: {rate:.2f}Hz < {a.hz*0.98:.2f}Hz')
+                return 1
+            if fail or d1.rx_queue_drops!=d0.rx_queue_drops or d1.rx_crc_errors!=d0.rx_crc_errors: return 1
+        print('VESC_TOOL_RT50_PASS')
+        return 0
+    finally: link.close()
+if __name__=='__main__': sys.exit(main())

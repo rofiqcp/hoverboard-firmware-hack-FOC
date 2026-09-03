@@ -27,7 +27,7 @@ uint8_t timeoutFlgSerial = 1;
 uint8_t ctrlModReqRaw = CTRL_MOD_REQ;
 uint8_t ctrlModReq = OPEN_MODE;
 
-uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047};
+uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048};
 
 static int16_t inputMax = 1000;
 static int16_t inputMin = -1000;
@@ -217,7 +217,10 @@ void readCommand(void) {
 
 void poweroff(void) {
   enable = 0;
-  printf("-- Motors disabled --\r\n");
+  LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
+  RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+#if POWER_OFF_ENABLE
+  printf("-- Motors disabled / power latch off --\r\n");
   buzzerCount = 0;
   buzzerPattern = 0;
   for (uint8_t i = 0; i < 8; ++i) {
@@ -227,9 +230,16 @@ void poweroff(void) {
   buzzerFreq = 0;
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_RESET);
   while (1) { }
+#else
+  /* Development mode: never drop PA5 OFF latch, so USART3/VESC Tool stays alive. */
+  HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
+#endif
 }
 
 void poweroffPressCheck(void) {
+#if POWER_BUTTON_BYPASS || !POWER_OFF_ENABLE
+  return;
+#else
   if (!HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) return;
   uint16_t pressedMs = 0;
   enable = 0;
@@ -238,6 +248,7 @@ void poweroffPressCheck(void) {
     if (pressedMs < 60000) pressedMs += 10;
   }
   if (pressedMs >= 80) poweroff();
+#endif
 }
 
 void filtLowPass32(int32_t u, uint16_t coef, int32_t *y) {

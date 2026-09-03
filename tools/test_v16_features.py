@@ -22,7 +22,7 @@ assert 'edge_phase = hall_angle200_to_phase(m->m_hall_pos)' in mc
 assert 'm_phase_hall_target' in mch and 'phase_diff_u16' in mc
 assert 'rate-limits corrected Hall phase' in mc
 assert 'm_hall_reject_counted_state' in mch and 'm->m_hall_reject_counted_state != h' in mc
-assert 'one chatter/outlier edge into' in mc
+assert 'period_for_filter' in mc and 'floor_period' in mc and 'm->m_hall_period_reject_count++' in mc, 'Hall timing outlier slew-limit path missing'
 assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
 speed_block=mc[mc.index('if (m->m_control_mode==CONTROL_MODE_SPEED) {'):mc.index('} else {', mc.index('if (m->m_control_mode==CONTROL_MODE_SPEED) {'))]
 assert 'iq_setpoint_slew_step(m);' not in speed_block and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in speed_block
@@ -71,5 +71,11 @@ assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not 
 assert 'hall_table_runtime_sane' in mc and 'Preserve the last known-good table' in mc, 'runtime Hall-table validation missing'
 assert 'motor_pole_pairs(second)*4294967296ULL' in mc, 'right openloop must use per-motor pole pairs'
 assert 'hall-phase' in (R/'tools/vesc_debug.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_debug.py').read_text(), 'active Hall phase-check utility missing'
+
+
+# Standard VESC handbrake command must not be silently ignored.
+assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_brake_current(current)' in vp
+dual=(R/'tools/vesc_dual.py').read_text()
+assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
 print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo4=1 vesc_request_reply=1 brake_latch=1 position_cap=1')

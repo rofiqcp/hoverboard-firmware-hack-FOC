@@ -82,9 +82,12 @@ enum {
     EE_R_KPS, EE_R_KIS, EE_R_KDS, EE_R_KPP, EE_R_KIP, EE_R_KDP,
     EE_L_SPEED_RAMP10 = 39, EE_R_SPEED_RAMP10,
     EE_L_SPEED_REL = 41, EE_R_SPEED_REL,
-    EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44
+    EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44,
+    EE_L_MOTOR_POLES = 45, EE_R_MOTOR_POLES = 46,
+    EE_L_GEAR_X64 = 47, EE_R_GEAR_X64 = 48
 };
-#define EE_CFG_SIGNATURE_VALUE 0x6011u
+#define EE_CFG_SIGNATURE_VALUE 0x6012u
+#define EE_CFG_SIGNATURE_V19   0x6011u
 #define EE_CFG_SIGNATURE_V18   0x6010u
 #define EE_CFG_SIGNATURE_V17   0x600Fu
 #define EE_CFG_SIGNATURE_V16   0x600Eu
@@ -127,7 +130,9 @@ bool mc_interface_store_configuration_motor(bool second) {
     const uint8_t ramp_slot = second ? EE_R_SPEED_RAMP10 : EE_L_SPEED_RAMP10;
     const uint8_t rel_slot = second ? EE_R_SPEED_REL : EE_L_SPEED_REL;
     const uint8_t cur_slot = second ? EE_R_CUR_CA : EE_L_CUR_CA;
-    const uint16_t pp = second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT;
+    const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
+    const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
+    const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
     int32_t ca = (int32_t)(m->m_conf.l_current_max * 100.0f + 0.5f);
     if (ca < 1) ca = 1;
     if (ca > I_MOT_MAX * 100) ca = I_MOT_MAX * 100;
@@ -147,6 +152,15 @@ bool mc_interface_store_configuration_motor(bool second) {
     for (uint8_t i = 0u; i < 10u; ++i) ok &= ee_write_slot((uint8_t)(gain_base + i), gains[i]);
     ok &= ee_write_slot(ramp_slot, ramp10);
     ok &= ee_write_slot(rel_slot, rel_erpm);
+    ok &= ee_write_slot(pole_slot, m->m_conf.si_motor_poles);
+    {
+        float gr = m->m_conf.si_gear_ratio;
+        if (!(gr >= 0.01f && gr <= 1000.0f)) gr = 1.0f;
+        uint32_t gx64 = (uint32_t)(gr * 64.0f + 0.5f);
+        if (gx64 < 1u) gx64 = 1u;
+        if (gx64 > 65535u) gx64 = 65535u;
+        ok &= ee_write_slot(gear_slot, (uint16_t)gx64);
+    }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
     ok &= ee_write_slot(second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE, EE_CFG_SIGNATURE_VALUE);
@@ -160,19 +174,20 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||
         !ee_read_slot(sig_slot, &sig) ||
-        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V18 &&
-         sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
+        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V19 &&
+         sig != EE_CFG_SIGNATURE_V18 && sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
         return false;
     }
     const bool migrate_speed_pid = (sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
-    const bool migrate_position_pid = (sig != EE_CFG_SIGNATURE_VALUE);
+    const bool migrate_position_pid = (sig == EE_CFG_SIGNATURE_V18 || sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
     const uint8_t ramp_slot = second ? EE_R_SPEED_RAMP10 : EE_L_SPEED_RAMP10;
     const uint8_t rel_slot = second ? EE_R_SPEED_REL : EE_L_SPEED_REL;
     const uint8_t cur_slot = second ? EE_R_CUR_CA : EE_L_CUR_CA;
-    const uint16_t pp = second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT;
+    const uint8_t pole_slot = second ? EE_R_MOTOR_POLES : EE_L_MOTOR_POLES;
+    const uint8_t gear_slot = second ? EE_R_GEAR_X64 : EE_L_GEAR_X64;
     uint16_t v = 0u;
     uint8_t hall[8];
     for (uint8_t i = 0u; i < 8u; ++i) {
@@ -181,6 +196,12 @@ bool mc_interface_load_configuration_motor(bool second) {
     }
     if (!hall_table_sane(hall)) return false;
     for (uint8_t i = 0u; i < 8u; ++i) m->m_conf.foc_hall_table[i] = hall[i];
+
+    if (sig == EE_CFG_SIGNATURE_VALUE) {
+        if (ee_read_slot(pole_slot, &v) && v >= 2u && v <= 254u && (v & 1u) == 0u) m->m_conf.si_motor_poles = (uint8_t)v;
+        if (ee_read_slot(gear_slot, &v) && v > 0u) m->m_conf.si_gear_ratio = (float)v / 64.0f;
+    }
+    const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
 
     if (ee_read_slot(cur_slot, &v) && v >= 10u && v <= I_MOT_MAX * 100u) {
         m->m_conf.l_current_max = (float)v / 100.0f;

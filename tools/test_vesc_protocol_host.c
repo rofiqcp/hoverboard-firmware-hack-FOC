@@ -12,8 +12,10 @@
 #include "vesc/mcconf_serial.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "defines.h"
 
 UART_HandleTypeDef huart3 = {0};
+volatile adc_buf_t adc_buffer = {0};
 int16_t board_temp_deg_c = 31;
 static uint32_t tick_ms = 1000u;
 static uint8_t tx_capture[1024];
@@ -35,6 +37,11 @@ static int32_t pos_max_user[2] = {INT32_MAX,INT32_MAX};
 uint32_t HAL_GetTick(void) { return tick_ms; }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *d, uint16_t n, uint32_t t) {
     (void)h; (void)t;
+    if (n > sizeof(tx_capture)) return 1;
+    memcpy(tx_capture,d,n); tx_capture_len=n; return HAL_OK;
+}
+int HAL_UART_Transmit_DMA(UART_HandleTypeDef *h, uint8_t *d, uint16_t n) {
+    (void)h;
     if (n > sizeof(tx_capture)) return 1;
     memcpy(tx_capture,d,n); tx_capture_len=n; return HAL_OK;
 }
@@ -62,10 +69,19 @@ void mcpwm_foc_get_default_configuration(mc_configuration *c, bool second) {
     { const uint8_t t[8]={255u,83u,17u,50u,150u,117u,183u,255u}; for(int i=0;i<8;i++) c->foc_hall_table[i]=(int8_t)t[i]; }
 }
 void mc_interface_set_duty(float d) { set_duty[selected_motor==2?1:0]=d; }
+mc_fault_code mc_interface_get_fault_motor(bool second) { (void)second; return FAULT_CODE_NONE; }
+void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float brake_current) {
+    (void)second; (void)timeout_ms; (void)brake_current;
+}
 void mcpwm_foc_vesc_override_touch(bool second) { touch_count[second?1:0]++; }
 bool mcpwm_foc_vesc_override_active(bool second) { return touch_count[second?1:0] != 0u; }
 const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool second) { return &diag_motors[second?1:0]; }
 float mcpwm_foc_get_erpm_motor(bool second) { return second ? -50.0f : 50.0f; }
+void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
+uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}
+float mcpwm_foc_get_gear_ratio(bool second){float g=confs[second?1:0].si_gear_ratio;return g>0.0f?g:1.0f;}
+float mcpwm_foc_get_motor_mechanical_rpm(bool second){return mcpwm_foc_get_erpm_motor(second)/(float)mcpwm_foc_get_pole_pairs(second);}
+float mcpwm_foc_get_output_rpm(bool second){return mcpwm_foc_get_motor_mechanical_rpm(second)/mcpwm_foc_get_gear_ratio(second);}
 void mcpwm_foc_set_position_user_counts(int32_t v, bool second) {
     const int j=second?1:0;
     if(v<pos_min_user[j])v=pos_min_user[j];
@@ -224,13 +240,14 @@ int main(void){
     {int32_t mi=1; if(buffer_get_uint32(r,&mi)!=MCCONF_SIGNATURE) return fail("mcconf default signature");}
     {
         uint8_t sm[700]; mc_configuration c=confs[0];
-        c.l_current_max=9.0f; c.l_current_min=-9.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=30u;
+        c.l_current_max=9.0f; c.l_current_min=-9.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=20u; c.si_gear_ratio=5.5f;
         const uint8_t ht[8]={255u,80u,14u,47u,147u,114u,180u,255u};
         for(int q=0;q<8;q++) c.foc_hall_table[q]=(int8_t)ht[q];
         sm[0]=COMM_SET_MCCONF; const int32_t sn=confgenerator_serialize_mcconf(sm+1,&c);
         const unsigned before=store_count[0];
         if(sn<=0 || !transact(sm,(uint16_t)(sn+1),r,&rn)||rn!=1u||r[0]!=COMM_SET_MCCONF) return fail("set mcconf ack");
         if(store_count[0]!=before+1u || !nearf32(confs[0].l_current_max,9.0f,0.01f)) return fail("set mcconf apply/store");
+        if(confs[0].si_motor_poles!=20u || !nearf32(confs[0].si_gear_ratio,5.5f,0.01f)) return fail("set mcconf runtime poles/gear");
         for(int q=0;q<8;q++) if((uint8_t)confs[0].foc_hall_table[q]!=ht[q]) return fail("set mcconf hall table");
 
         /* Standard VESC reset-default workflow is GET_MCCONF_DEFAULT followed
@@ -246,13 +263,14 @@ int main(void){
     }
     {
         uint8_t sm[702]; mc_configuration c=confs[1];
-        c.l_current_max=8.0f; c.l_current_min=-8.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=30u;
+        c.l_current_max=8.0f; c.l_current_min=-8.0f; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL; c.si_motor_poles=14u; c.si_gear_ratio=2.0f;
         const uint8_t ht[8]={255u,82u,16u,49u,149u,116u,182u,255u};
         for(int q=0;q<8;q++) c.foc_hall_table[q]=(int8_t)ht[q];
         sm[0]=COMM_FORWARD_CAN; sm[1]=2u; sm[2]=COMM_SET_MCCONF;
         const int32_t sn=confgenerator_serialize_mcconf(sm+3,&c); const unsigned before=store_count[1];
         if(sn<=0 || !transact(sm,(uint16_t)(sn+3),r,&rn)||rn!=1u||r[0]!=COMM_SET_MCCONF) return fail("set right mcconf ack");
         if(store_count[1]!=before+1u || !nearf32(confs[1].l_current_max,8.0f,0.01f)) return fail("set right mcconf apply/store");
+        if(confs[1].si_motor_poles!=14u || !nearf32(confs[1].si_gear_ratio,2.0f,0.01f)) return fail("set right mcconf runtime poles/gear");
         for(int q=0;q<8;q++) if((uint8_t)confs[1].foc_hall_table[q]!=ht[q]) return fail("set right mcconf hall table");
     }
     {

@@ -140,6 +140,10 @@ def print_diag(prefix: str, d: Diag) -> None:
               f"dir={d.hall_direction} interp={int(bool(d.hall_interp))} period={d.hall_period} ticks={d.hall_ticks} "
               f"reject_seq={d.hall_sequence_rejects} reject_period={d.hall_period_rejects} "
               f"last_reject={d.hall_last_reject_reason}:{d.hall_last_reject_from}->{d.hall_last_reject_to}")
+    if d.motor_poles is not None:
+        print(f"  CURRENT_OFFSETS phase0={d.current_offset_phase0} phase1={d.current_offset_phase1} dc={d.current_offset_dc} "
+              f"DRIVETRAIN poles={d.motor_poles} pp={d.pole_pairs} gear={d.gear_ratio:.3f} "
+              f"motor_rpm={d.motor_mech_rpm:.3f} output_rpm={d.output_rpm:.3f} qdrop={d.rx_queue_drops}")
 
 
 def hall_table_valid(table: list[int]) -> tuple[bool, str]:
@@ -381,8 +385,10 @@ def cmd_rpm(args, link: VescDual) -> int:
     if left and right:
         raise SystemExit("rpm test jalankan satu motor: --motor left atau right")
     motor = "right" if right else "left"
-    erpm = int(round(args.erpm if args.erpm is not None else args.mech_rpm * POLE_PAIRS))
-    print(f"RPM target = {erpm} ERPM ({erpm/POLE_PAIRS:.3f} mechanical RPM @ {POLE_PAIRS} pole-pair)")
+    dcfg = link.diag(right)
+    pp = dcfg.pole_pairs or POLE_PAIRS
+    erpm = int(round(args.erpm if args.erpm is not None else args.mech_rpm * pp))
+    print(f"RPM target = {erpm} ERPM ({erpm/pp:.3f} motor mechanical RPM @ {pp} pole-pair, gear={dcfg.gear_ratio or 1.0:.3f})")
     return run_motion_test(args, link, motor, COMM_SET_RPM, erpm, f"RPM {erpm} ERPM")
 
 
@@ -482,7 +488,8 @@ def cmd_hall_phase(args, link: VescDual) -> int:
     if args.erpm is not None:
         erpm = int(round(args.erpm))
     elif args.mech_rpm is not None:
-        erpm = int(round(args.mech_rpm * POLE_PAIRS))
+        cfg = link.diag(is_right)
+        erpm = int(round(args.mech_rpm * (cfg.pole_pairs or POLE_PAIRS)))
     else:
         erpm = 750
     if abs(erpm) < 300 or abs(erpm) > 1200:
@@ -507,6 +514,10 @@ def cmd_hall_phase(args, link: VescDual) -> int:
                 elapsed = time.monotonic() - start
                 if d.fault or d.current_trips != trip0:
                     print(f"HALL_PHASE_FAIL fault/trip fault={d.fault} trips={trip0}->{d.current_trips}")
+                    return 2
+                speed_limit=max(1500.0,abs(float(erpm))*1.8)
+                if abs(d.erpm)>speed_limit or abs(d.iq_a)>5.0:
+                    print(f"HALL_PHASE_FAIL safety erpm={d.erpm} Iq={d.iq_a:.2f}A limit={speed_limit:.0f}")
                     return 2
                 if d.phase_raw is None or d.phase_hall_raw is None or d.phase_target_raw is None:
                     print("HALL_PHASE_FAIL firmware diagnostic extension belum tersedia")
@@ -549,6 +560,35 @@ def cmd_hall_phase(args, link: VescDual) -> int:
         return 2
     print("HALL_PHASE_PASS table200->360e->FOC phase aktif konsisten")
     return 0
+
+def cmd_wiring_check(args, link: VescDual) -> int:
+    """Safe recommissioning workflow after changing phase or Hall wiring."""
+    require_arm(args)
+    rc = 0
+    print("=== WIRING CHECK: MOTOR HARUS BEBAS BERPUTAR / RODA TERANGKAT ===")
+    for motor, is_right in (("left", False), ("right", True)):
+        print(f"=== {motor.upper()} HALL DETECT 1.0 A ===")
+        class H: pass
+        h=H(); h.arm=True; h.motor=motor; h.amps=1.0
+        if cmd_hall(h, link): rc = 2; continue
+        d=link.diag(is_right)
+        ok,why=hall_table_valid(d.hall_table)
+        if not ok or not d.hall_store_ok:
+            print(f"WIRING_CHECK_FAIL {motor}: Hall table/persistence {why}"); rc=2; continue
+        for amps in (0.10, -0.10):
+            print(f"=== {motor.upper()} CURRENT {amps:+.2f} A ===")
+            class C: pass
+            c=C(); c.arm=True; c.motor=motor; c.amps=amps; c.seconds=0.8; c.hz=50.0
+            if cmd_current(c, link): rc=2; break
+        if rc: continue
+        print(f"=== {motor.upper()} HALL/FOC PHASE +750 ERPM ===")
+        class P: pass
+        p=P(); p.arm=True; p.motor=motor; p.erpm=750.0; p.mech_rpm=None; p.seconds=2.0; p.hz=40.0
+        if cmd_hall_phase(p, link): rc=2
+        release_one(link,motor)
+    print("WIRING_CHECK_RESULT:", "PASS - wiring learned and low-energy direction/current checks passed" if rc==0 else "FAIL - jangan gunakan normal drive sebelum diperbaiki")
+    return rc
+
 
 def cmd_all(args, link: VescDual) -> int:
     rc = 0
@@ -593,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="VESC 6.00 dual STM32F103 hardware/protocol debugger")
     p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
     p.add_argument("command", nargs="?", default="info",
-                   choices=("selftest","info","diag","rt","hall","hall-phase","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
+                   choices=("selftest","info","diag","rt","hall","hall-phase","wiring-check","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--motor", default="both", choices=("left","right","both"))
     p.add_argument("--hz", type=float, default=50.0)
@@ -627,6 +667,7 @@ def main() -> int:
         if args.command == "rt": return cmd_rt(args, link)
         if args.command == "hall": return cmd_hall(args, link)
         if args.command == "hall-phase": return cmd_hall_phase(args, link)
+        if args.command == "wiring-check": return cmd_wiring_check(args, link)
         if args.command == "current": return cmd_current(args, link)
         if args.command == "rpm": return cmd_rpm(args, link)
         if args.command == "pos-vesc": return cmd_pos_vesc(args, link)

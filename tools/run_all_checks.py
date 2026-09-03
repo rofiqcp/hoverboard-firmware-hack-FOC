@@ -21,7 +21,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_hall_3rev_runtime.py','tools/test_hall_3rev_runtime.c','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
+        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/test_vesc_tool_rt50.py','tools/test_hall_3rev_runtime.py','tools/test_hall_3rev_runtime.c','tools/test_motor_control_v12.py','tools/test_motor_control_v12.c','tools/test_motor_control_v13.py','tools/test_motor_control_v13.c','tools/test_v13_features.py','tools/test_v14_features.py','tools/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -62,7 +62,7 @@ def check_static():
     assert 'leftPhaseTrip=leftBridgeWasOn' in mc and 'rightPhaseTrip=rightBridgeWasOn' in mc, 'phase over-current must protect all powered modes'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
-    assert 'v->rpm=mcpwm_foc_get_erpm_motor(second)' in mc, 'VESC mc_values.rpm must be ERPM'
+    assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)' in mc and 'motor_pole_pairs(second)' in mc, 'VESC mc_values.rpm must be atomic ERPM'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'm->m_phase_openloop : m->m_phase_hall' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
@@ -81,6 +81,7 @@ def check_static():
     assert '(((i_sum >> 16) << 1) + (int32_t)p_term) >> 1' in mathc, 'PI equation no longer matches generated PI_clamp_fixdt'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
+    assert 'HAL_UART_Transmit_DMA(&huart3, tx, i)' in vp, 'VESC reply path must use USART3 TX DMA'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
     assert 'COMM_DETECT_HALL_FOC' in vp and 'mcpwm_foc_detect_hall' in vp, 'VESC Hall detect command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
@@ -90,8 +91,25 @@ def check_static():
     serc=(ROOT/'Src/vesc/mcconf_serial.c').read_text()
     assert 'appconf6_append_balance_placeholder' in serc and 'appconf6_skip_balance_placeholder' in serc, 'VESC 6.00 balance wire block adapter missing'
     assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
+    assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
+    assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
+    assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
+    appv=(ROOT/'Src/vesc/app_vesc.c').read_text()
+    assert 'adc_buffer.adc2_spare4' in appv and 'adc_buffer.adc2_spare5' in appv, 'PA2/PA3 ADC2 app mapping missing'
+    assert 'APP_ADC_UART' in appv and 'app_vesc_process' in appv, 'APP_ADC/UART runtime missing'
+    assert 'a->timeout_msec = 1000u;' in appv, 'VESC App Config default timeout must be 1000 ms'
+    assert 'mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current)' in appv, 'App Config timeout/brake must drive motor watchdog'
+    for setter in ('mc_interface_set_duty', 'mc_interface_set_current', 'mc_interface_set_brake_current', 'mc_interface_set_pid_speed'):
+        pos=vp.find(setter)
+        assert pos >= 0 and vp.rfind('touch_motor(second)', max(0,pos-100), pos) >= 0, f'VESC ownership must be claimed before {setter}'
+    assert 'alive_local' in vp and 'alive_right' in vp and 'mcpwm_foc_vesc_override_touch(alive_right)' in vp, 'COMM_ALIVE must bypass RX FIFO after CRC validation'
+    assert 's_vesc_owned[2]' in mc and 's_vesc_timeout_ticks[2]' in mc, 'VESC ownership and timeout must be separate state'
+    assert 'POWER_OFF_ENABLE          0' in cfg and 'POWER_BUTTON_BYPASS       1' in cfg, 'development power latch bypass missing'
+    assert 'm_fault_recovery_ticks' in mc and 'm_fault_stop_time_ms' in mc, 'fault recovery timer missing'
     assert 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp, 'virtual CAN routing missing'
     assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()
@@ -100,7 +118,7 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x30\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)0x31\)', eeh), 'EEPROM virtual variable count mismatch'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
     assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'
@@ -136,7 +154,7 @@ def config_size_check():
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py'])
+    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/test_vesc_dual.py','tools/test_vesc_tool_rt50.py'])
     run([sys.executable,'tools/host_compile_check.py'])
     run([sys.executable,'tools/test_foc_math.py'])
     run([sys.executable,'tools/test_motor_control_v12.py'])

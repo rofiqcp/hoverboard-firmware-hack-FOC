@@ -216,7 +216,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)0x30)       /* key + dual-motor VESC config/Hall persistence */
+#define NB_OF_VAR             ((uint8_t)0x31)       /* + runtime poles/gear persistence */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

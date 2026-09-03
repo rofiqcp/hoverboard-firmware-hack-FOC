@@ -64,6 +64,8 @@ int main(void){
     memcpy(cl.foc_hall_table,hl,8); memcpy(cr.foc_hall_table,hr,8);
     cl.l_current_max=12.34f; cl.l_current_min=-12.34f;
     cr.l_current_max=9.87f; cr.l_current_min=-9.87f;
+    cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f;
+    cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
     m_motor_1.m_kpq_q11=1111u; m_motor_1.m_kiq_q16=2222u;
@@ -86,6 +88,8 @@ int main(void){
     if(!same8(m_motor_2.m_conf.foc_hall_table,hr)) return fail("right Hall persistence");
     if(fabsf(m_motor_1.m_conf.l_current_max-12.34f)>0.011f) return fail("left current persistence");
     if(fabsf(m_motor_2.m_conf.l_current_max-9.87f)>0.011f) return fail("right current persistence");
+    if(m_motor_1.m_conf.si_motor_poles!=20u || fabsf(m_motor_1.m_conf.si_gear_ratio-5.25f)>0.02f) return fail("left poles/gear persistence");
+    if(m_motor_2.m_conf.si_motor_poles!=14u || fabsf(m_motor_2.m_conf.si_gear_ratio-1.0f)>0.02f) return fail("right poles/gear persistence");
     if(m_motor_1.m_kpq_q11!=1111u || m_motor_1.m_kiq_q16!=2222u || m_motor_1.m_kdp_q11!=111u) return fail("left gains persistence");
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
     if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
@@ -97,8 +101,9 @@ int main(void){
     if(!mc_interface_load_configuration_motor(false)) return fail("left must survive right signature corruption");
     if(mc_interface_load_configuration_motor(true)) return fail("right corrupted signature must reject");
 
-    printf("EEPROM_DUAL_PERSISTENCE_PASS leftI=%.2f rightI=%.2f leftHall=%u rightHall=%u leftRamp=%u rightRamp=%u\n",
+    printf("EEPROM_DUAL_PERSISTENCE_PASS leftI=%.2f rightI=%.2f leftHall=%u rightHall=%u leftRamp=%u rightRamp=%u poles=%u/%u gear=%.2f/%.2f\n",
            m_motor_1.m_conf.l_current_max,9.87f,m_motor_1.m_conf.foc_hall_table[1],hr[1],
-           m_motor_1.m_speed_ramp_rpm_s,234u);
+           m_motor_1.m_speed_ramp_rpm_s,234u,m_motor_1.m_conf.si_motor_poles,m_motor_2.m_conf.si_motor_poles,
+           m_motor_1.m_conf.si_gear_ratio,m_motor_2.m_conf.si_gear_ratio);
     return 0;
 }

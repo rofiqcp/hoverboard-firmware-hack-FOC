@@ -12,6 +12,9 @@
 #define MCCONF_L_IN_CURRENT_MIN             -17.0f
 #define MCCONF_L_MAX_ERPM                 15000.0f
 #define MCCONF_L_MIN_ERPM                -15000.0f
+#define MCCONF_L_MIN_DUTY                     0.0f
+#define MCCONF_L_MAX_DUTY                    0.95f
+#define MCCONF_FAULT_STOP_TIME_MS             500u
 #define MCCONF_FOC_SENSOR_MODE      FOC_SENSOR_MODE_HALL
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u
 #define MCCONF_FOC_CURRENT_KI_Q16           1229u

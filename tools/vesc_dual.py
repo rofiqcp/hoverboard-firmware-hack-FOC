@@ -27,6 +27,7 @@ COMM_SET_CURRENT = 6
 COMM_SET_CURRENT_BRAKE = 7
 COMM_SET_RPM = 8
 COMM_SET_POS = 9
+COMM_SET_HANDBRAKE = 10
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
 COMM_FORWARD_CAN = 34
@@ -187,6 +188,15 @@ class Diag:
     hall_ticks: int | None = None
     hall_period_rejects: int | None = None
     hall_sequence_rejects: int | None = None
+    current_offset_phase0: int | None = None
+    current_offset_phase1: int | None = None
+    current_offset_dc: int | None = None
+    motor_poles: int | None = None
+    pole_pairs: int | None = None
+    gear_ratio: float | None = None
+    motor_mech_rpm: float | None = None
+    output_rpm: float | None = None
+    rx_queue_drops: int | None = None
 
     def short(self) -> str:
         return (
@@ -238,6 +248,15 @@ def parse_diag(payload: bytes) -> Diag:
                    phase_hall_raw=phase_hall_raw, phase_target_raw=phase_target_raw,
                    hall_period=hall_period, hall_ticks=hall_ticks,
                    hall_period_rejects=period_rej, hall_sequence_rejects=sequence_rej)
+    if len(payload) >= 124:
+        po0, po1, dco = struct.unpack_from(">3h", payload, 104)
+        poles, pp = struct.unpack_from(">2B", payload, 110)
+        gear_milli, mech_milli, out_milli = struct.unpack_from(">3i", payload, 112)
+        ext.update(current_offset_phase0=po0, current_offset_phase1=po1, current_offset_dc=dco,
+                   motor_poles=poles, pole_pairs=pp, gear_ratio=gear_milli/1000.0,
+                   motor_mech_rpm=mech_milli/1000.0, output_rpm=out_milli/1000.0)
+    if len(payload) >= 128:
+        ext["rx_queue_drops"] = struct.unpack_from(">I", payload, 124)[0]
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),
@@ -372,6 +391,12 @@ class VescDual:
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
 
+    def handbrake(self, left_a: float, right_a: float):
+        l = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(abs(left_a) * 1000))
+        r = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(abs(right_a) * 1000))
+        with self.io_lock:
+            self.send(l); self.send(self.fwd(r))
+
     def values(self, right=False) -> Values:
         req = bytes((COMM_GET_VALUES_SELECTIVE,)) + struct.pack(">I", VALUE_MASK)
         expected_id = RIGHT_ID if right else 1
@@ -428,7 +453,15 @@ class VescDual:
         return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
 
     def diag(self, right: bool = False) -> Diag:
-        return parse_diag(self.custom_transact(HB_GET_DIAG, right=right))
+        # Diagnostic reply is now ~122 bytes. At 115200 baud it can overlap a
+        # 40-60 Hz command refresher, so allow one longer transaction/retry.
+        last = None
+        for _ in range(2):
+            try:
+                return parse_diag(self.custom_transact(HB_GET_DIAG, right=right, timeout=max(self.timeout, 0.60)))
+            except TimeoutError as exc:
+                last = exc
+        raise last
 
 
 class ReplWorker:
@@ -445,6 +478,12 @@ class ReplWorker:
         self.exit = False
         self.last_l = Values(vesc_id=1)
         self.last_r = Values(vesc_id=2)
+        try:
+            dl, dr = self.link.diag(False), self.link.diag(True)
+            self.stop_erpm_l = 5 * (dl.pole_pairs or POLE_PAIRS)
+            self.stop_erpm_r = 5 * (dr.pole_pairs or POLE_PAIRS)
+        except Exception:
+            self.stop_erpm_l = self.stop_erpm_r = STOP_ERPM
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -496,7 +535,7 @@ class ReplWorker:
                     next_tel = now + self.telemetry_period
                     self.last_l = self.link.values(False)
                     self.last_r = self.link.values(True)
-                    if stopping and mode == "rpm" and abs(self.last_l.rpm) <= STOP_ERPM and abs(self.last_r.rpm) <= STOP_ERPM:
+                    if stopping and mode == "rpm" and abs(self.last_l.rpm) <= self.stop_erpm_l and abs(self.last_r.rpm) <= self.stop_erpm_r:
                         self.link.set_rpm(0, 0)
                         with self.lock:
                             self.active = False; self.stop_flag = False

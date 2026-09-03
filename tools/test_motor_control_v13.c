@@ -276,7 +276,41 @@ int main(void){
     mcpwm_foc_get_values(&pvals,false);
     if(fabsf(pvals.current_motor+1.25f)>0.01f || fabsf(pvals.current_in+1.00f)>0.01f)return fail("VESC regenerative current signs");
 
-    printf("MOTOR_CONTROL_V13_PASS speed_ramp=%uRPM/s trq50=0.50A posCPR=90 VESCcmd40=%ld VESCpos=%.1f\n",
+    /* Standard VESC Ah/Wh telemetry must be live counters, not constant zero.
+     * Integrate exactly 100 ms at +1 A and then 100 ms at -1 A. The default
+     * test bus is 40.0 V, so expected draw/charge are 0.1 As and 4.0 Ws. */
+    mcpwm_foc_init();
+    m_motor_1.m_current_in_counts=-50;
+    mcpwm_foc_energy_update(1000u);
+    mcpwm_foc_energy_update(1100u);
+    mcpwm_foc_get_values(&pvals,false);
+    if(fabsf(pvals.amp_hours-(0.1f/3600.0f))>1e-7f)return fail("VESC Ah drawn integration");
+    if(fabsf(pvals.watt_hours-(pvals.amp_hours*pvals.v_in))>2e-6f)return fail("VESC Wh drawn integration");
+    if(pvals.amp_hours_charged!=0.0f || pvals.watt_hours_charged!=0.0f)return fail("VESC charged counters must start zero");
+    m_motor_1.m_current_in_counts=50;
+    mcpwm_foc_energy_update(1200u);
+    mcpwm_foc_get_values(&pvals,false);
+    if(fabsf(pvals.amp_hours_charged-(0.1f/3600.0f))>1e-7f)return fail("VESC Ah charged integration");
+    if(fabsf(pvals.watt_hours_charged-(pvals.amp_hours_charged*pvals.v_in))>2e-6f)return fail("VESC Wh charged integration");
+
+    /* Standard VESC drivetrain setup is runtime configuration: motor poles
+     * change electrical<->mechanical conversion; gear ratio changes output
+     * shaft speed only. COMM_SET_RPM and mc_values.rpm stay ERPM. */
+    {
+        mc_configuration dyn=m_motor_1.m_conf;
+        dyn.si_motor_poles=20u; dyn.si_gear_ratio=5.0f;
+        mcpwm_foc_set_configuration(&dyn,false);
+        mcpwm_foc_set_pid_speed(300.0f,false);
+        if(mcpwm_foc_get_pole_pairs(false)!=10u)return fail("runtime pole-pair 20 poles -> 10pp");
+        if(labs((long)m_motor_1.m_speed_target_rpm_q16-(long)(30*65536))>2)return fail("300 ERPM -> 30 motor RPM @10pp");
+        m_motor_1.m_hall_initialized=0u; m_motor_1.m_rpm=100;
+        if(fabsf(mcpwm_foc_get_motor_mechanical_rpm(false)-100.0f)>0.01f)return fail("runtime motor mechanical RPM");
+        if(fabsf(mcpwm_foc_get_output_rpm(false)-20.0f)>0.01f)return fail("gearbox output RPM");
+        dyn.si_gear_ratio=1.0f; mcpwm_foc_set_configuration(&dyn,false);
+        if(fabsf(mcpwm_foc_get_output_rpm(false)-100.0f)>0.01f)return fail("direct drive output RPM");
+    }
+
+    printf("MOTOR_CONTROL_V13_PASS speed_ramp=%uRPM/s trq50=0.50A posCPR=90 VESCcmd40=%ld VESCpos=%.1f runtime_poles_gear=1\n",
            m_motor_1.m_speed_ramp_rpm_s,(long)m_motor_1.m_position_target_counts,pvals.position);
     return 0;
 }
