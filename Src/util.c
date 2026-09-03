@@ -45,7 +45,12 @@ static uint8_t debugIndex = 0;
 int _write(int file, char *data, int len) {
   (void)file;
   if (len <= 0) return 0;
-  /* Debug output and binary feedback share USART3. Wait for feedback DMA to finish. */
+  /* USART3 is the VESC binary transport. Raw printf text between framed VESC
+   * packets corrupts the host decoder and previously caused intermittent
+   * COMM_GET_VALUES timeouts / "Could not read firmware version" while a motor
+   * was active. Keep the legacy ASCII terminal available only when no VESC
+   * session is active; during a VESC session debug text is intentionally dropped. */
+  if (vesc_protocol_link_active()) return len;
   while (huart3.gState != HAL_UART_STATE_READY) { }
   return (HAL_UART_Transmit(&huart3, (uint8_t *)data, (uint16_t)len, 1000) == HAL_OK) ? len : 0;
 }

@@ -4,7 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import csv,struct,subprocess,tempfile,time
+import argparse,csv,struct,subprocess,tempfile,time
 from vesc_dual import VescDual,COMM_SET_RPM,COMM_SET_CURRENT_BRAKE,COMM_SET_HANDBRAKE,COMM_ALIVE
 COMM_GET_MCCONF=14; COMM_SET_MCCONF=13; GAIN_TOOL='/tmp/mc_speed_gain_tool'
 def getmc(l,r):
@@ -23,8 +23,13 @@ def release(l,r): send(l,r,COMM_SET_RPM,0,1);alive(l,r)
 def sample(l,r,phase,t0,row):
  v=l.values(r); row.update(phase=phase,t=time.monotonic()-t0,erpm=v.rpm,iq=v.iq,imotor=v.current_motor,duty=v.duty,fault=v.fault);return v
 def main():
- out=Path('tools/results/speed_pid');out.mkdir(exist_ok=True);stamp=time.strftime('%Y%m%d_%H%M%S');fpath=out/f'brake_handbrake_{stamp}.csv'
- L=VescDual('/dev/ttyUSB0',115200,timeout=.7);orig={};rows=[]
+ ap=argparse.ArgumentParser(description='Guarded brake and handbrake hardware test.')
+ ap.add_argument('--port',default='/dev/ttyUSB0')
+ ap.add_argument('--arm',action='store_true',help='required to actuate the motor')
+ a=ap.parse_args()
+ if not a.arm: ap.error('motor actuation requires --arm')
+ stamp=time.strftime('%Y%m%d_%H%M%S');out=TOOLS_DIR/'results'/'speed_pid'/stamp;out.mkdir(parents=True,exist_ok=True);fpath=out/'brake_handbrake.csv'
+ L=VescDual(a.port,115200,timeout=.7);orig={};rows=[]
  try:
   for r,m in [(False,'left'),(True,'right')]:orig[m]=getmc(L,r);setmc(L,r,patch(orig[m]));release(L,r)
   for r,m in [(False,'left'),(True,'right')]:

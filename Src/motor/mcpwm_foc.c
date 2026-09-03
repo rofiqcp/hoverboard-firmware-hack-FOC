@@ -76,11 +76,20 @@ static uint8_t s_foc_control_div = 0u;
  * These defaults reproduce the previously proven hard-coded sector centers. */
 static const uint8_t s_default_foc_hall_table[8] = {255u, 83u, 17u, 50u, 150u, 117u, 183u, 255u};
 
+static uint16_t default_motor_poles(bool second) {
+#if MCCONF_POLE_PAIRS_LEFT == MCCONF_POLE_PAIRS_RIGHT
+    (void)second;
+    return (uint16_t)(2u * MCCONF_POLE_PAIRS_LEFT);
+#else
+    return (uint16_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+#endif
+}
+
 static uint16_t motor_pole_pairs(bool second) {
     const mc_configuration *c = second ? &m_motor_2.m_conf : &m_motor_1.m_conf;
     uint16_t poles = c->si_motor_poles;
     if (poles < 2u || (poles & 1u)) {
-        poles = (uint16_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+        poles = default_motor_poles(second);
     }
     return (uint16_t)(poles / 2u);
 }
@@ -246,9 +255,9 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->p_pid_ki = (float)MCCONF_POSITION_KI_Q16 / 1000.0f;
     c->p_pid_kd = (float)MCCONF_POSITION_KD_Q11 / 1000.0f;
     c->p_pid_kd_filter = (float)MCCONF_POSITION_KD_FILTER_Q16 / 65536.0f;
-    c->p_pid_kd_proc = 0.0f;
+    c->p_pid_kd_proc = 0.00035f; /* upstream VESC default process-D damping */
     c->p_pid_ang_div = 1.0f;
-    c->si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+    c->si_motor_poles = (uint8_t)default_motor_poles(second);
     c->si_gear_ratio = 1.0f; /* direct drive; set >1 in VESC Tool for a gearbox */
     for (int i=0;i<8;i++) c->foc_hall_table[i] = (int8_t)s_default_foc_hall_table[i];
 }
@@ -281,6 +290,23 @@ static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     if(v<0.0)v=0.0;
     if(v>4294967295.0)v=4294967295.0;
     m->m_speed_kd_coeff_q8=(uint32_t)(v+0.5);
+}
+
+static void position_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
+    if (!m) return;
+    /* Count-position process D uses signed mechanical RPM -> electrical deg/s. */
+    double v=(double)m->m_conf.p_pid_kd_proc*6.0*32768.0*65536.0;
+    if(v<0.0)v=0.0;
+    if(v>4294967295.0)v=4294967295.0;
+    m->m_position_kd_proc_coeff_q16=(uint32_t)(v+0.5);
+    /* Stock VESC SET_POS tracks electrical phase directly. Cache a coefficient
+     * for -d(phase)/dt * kd_proc in normalized Q15, preserving the sign of the
+     * actual phase delta instead of relying on Hall ERPM sign conventions. */
+    v=(double)m->m_conf.p_pid_kd_proc*(double)PWM_FREQ*180.0*16.0/
+      (double)MCCONF_FOC_CONTROL_DIV;
+    if(v<0.0)v=0.0;
+    if(v>65535.0)v=65535.0;
+    m->m_position_kd_proc_phase_coeff_q4=(uint16_t)(v+0.5);
 }
 
 static bool hall_table_runtime_sane(const uint8_t t[8]) {
@@ -332,6 +358,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_input_current_regen_q4=(int16_t)(-MCCONF_L_IN_CURRENT_MIN*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_duty_ramp_step_permille=(uint16_t)(MCCONF_DUTY_RAMP_STEP_DEFAULT*1000.0f+0.5f);
     speed_pid_recompute_coeff(m);
+    position_pid_recompute_coeff(m);
     m->m_abs_current_limit_counts=(int16_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV+0.5f);
     m->m_duty_limit_permille=(int16_t)(MCCONF_L_MAX_DUTY*1000.0f+0.5f);
     m->m_telem_current_filter_q16=(uint16_t)(MCCONF_FOC_TELEMETRY_FILTER_DEFAULT*65535.0f+0.5f);
@@ -391,7 +418,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (next.si_motor_poles < 2u || (next.si_motor_poles & 1u)) {
         next.si_motor_poles = m->m_conf.si_motor_poles;
         if (next.si_motor_poles < 2u || (next.si_motor_poles & 1u))
-            next.si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
+            next.si_motor_poles = (uint8_t)default_motor_poles(second);
     }
     if (!(next.si_gear_ratio >= 0.01f && next.si_gear_ratio <= 1000.0f)) next.si_gear_ratio = 1.0f;
     if (!(next.l_max_duty > 0.0f) || next.l_max_duty > MCCONF_L_MAX_DUTY) next.l_max_duty=MCCONF_L_MAX_DUTY;
@@ -471,6 +498,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         m->m_telem_current_filter_q16=(uint16_t)CLAMP(a,1,65535);
     }
     speed_pid_recompute_coeff(m);
+    position_pid_recompute_coeff(m);
     m->m_abs_current_limit_counts=(int16_t)CLAMP((int32_t)(next.l_abs_current_max*(float)A2BIT_CONV+0.5f),1,32767);
     m->m_duty_limit_permille=(int16_t)CLAMP((int32_t)(next.l_max_duty*1000.0f+0.5f),1,1000);
     {
@@ -483,6 +511,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
 void mcpwm_foc_sync_tuning_to_conf(bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     speed_pid_recompute_coeff(m);
+    position_pid_recompute_coeff(m);
     m->m_conf.foc_current_kp=(float)m->m_kpq_q11/1536.0f;
     m->m_conf.foc_current_ki=(float)m->m_kiq_q16/4.608f;
     m->m_conf.s_pid_kp=(float)m->m_kps_q11/(float)MCCONF_SPEED_GAIN_SCALE;
@@ -506,8 +535,10 @@ static int16_t amp_to_q4(const mcpwm_foc_motor_t *m, float current) {
 }
 
 static void reset_position_pid(mcpwm_foc_motor_t *m){
-    m->m_position_integrator=0;m->m_position_prev_error=0;m->m_position_sat_hold=0;
-    m->m_position_dt_ticks=1u;m->m_position_d_filter_q15=0;
+    m->m_position_integrator=0;m->m_position_prev_error=0;m->m_position_prev_error_mdeg=0;m->m_position_sat_hold=0;
+    m->m_position_dt_ticks=1u;m->m_position_d_filter_q15=0;m->m_position_d_proc_filter_q15=0;
+    m->m_position_prev_proc_phase=m->m_phase;m->m_position_proc_dt_ticks=1u;
+    m->m_position_breakaway_ticks=0u;m->m_position_no_motion_ticks=0u;m->m_position_motion_seen=0u;
     m->m_position_drive_direction=0;m->m_position_settle_ticks=0;
 }
 
@@ -521,7 +552,6 @@ static void iq_setpoint_slew_step(mcpwm_foc_motor_t *m) {
     int32_t step_q16 = ((int32_t)MCCONF_CURRENT_SLEW_A_PER_S *
                         FOC_CURRENT_Q4_PER_A * 65536 *
                         (int32_t)MCCONF_FOC_CONTROL_DIV) / PWM_FREQ;
-    if (step_q16 < 1) step_q16 = 1;
     if (m->m_iq_set_ramp_q16 < target_q16) {
         m->m_iq_set_ramp_q16 += step_q16;
         if (m->m_iq_set_ramp_q16 > target_q16) m->m_iq_set_ramp_q16 = target_q16;
@@ -611,27 +641,37 @@ void mcpwm_foc_set_pid_speed(float erpm, bool second) {
     }
 }
 void mcpwm_foc_set_pid_pos(float position_deg,bool second){
-    /* Stock VESC COMM_SET_POS is a single-turn rotor electrical-angle command.
-     * The long-range Hall-count position requested by this project remains the
-     * separate mode-5/PSETL/PSETR API. With Hall sensing at standstill the
-     * physical position resolution is one 60-degree electrical sector, so map
-     * the requested VESC angle to the nearest equivalent Hall-count target. */
+    /* Match vedderb/bldc foc_run_pid_control_pos: without a dedicated encoder,
+     * VESC uses the live FOC electrical rotor phase as m_pos_pid_now and closes
+     * a shortest-path angular PID on that continuous phase. Do NOT quantize the
+     * command to Hall transition counts. */
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     while(position_deg>=360.0f)position_deg-=360.0f;
     while(position_deg<0.0f)position_deg+=360.0f;
-    float now=mcpwm_foc_get_phase_motor(second);
-    float diff=position_deg-now;
-    while(diff>180.0f)diff-=360.0f;
-    while(diff<-180.0f)diff+=360.0f;
-    int32_t delta=(int32_t)(diff>=0.0f?(diff/60.0f+0.5f):(diff/60.0f-0.5f));
-    int64_t target=(int64_t)m->m_position_counts+delta;
-    if(target>INT32_MAX)target=INT32_MAX;
-    if(target<INT32_MIN)target=INT32_MIN;
-    mcpwm_foc_set_position_counts((int32_t)target,second);
+    uint32_t ph=(uint32_t)(position_deg*(65536.0f/360.0f)+0.5f);
+    if(ph>=65536u)ph=0u;
+    const uint16_t new_phase=(uint16_t)ph;
+    const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode==0u);
+    const int16_t target_delta=(int16_t)(new_phase-m->m_pos_pid_set_phase);
+    const bool target_changed=(target_delta>64 || target_delta<-64);
+    set_control_mode(m,CONTROL_MODE_POS);
+    if(branch_change) reset_position_pid(m);
+    if(target_changed && !branch_change){
+        m->m_position_breakaway_ticks=0u;m->m_position_no_motion_ticks=0u;m->m_position_motion_seen=0u;
+        m->m_position_prev_proc_phase=m->m_phase;m->m_position_proc_dt_ticks=1u;
+    }
+    m->m_pos_pid_phase_mode=1u;
+    m->m_pos_pid_set_phase=new_phase;
 }
 void mcpwm_foc_set_position_counts(int32_t pc,bool second){
-    mcpwm_foc_motor_t*m=mcpwm_foc_get_motor(second);if(pc<m->m_position_min_counts)pc=m->m_position_min_counts;if(pc>m->m_position_max_counts)pc=m->m_position_max_counts;
-    set_control_mode(m,CONTROL_MODE_POS);m->m_position_target_counts=pc;
+    mcpwm_foc_motor_t*m=mcpwm_foc_get_motor(second);
+    if(pc<m->m_position_min_counts)pc=m->m_position_min_counts;
+    if(pc>m->m_position_max_counts)pc=m->m_position_max_counts;
+    const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode!=0u);
+    set_control_mode(m,CONTROL_MODE_POS);
+    if(branch_change) reset_position_pid(m);
+    m->m_pos_pid_phase_mode=0u;
+    m->m_position_target_counts=pc;
 }
 void mcpwm_foc_set_position_user_counts(int32_t pc,bool second){
     mcpwm_foc_set_position_counts(user_position_to_internal(pc,second),second);
@@ -1072,7 +1112,6 @@ static void openloop_current_ramp_update(mcpwm_foc_motor_t *m) {
      * electrical phase remaining exactly where the detector put it. */
     const int32_t target_id_q16=(int32_t)m->m_openloop_id_target_q4<<16;
     int32_t id_step_q16=((int32_t)MCCONF_OPENLOOP_ID_SLEW_A_S*FOC_CURRENT_Q4_PER_A<<16)/PWM_FREQ;
-    if(id_step_q16<1)id_step_q16=1;
     if(m->m_openloop_id_ramp_q16<target_id_q16){
         m->m_openloop_id_ramp_q16+=id_step_q16;
         if(m->m_openloop_id_ramp_q16>target_id_q16)m->m_openloop_id_ramp_q16=target_id_q16;
@@ -1117,7 +1156,6 @@ static void openloop_update(mcpwm_foc_motor_t *m, bool second) {
 
     const int32_t target_speed_q16=(int32_t)absrpm<<16;
     int32_t speed_step=((int32_t)MCCONF_OPENLOOP_ACCEL_RPM_S<<16)/PWM_FREQ;
-    if(speed_step<1)speed_step=1;
     if(m->m_openloop_speed_q16<target_speed_q16){
         m->m_openloop_speed_q16+=speed_step;
         if(m->m_openloop_speed_q16>target_speed_q16)m->m_openloop_speed_q16=target_speed_q16;
@@ -1147,16 +1185,25 @@ static int16_t pi_run_state(int16_t err, uint16_t kp, uint16_t ki, int16_t max, 
 }
 
 static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
-    /* VESC foc_run_pid_control_pos architecture: position PID output is
-     * normalized to [-1,1] and then multiplied by the configured motor-current
-     * limit. This Hall port stores position in sector counts; one count is
-     * 360/(6*pole_pairs) mechanical degrees. Gains are stored as gain*1000. */
-    int64_t ec64=(int64_t)m->m_position_target_counts-(int64_t)m->m_position_counts;
-    if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
-    const int32_t ec=(int32_t)ec64;
-    const int32_t pp=(int32_t)motor_pole_pairs(second);
-    const int32_t mdeg_per_count=360000/(6*pp);
-    const int32_t error_mdeg=ec*mdeg_per_count;
+    /* Stock COMM_SET_POS remains VESC-compatible in electrical degrees. On
+     * this Hall-only hoverboard, direct position->Iq is under-damped because one
+     * Hall sector is 60 electrical degrees. Use the hardware-safe cascade
+     * position PID -> ERPM -> speed PI -> Iq -> current PI -> Vq for phase mode.
+     * The custom long-range Hall-count API remains a separate branch. */
+    int32_t error_mdeg;
+    int32_t count_error=0;
+    if(m->m_pos_pid_phase_mode){
+        const int16_t phase_err=(int16_t)(m->m_pos_pid_set_phase-m->m_phase);
+        error_mdeg=(int32_t)(((int64_t)phase_err*360000LL)/65536LL);
+    }else{
+        int64_t ec64=(int64_t)m->m_position_target_counts-(int64_t)m->m_position_counts;
+        if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
+        count_error=(int32_t)ec64;
+        const int32_t pp=(int32_t)motor_pole_pairs(second);
+        const int32_t mdeg_per_count=360000/(6*pp);
+        error_mdeg=count_error*mdeg_per_count;
+        m->m_position_prev_error=(int16_t)count_error;
+    }
     const int32_t limit_q4=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
 
     int64_t p64=(int64_t)error_mdeg*(int32_t)m->m_kpp_q11*32768LL;
@@ -1177,15 +1224,14 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         m->m_position_integrator=(int32_t)isum;
     }
 
-    int32_t d_raw_q15=0;
     if(m->m_kdp_q11!=0u){
-        if(ec==(int32_t)m->m_position_prev_error){
+        int32_t d_raw_q15=0;
+        if(error_mdeg==m->m_position_prev_error_mdeg){
             if(m->m_position_dt_ticks<65535u)m->m_position_dt_ticks++;
         }else{
             const uint32_t dt_ticks=m->m_position_dt_ticks?m->m_position_dt_ticks:1u;
-            const int32_t de=ec-(int32_t)m->m_position_prev_error;
-            int64_t d64=(int64_t)de*mdeg_per_count*(int32_t)m->m_kdp_q11*32768LL*
-                        (int32_t)PWM_FREQ;
+            const int32_t de_mdeg=error_mdeg-m->m_position_prev_error_mdeg;
+            int64_t d64=(int64_t)de_mdeg*(int32_t)m->m_kdp_q11*32768LL*(int32_t)PWM_FREQ;
             d64/=(1000000LL*(int32_t)MCCONF_FOC_CONTROL_DIV*(int64_t)dt_ticks);
             if(d64>32768)d64=32768; else if(d64<-32768)d64=-32768;
             d_raw_q15=(int32_t)d64;
@@ -1196,58 +1242,130 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     }else{
         m->m_position_dt_ticks=1u; m->m_position_d_filter_q15=0;
     }
+    m->m_position_prev_error_mdeg=error_mdeg;
     const int32_t d_q15=m->m_position_d_filter_q15;
-    m->m_position_prev_error=(int16_t)ec;
-    int32_t out_q15=p_q15+(m->m_position_integrator>>16)+d_q15;
+
+    if(m->m_pos_pid_phase_mode){
+        /* Upstream VESC position controller: normalized position PID -> Iq.
+         * Hall-only hardware cannot resolve better than one electrical sector at
+         * standstill, so use a small target deadband and a 0.6 A hardware-safe
+         * current scale. Unlike the discarded position->speed cascade, process-D
+         * is derived from the actual electrical phase delta, exactly matching the
+         * quantity that SET_POS controls. */
+        if(m->m_position_proc_dt_ticks<65535u)m->m_position_proc_dt_ticks++;
+        const int16_t proc_delta=(int16_t)(m->m_phase-m->m_position_prev_proc_phase);
+        int32_t dproc_raw_q15=0;
+        if(proc_delta!=0){
+            const uint32_t dt_ticks=m->m_position_proc_dt_ticks?m->m_position_proc_dt_ticks:1u;
+            int32_t dp=-(int32_t)proc_delta*(int32_t)m->m_position_kd_proc_phase_coeff_q4;
+            if(dt_ticks>1u)dp/=(int32_t)dt_ticks;
+            dp>>=4;
+            if(dp>32768)dp=32768; else if(dp<-32768)dp=-32768;
+            dproc_raw_q15=dp;
+            m->m_position_prev_proc_phase=m->m_phase;
+            m->m_position_proc_dt_ticks=1u;
+            m->m_position_motion_seen=1u;
+            m->m_position_no_motion_ticks=0u;
+        }else if(m->m_position_no_motion_ticks<65535u){
+            m->m_position_no_motion_ticks++;
+        }
+        const int32_t dpdiff=dproc_raw_q15-m->m_position_d_proc_filter_q15;
+        m->m_position_d_proc_filter_q15 +=
+            (int32_t)(((int64_t)dpdiff*m->m_position_kd_filter_q16)>>16);
+
+        const int32_t abs_error=error_mdeg<0?-error_mdeg:error_mdeg;
+        int32_t base_q15=p_q15+(m->m_position_integrator>>16)+d_q15;
+        if(abs_error<=(int32_t)MCCONF_POSITION_PHASE_DEADBAND_MDEG){
+            base_q15=0;
+            m->m_position_integrator=0;
+            m->m_position_d_filter_q15=0;
+        }
+        int32_t out_q15=base_q15+m->m_position_d_proc_filter_q15;
+        out_q15=CLAMP(out_q15,-32768,32768);
+
+        const uint32_t kick_max=((uint32_t)MCCONF_POSITION_BREAKAWAY_KICK_MS*(uint32_t)PWM_FREQ)/
+                                (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+        const uint32_t rearm_ticks=((uint32_t)MCCONF_POSITION_BREAKAWAY_REARM_MS*(uint32_t)PWM_FREQ)/
+                                   (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+        if(m->m_position_motion_seen && abs_error>(int32_t)MCCONF_POSITION_PHASE_DEADBAND_MDEG &&
+           m->m_position_no_motion_ticks>=rearm_ticks){
+            m->m_position_motion_seen=0u;m->m_position_breakaway_ticks=0u;m->m_position_no_motion_ticks=0u;
+        }
+        const bool kick=(abs_error>(int32_t)MCCONF_POSITION_PHASE_DEADBAND_MDEG &&
+                         !m->m_position_motion_seen && m->m_position_breakaway_ticks<kick_max);
+        if(kick){
+            m->m_position_breakaway_ticks++;
+            int32_t kick_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_BREAKAWAY_CURRENT_MA)/1000;
+            if(kick_q4>limit_q4)kick_q4=limit_q4;
+            return (int16_t)(error_mdeg>0?kick_q4:-kick_q4);
+        }
+        int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_RUN_CURRENT_MAX_MA)/1000;
+        if(pos_lim_q4>limit_q4)pos_lim_q4=limit_q4;
+        m->m_position_drive_direction=0;
+        m->m_position_settle_ticks=0;
+        return (int16_t)(((int64_t)out_q15*pos_lim_q4)/32768LL);
+    }
+
+    /* VESC p_pid_kd_proc: derivative of the measured electrical position is
+     * a direct damping term and remains useful even when Hall angle is coarse at
+     * standstill. m_rpm*pp is signed ERPM, so this is exactly -deg/s*Kd_proc. */
+    int64_t dproc64=-(int64_t)m->m_rpm*(int32_t)motor_pole_pairs(second)*
+                    (int64_t)m->m_position_kd_proc_coeff_q16;
+    dproc64 >>= 16;
+    if(dproc64>32768)dproc64=32768; else if(dproc64<-32768)dproc64=-32768;
+    const int32_t dproc_raw_q15=(int32_t)dproc64;
+    const int32_t dpdiff=dproc_raw_q15-m->m_position_d_proc_filter_q15;
+    m->m_position_d_proc_filter_q15 +=
+        (int32_t)(((int64_t)dpdiff*m->m_position_kd_filter_q16)>>16);
+    const int32_t dproc_q15=m->m_position_d_proc_filter_q15;
+
+    int32_t out_q15=p_q15+(m->m_position_integrator>>16)+d_q15+dproc_q15;
     out_q15=CLAMP(out_q15,-32768,32768);
 
-    int32_t iq_cmd_q4=(int32_t)(((int64_t)out_q15*limit_q4)/32768LL);
-    const int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
-                              (int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
-    iq_cmd_q4=CLAMP(iq_cmd_q4,-pos_lim_q4,pos_lim_q4);
+    /* Keep VESC's normalized position PID, but scale it by a hardware-safe
+     * position current range instead of multiplying by the full 15 A motor
+     * limit and clipping afterwards. Post-clipping turns small position errors
+     * into bang-bang current; pre-scaling preserves proportional authority near
+     * the target while still providing enough breakaway torque at large error. */
+    int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+    if(pos_lim_q4>limit_q4)pos_lim_q4=limit_q4;
+    int32_t iq_cmd_q4=(int32_t)(((int64_t)out_q15*pos_lim_q4)/32768LL);
 
-    /* Hall position is quantized to sector edges. Using instantaneous Hall RPM
-     * as damping is unstable near an edge because one accepted reversal can
-     * imply hundreds of RPM for a few samples. Instead, remember the validated
-     * position-error direction. On first reaching the target sector, keep a
-     * small bounded current briefly to move away from the boundary toward the
-     * sector interior, then command exactly zero current. */
-    if(ec>0){
-        m->m_position_drive_direction=1;
-        m->m_position_settle_ticks=0;
-    }else if(ec<0){
-        m->m_position_drive_direction=-1;
-        m->m_position_settle_ticks=0;
-    }else if(m->m_position_drive_direction!=0){
-        const uint32_t settle_max=((uint32_t)MCCONF_POSITION_SETTLE_MS*
-                                  (uint32_t)PWM_FREQ)/
-                                  (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
-        if(m->m_position_settle_ticks<settle_max){
-            const int32_t settle_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
-                                     (int32_t)MCCONF_POSITION_SETTLE_CURRENT_MA)/1000;
-            iq_cmd_q4=(int32_t)m->m_position_drive_direction*settle_q4;
-            m->m_position_settle_ticks++;
+    {
+        if(count_error>0){
+            m->m_position_drive_direction=1; m->m_position_settle_ticks=0;
+        }else if(count_error<0){
+            m->m_position_drive_direction=-1; m->m_position_settle_ticks=0;
+        }else if(m->m_position_drive_direction!=0){
+            const uint32_t settle_max=((uint32_t)MCCONF_POSITION_SETTLE_MS*(uint32_t)PWM_FREQ)/
+                                      (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+            if(m->m_position_settle_ticks<settle_max){
+                const int32_t settle_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                                         (int32_t)MCCONF_POSITION_SETTLE_CURRENT_MA)/1000;
+                iq_cmd_q4=(int32_t)m->m_position_drive_direction*settle_q4;
+                m->m_position_settle_ticks++;
+            }else{
+                iq_cmd_q4=0; m->m_position_drive_direction=0;
+            }
         }else{
             iq_cmd_q4=0;
-            m->m_position_drive_direction=0;
         }
-    }else{
-        iq_cmd_q4=0;
     }
     return (int16_t)iq_cmd_q4;
 }
 
-static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
-    /* Match vedderb/bldc foc_run_pid_control_speed architecture: speed PID
-     * produces an Iq/current request, then the inner FOC current PI produces Vq.
-     * Upstream scales speed PID by 1/20 and clamps it to +/- current limit.
-     * Keep that behavior in integer math: gains are stored as gain*1000, speed
-     * error is ERPM Q16, and m_speed_integrator is Iq(q4) Q16. */
-    const int32_t pp = (int32_t)motor_pole_pairs(second);
-    const int32_t limit_q4 = m->m_current_limit_q4 > 0 ?
-                             m->m_current_limit_q4 : MCCONF_MOTOR_CURRENT_MAX_Q4;
-    int64_t target64 = (int64_t)m->m_speed_set_ramp_q16 * pp;
-    int64_t measured64 = (int64_t)measured_mech_rpm_q16(m, second) * pp;
+static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
+                                                   int32_t target_erpm_q16, int32_t output_limit_q4) {
+    /* VESC speed PID -> Iq. The normal speed mode uses the full configured
+     * current range. Hall-position mode reuses the exact same regulator with a
+     * smaller output ceiling, so position cannot wind the speed integrator into
+     * multi-ampere torque while a wheel is mechanically blocked. */
+    const int32_t pp=(int32_t)motor_pole_pairs(second);
+    const int32_t full_limit_q4=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
+    int32_t limit_q4=output_limit_q4;
+    if(limit_q4<=0 || limit_q4>full_limit_q4)limit_q4=full_limit_q4;
+    const int64_t target64=(int64_t)target_erpm_q16;
+    int64_t measured64=(int64_t)measured_mech_rpm_q16(m,second)*pp;
     int64_t error64 = target64 - measured64;
     if (error64 > INT32_MAX) error64 = INT32_MAX;
     if (error64 < INT32_MIN) error64 = INT32_MIN;
@@ -1271,7 +1389,7 @@ static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     const int32_t error_q2=error_q16>>14;
     int64_t pnorm64=((int64_t)error_q2*(int64_t)m->m_speed_kp_coeff_q16)>>16;
     if(pnorm64>32768)pnorm64=32768; else if(pnorm64<-32768)pnorm64=-32768;
-    const int32_t p_q4=(int32_t)((pnorm64*(int64_t)limit_q4)>>15);
+    const int32_t p_q4=(int32_t)((pnorm64*(int64_t)full_limit_q4)>>15);
 
     const int64_t i_step=((int64_t)error_q2*(int64_t)m->m_speed_ki_coeff_q16)>>16;
     const int64_t i_lim = (int64_t)limit_q4 << 16;
@@ -1283,7 +1401,8 @@ static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     if (m->m_speed_kd_coeff_q8 != 0u) {
         int64_t de64=(int64_t)error_q16-(int64_t)m->m_speed_prev_error;
         if(de64>INT32_MAX)de64=INT32_MAX; else if(de64<INT32_MIN)de64=INT32_MIN;
-        const int32_t de_q2=((int32_t)de64)>>14;
+        const uint32_t de_mag_q16=(uint32_t)(de64<0 ? -de64 : de64);
+        const int32_t de_q2=de64<0 ? -(int32_t)(de_mag_q16>>14) : (int32_t)(de_mag_q16>>14);
         int64_t dq=((int64_t)de_q2*(int64_t)m->m_speed_kd_coeff_q8)>>8;
         if(dq>limit_q4)dq=limit_q4; else if(dq<-limit_q4)dq=-limit_q4;
         d_q4=(int32_t)dq;
@@ -1309,7 +1428,16 @@ static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         if (measured64 > erpm20_q16 && out_q4 < 0) out_q4 = 0;
         if (measured64 < -erpm20_q16 && out_q4 > 0) out_q4 = 0;
     }
-    return (int16_t)CLAMP(out_q4, -limit_q4, limit_q4);
+    return (int16_t)CLAMP(out_q4,-limit_q4,limit_q4);
+}
+
+static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m,bool second){
+    const int32_t pp=(int32_t)motor_pole_pairs(second);
+    int64_t target64=(int64_t)m->m_speed_set_ramp_q16*pp;
+    if(target64>INT32_MAX)target64=INT32_MAX;
+    if(target64<INT32_MIN)target64=INT32_MIN;
+    const int32_t full_limit=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
+    return speed_pid_iq_target_erpm_step(m,second,(int32_t)target64,full_limit);
 }
 
 static int16_t duty_control_iq_target_step(mcpwm_foc_motor_t *m) {
@@ -1552,11 +1680,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                     }
                 } else if(m->m_control_mode==CONTROL_MODE_POS){
                     m->m_iq_target_q4=position_pid_iq_target_step(m,second);
-                    /* VESC position PID writes Iq directly. The dedicated
-                     * position current cap above makes a slower command slew
-                     * unnecessary and avoids phase lag in velocity damping. */
-                    m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    /* Position cascade is intentionally current-slewed. The
+                     * outer loop runs at low Hall positioning speed, so a 10 A/s
+                     * slew removes bridge torque steps without hiding damping. */
+                    iq_setpoint_slew_step(m);
                 } else if (m->m_control_mode==CONTROL_MODE_CURRENT_BRAKE) {
                     bool same_motion=false;
                     if(m->m_brake_direction!=0 && m->m_hall_initialized &&
@@ -1697,7 +1824,6 @@ void mcpwm_foc_vesc_override_touch(bool second) {
     }
 }
 bool mcpwm_foc_vesc_override_active(bool second) { return s_vesc_owned[second?1u:0u] != 0u; }
-bool mcpwm_foc_vesc_override_active_any(void) { return (s_vesc_owned[0] != 0u) || (s_vesc_owned[1] != 0u); }
 bool mcpwm_foc_vesc_command_live(bool second) {
     const uint8_t i=second?1u:0u;
     return s_vesc_owned[i] && (s_vesc_timeout_ticks[i] != 0u || s_vesc_timeout_braking[i]);
@@ -2149,7 +2275,6 @@ static float motor_current_vesc_a(const mcpwm_foc_motor_t *m){
 }
 float mcpwm_foc_get_tot_current_motor(bool s){return motor_current_vesc_a(mcpwm_foc_get_motor_const(s));}
 float mcpwm_foc_get_tot_current_in_motor(bool s){return -(float)mcpwm_foc_get_motor_const(s)->m_current_in_telem_counts/(float)A2BIT_CONV;}
-float mcpwm_foc_get_rpm_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_rpm;}
 float mcpwm_foc_get_motor_mechanical_rpm(bool s){
     const float pp=(float)motor_pole_pairs(s);
     return pp>0.0f ? mcpwm_foc_get_erpm_motor(s)/pp : 0.0f;
@@ -2201,7 +2326,7 @@ void mcpwm_foc_energy_update(uint32_t now_ms) {
 float mcpwm_foc_get_vd_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vd*(bus_voltage_now()/(float)MCCONF_FOC_VOLTAGE_MAX);}
 float mcpwm_foc_get_vq_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vq*(bus_voltage_now()/(float)MCCONF_FOC_VOLTAGE_MAX);}
 float mcpwm_foc_get_phase_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_phase*(360.0f/65536.0f);}
-int32_t mcpwm_foc_get_position_counts(bool s){return mcpwm_foc_get_motor_const(s)->m_position_counts;}mc_state mcpwm_foc_get_state_motor(bool s){return mcpwm_foc_get_motor_const(s)->m_state;}mc_fault_code mcpwm_foc_get_fault_motor(bool s){return mcpwm_foc_get_motor_const(s)->m_fault;}
+mc_state mcpwm_foc_get_state_motor(bool s){return mcpwm_foc_get_motor_const(s)->m_state;}mc_fault_code mcpwm_foc_get_fault_motor(bool s){return mcpwm_foc_get_motor_const(s)->m_fault;}
 
 void mcpwm_foc_get_values(mc_values *v,bool second){
     if (!v) return;

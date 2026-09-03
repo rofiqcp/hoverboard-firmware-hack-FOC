@@ -4,7 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import time, statistics
+import argparse, time, statistics
 from vesc_dual import VescDual, COMM_SET_DUTY
 from vesc_debug import send_one, release_one
 
@@ -50,5 +50,14 @@ def run(port='/dev/ttyUSB0'):
     finally:
         link.close()
 
+def main():
+    ap = argparse.ArgumentParser(description='Low-duty guarded hardware smoke test.')
+    ap.add_argument('--port', default='/dev/ttyUSB0')
+    ap.add_argument('--arm', action='store_true', help='required to send motor duty commands')
+    a = ap.parse_args()
+    if not a.arm:
+        ap.error('motor actuation requires --arm')
+    return run(a.port)
+
 if __name__ == '__main__':
-    raise SystemExit(run())
+    raise SystemExit(main())

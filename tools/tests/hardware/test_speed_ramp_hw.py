@@ -4,7 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import csv,json,subprocess,tempfile,time
+import argparse,csv,json,subprocess,tempfile,time
 from vesc_dual import VescDual
 from test_speed_pid_sweep_hw import get_mc,set_mc,run_case,release
 TOOL='/tmp/mc_speed_tool2'
@@ -16,11 +16,16 @@ def patch(raw,kp,ki,kd,ramp,min_erpm=75):
         return b.read_bytes(),cp.stdout.strip()
 
 def main():
-    port='/dev/ttyUSB0'; out=Path('tools/results/speed_pid'); out.mkdir(exist_ok=True)
-    stamp=time.strftime('%Y%m%d_%H%M%S'); rawp=out/f'ramp_raw_{stamp}.csv'; sump=out/f'ramp_summary_{stamp}.csv'
+    ap=argparse.ArgumentParser(description='Guarded speed-ramp hardware sweep.')
+    ap.add_argument('--port',default='/dev/ttyUSB0')
+    ap.add_argument('--arm',action='store_true',help='required to actuate the motor')
+    a=ap.parse_args()
+    if not a.arm: ap.error('motor actuation requires --arm')
+    stamp=time.strftime('%Y%m%d_%H%M%S'); out=TOOLS_DIR/'results'/'speed_pid'/stamp; out.mkdir(parents=True,exist_ok=True)
+    rawp=out/'ramp_raw.csv'; sump=out/'ramp_summary.csv'
     configs={'left':(.009,.020,0.0),'right':(.0095,.022,0.0)}; ramps=[600,900,1200,1500]
     fields=['case','motor','kp','ki','kd','target','phase','t','erpm','iq','id','imotor','iin','duty','vq','vd','fault']
-    link=VescDual(port,115200,timeout=.65); orig={}; res=[]
+    link=VescDual(a.port,115200,timeout=.65); orig={}; res=[]
     try:
         for right,motor in [(False,'left'),(True,'right')]: orig[motor]=get_mc(link,right)
         with rawp.open('w',newline='') as f:

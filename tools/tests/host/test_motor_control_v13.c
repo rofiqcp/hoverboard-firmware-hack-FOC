@@ -314,9 +314,9 @@ int main(void){
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("OFF telemetry must not arm bridge");
     if(m_motor_1.m_telem_avg_samples!=0u)return fail("COMM_GET_VALUES must read/reset current average window");
 
-    /* One Hall count is four mechanical degrees at 15 pole-pairs. With the new
-     * steering Kp=0.060 and an active 1 A current limit it should request about
-     * 0.24 A, enough to approach breakaway without immediately saturating. */
+    /* One Hall count is four mechanical degrees at 15 pole-pairs. Kp=0.060
+     * would request about 0.24 A with a 1 A motor-current limit, but the
+     * hardware-safe position-output cap must clamp that request deterministically. */
     mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     mc_configuration pos1=m_motor_1.m_conf; pos1.l_current_max=1.0f; pos1.l_current_min=-1.0f;
     pos1.p_pid_kp=0.060f; pos1.p_pid_ki=0.0f; pos1.p_pid_kd=0.0f; pos1.p_pid_kd_filter=0.20f;
@@ -325,7 +325,14 @@ int main(void){
     mcpwm_foc_set_position_counts(1,false); mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
     for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_iq_target_q4<170 || m_motor_1.m_iq_target_q4>215)return fail("position 1-count Kp0.060 current request");
+    {
+        const int32_t mdeg_per_count=360000/(6*(int32_t)MCCONF_POLE_PAIRS_LEFT);
+        const int32_t p_q15=(int32_t)(((int64_t)mdeg_per_count*60*32768LL)/1000000LL);
+        const int32_t cap_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+        const int32_t scale_q4=cap_q4<FOC_CURRENT_Q4_PER_A?cap_q4:FOC_CURRENT_Q4_PER_A; /* test l_current_max=1 A */
+        const int32_t expected_q4=(int32_t)(((int64_t)p_q15*scale_q4)/32768LL);
+        if(abs((int)m_motor_1.m_iq_target_q4-(int)expected_q4)>2)return fail("position PID/current safety cap");
+    }
     if(m_motor_1.m_position_kd_filter_q16<13000u || m_motor_1.m_position_kd_filter_q16>13200u)return fail("position D filter config mapping");
 
     /* A stock VESC mc_configuration has one common current Kp/Ki. Writing it
@@ -364,17 +371,32 @@ int main(void){
     mcpwm_foc_set_position_counts(-100,false);
     if(m_motor_1.m_position_target_counts!=-5)return fail("position PMIN clamp");
 
-    /* Standard VESC COMM_SET_POS is single-turn rotor electrical position,
-     * not this project's long-range Hall-count coordinate. With Hall-only
-     * position sensing the command is quantized to the nearest 60 electrical
-     * degrees. From electrical phase 0 deg, a 40 deg request therefore maps
-     * to +1 Hall transition. Standard mc_values.position is the normalized
-     * rotor electrical phase itself. */
-    mcpwm_foc_init();
-    m_motor_1.m_phase=0u;
-    m_motor_1.m_position_counts=0;
+    /* Standard VESC COMM_SET_POS stays single-turn electrical degrees and never
+     * aliases the project's long-range Hall-count coordinate. It follows the
+     * upstream normalized position PID -> Iq architecture with a Hall deadband. */
+    mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    {
+        const float now=mcpwm_foc_get_phase_motor(false);
+        float target=now+60.0f; if(target>=360.0f)target-=360.0f;
+        mcpwm_foc_set_pid_pos(target,false); mcpwm_foc_vesc_override_touch(false);
+        for(int i=0;i<12;i++)mcpwm_foc_adc_int_handler();
+        if(!m_motor_1.m_pos_pid_phase_mode || m_motor_1.m_control_mode!=CONTROL_MODE_POS)return fail("VESC position Hall phase mode");
+        if(m_motor_1.m_iq_target_q4<=0)return fail("VESC position positive phase error must request positive Iq");
+        { const int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+          const int32_t abs_iq=m_motor_1.m_iq_target_q4<0?-m_motor_1.m_iq_target_q4:m_motor_1.m_iq_target_q4;
+          if(abs_iq>pos_lim_q4)return fail("VESC position current ceiling"); }
+        mcpwm_foc_set_pid_pos(mcpwm_foc_get_phase_motor(false),false);
+        for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_iq_target_q4!=0)return fail("VESC position Hall deadband must release torque");
+    }
+    mcpwm_foc_release_motor(false);
+    m_motor_1.m_phase=0u; m_motor_1.m_position_counts=0;
     mcpwm_foc_set_pid_pos(40.0f,false);
-    if(m_motor_1.m_position_target_counts!=1)return fail("VESC position electrical degrees to nearest Hall count");
+    if(!m_motor_1.m_pos_pid_phase_mode)return fail("VESC position must use live phase mode");
+    { const float setdeg=(float)m_motor_1.m_pos_pid_set_phase*(360.0f/65536.0f);
+      if(fabsf(setdeg-40.0f)>0.02f)return fail("VESC position electrical target precision"); }
+    if(m_motor_1.m_position_target_counts!=0)return fail("VESC SET_POS must not alter custom Hall-count target");
     mc_values pvals;
     m_motor_1.m_phase=(uint16_t)lroundf(40.0f*(65536.0f/360.0f));
     mcpwm_foc_get_values(&pvals,false);
@@ -431,7 +453,7 @@ int main(void){
         if(fabsf(mcpwm_foc_get_output_rpm(false)-100.0f)>0.01f)return fail("direct drive output RPM");
     }
 
-    printf("MOTOR_CONTROL_V13_PASS speed_ramp=%uRPM/s trq50=0.50A posCPR=90 VESCcmd40=%ld VESCpos=%.1f runtime_poles_gear=1\n",
-           m_motor_1.m_speed_ramp_rpm_s,(long)m_motor_1.m_position_target_counts,pvals.position);
+    printf("MOTOR_CONTROL_V13_PASS speed_ramp=%uRPM/s trq50=0.50A posCPR=90 VESCcmd40_phase=%u VESCpos=%.1f runtime_poles_gear=1\n",
+           m_motor_1.m_speed_ramp_rpm_s,(unsigned)m_motor_1.m_pos_pid_set_phase,pvals.position);
     return 0;
 }

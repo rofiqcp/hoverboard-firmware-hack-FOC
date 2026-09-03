@@ -21,6 +21,7 @@
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
 #define VESC_RX_QUEUE_DEPTH          8u
+#define VESC_TX_QUEUE_DEPTH          8u
 
 /* Project-specific extensions are transported inside standard
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
@@ -54,9 +55,22 @@ static volatile uint8_t s_pending_head = 0u;
 static volatile uint8_t s_pending_tail = 0u;
 static volatile uint8_t s_pending_count = 0u;
 static volatile uint32_t s_rx_queue_drop = 0u;
+static volatile uint32_t s_rx_queue_highwater = 0u;
+static uint32_t s_process_last_ms = 0u;
+static uint32_t s_process_gap_max_ms = 0u;
 static volatile uint32_t s_link_last_ms = 0u;
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
+/* Framed reply FIFO. The in-flight slot remains owned by DMA until UART gState
+ * returns READY, so no response buffer can be overwritten mid-transmission. */
+static uint8_t s_tx_frame[VESC_TX_QUEUE_DEPTH][VESC_MAX_FRAME];
+static uint16_t s_tx_len[VESC_TX_QUEUE_DEPTH];
+static uint8_t s_tx_head = 0u;
+static uint8_t s_tx_tail = 0u;
+static uint8_t s_tx_count = 0u;
+static uint8_t s_tx_active = 0u;
+static uint32_t s_tx_queue_drop = 0u;
+static uint32_t s_tx_start_fail = 0u;
 static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
 
 /* Stock VESC handles COMM_DETECT_HALL_FOC as a blocking command in a dedicated
@@ -86,7 +100,20 @@ typedef struct {
 } hall_detect_job_t;
 
 static hall_detect_job_t s_hall_detect;
+
+typedef struct {
+    uint8_t active;
+    uint8_t motor_index;
+    float min_current_in;
+    float max_current_in;
+    float openloop_rpm;
+    float sl_erpm;
+    uint8_t hall[2][8];
+} detect_all_job_t;
+
+static detect_all_job_t s_detect_all;
 static void hall_detect_periodic(uint32_t now_ms);
+static void reply_mcconf(bool second, COMM_PACKET_ID id);
 /* VESC Tool rotor-position display stream. Upstream commands.c stores one
  * display_position_mode per VESC instance; this dual virtual target stores the
  * last selected endpoint so COMM_FORWARD_CAN ID2 behaves like a second VESC. */
@@ -111,11 +138,19 @@ void vesc_protocol_init(void) {
     s_pending_head = s_pending_tail = s_pending_count = 0u;
     memset((void *)s_pending_len, 0, sizeof(s_pending_len));
     s_rx_queue_drop = 0u;
+    s_rx_queue_highwater = 0u;
+    s_process_last_ms = 0u;
+    s_process_gap_max_ms = 0u;
     s_link_last_ms = 0u;
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
+    s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
+    memset(s_tx_len, 0, sizeof(s_tx_len));
+    s_tx_queue_drop = 0u;
+    s_tx_start_fail = 0u;
     s_last_hall_store_ok[0] = s_last_hall_store_ok[1] = 0u;
     memset(&s_hall_detect, 0, sizeof(s_hall_detect));
+    memset(&s_detect_all, 0, sizeof(s_detect_all));
     s_display_pos_mode = DISP_POS_MODE_NONE;
     s_display_second = 0u;
     s_display_prev_ms = 0u;
@@ -162,6 +197,7 @@ static void complete_frame(void) {
             s_pending_len[slot] = n;
             s_pending_head = (uint8_t)((slot + 1u) % VESC_RX_QUEUE_DEPTH);
             s_pending_count++;
+            if ((uint32_t)s_pending_count > s_rx_queue_highwater) s_rx_queue_highwater = s_pending_count;
         } else {
             s_rx_queue_drop++;
         }
@@ -222,13 +258,43 @@ bool vesc_protocol_link_active(void) {
 uint32_t vesc_protocol_rx_ok_count(void) { return s_rx_ok; }
 uint32_t vesc_protocol_rx_crc_error_count(void) { return s_rx_crc_err; }
 
+static void vesc_tx_service(void) {
+    /* Retire the slot only after DMA + UART shift register are fully done. */
+    if (s_tx_active) {
+        if (huart3.gState != HAL_UART_STATE_READY) return;
+        s_tx_active = 0u;
+        if (s_tx_count != 0u) {
+            s_tx_len[s_tx_tail] = 0u;
+            s_tx_tail = (uint8_t)((s_tx_tail + 1u) % VESC_TX_QUEUE_DEPTH);
+            s_tx_count--;
+        }
+    }
+    if (s_tx_count == 0u || huart3.gState != HAL_UART_STATE_READY) return;
+    const uint8_t slot = s_tx_tail;
+    const uint16_t n = s_tx_len[slot];
+    if (n == 0u || n > VESC_MAX_FRAME) {
+        s_tx_tail = (uint8_t)((s_tx_tail + 1u) % VESC_TX_QUEUE_DEPTH);
+        s_tx_count--;
+        return;
+    }
+    if (HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n) == HAL_OK) {
+        s_tx_active = 1u;
+    } else {
+        /* Never block the control/main loop. Retry the same queued frame on the
+         * next service pass; a transient DMA busy state cannot starve RX. */
+        s_tx_start_fail++;
+    }
+}
+
 static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     if (!payload || len == 0u || len > VESC_MAX_PAYLOAD) return;
-    static uint8_t tx[VESC_MAX_FRAME];
-    /* USART3 TX DMA owns this static frame until HAL marks the UART ready.
-     * Wait BEFORE rebuilding the buffer, otherwise a second queued VESC reply
-     * could overwrite bytes while DMA is still transmitting the first one. */
-    while (huart3.gState != HAL_UART_STATE_READY) { }
+    vesc_tx_service();
+    if (s_tx_count >= VESC_TX_QUEUE_DEPTH) {
+        s_tx_queue_drop++;
+        return;
+    }
+    const uint8_t slot = s_tx_head;
+    uint8_t *tx = s_tx_frame[slot];
     uint16_t i = 0u;
     if (len <= 255u) {
         tx[i++] = 2u;
@@ -244,12 +310,10 @@ static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     tx[i++] = (uint8_t)(crc >> 8);
     tx[i++] = (uint8_t)crc;
     tx[i++] = 3u;
-    /* FOC runs at 16 kHz. Byte-by-byte blocking TX left inter-byte gaps whenever
-     * the FOC ISR pre-empted HAL_UART_Transmit, dropping active-motor RT data
-     * below VESC Tool's 20-ms cadence. DMA keeps the wire continuous. */
-    if (HAL_UART_Transmit_DMA(&huart3, tx, i) != HAL_OK) {
-        (void)HAL_UART_Transmit(&huart3, tx, i, 1000u);
-    }
+    s_tx_len[slot] = i;
+    s_tx_head = (uint8_t)((slot + 1u) % VESC_TX_QUEUE_DEPTH);
+    s_tx_count++;
+    vesc_tx_service();
 }
 
 static float wrap_angle_diff_deg(float a, float b) {
@@ -280,8 +344,16 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         *out = phase;
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
-        const int32_t dc = m->m_position_target_counts - m->m_position_counts;
-        *out = wrap_angle_diff_deg((float)dc * 60.0f, 0.0f);
+        if(m->m_pos_pid_phase_mode){
+            const float target=(float)m->m_pos_pid_set_phase*(360.0f/65536.0f);
+            const float err=wrap_angle_diff_deg(target,phase);
+            *out=second?-err:err;
+        }else{
+            const int32_t dc=m->m_position_target_counts-m->m_position_counts;
+            const float pp=(float)mcpwm_foc_get_pole_pairs(second);
+            const float err=(pp>0.0f)?((float)dc*60.0f/pp):0.0f;
+            *out=second?-err:err;
+        }
         return true;
     }
     case DISP_POS_MODE_ENCODER_OBSERVER_ERROR:
@@ -607,45 +679,13 @@ static bool hall_detect_motor_locked(bool second) {
     return s_hall_detect.active && (s_hall_detect.second != 0u) == second;
 }
 
-static void hall_detect_reply_and_stop(bool success) {
-    uint8_t reply[10];
-    reply[0] = COMM_DETECT_HALL_FOC;
-    uint8_t fails = 0u;
-    for (uint8_t h = 0u; h < 8u; ++h) {
-        const uint8_t a = hall_detect_angle200(s_hall_detect.sum_s[h], s_hall_detect.sum_c[h],
-                                               s_hall_detect.samples[h]);
-        reply[1u + h] = a;
-        if (a == 255u) fails++;
-    }
-    if (fails != 2u) success = false;
-    reply[9] = success ? 0u : 1u;
-    const bool second = s_hall_detect.second != 0u;
-    mc_interface_select_motor_thread(second ? 2 : 1);
-    mc_interface_release_motor();
-    mcpwm_foc_vesc_override_clear(second);
-    mc_interface_select_motor_thread(1);
-    s_last_hall_store_ok[second ? 1u : 0u] = 0u; /* Detect is intentionally not a store. */
-    memset(&s_hall_detect, 0, sizeof(s_hall_detect));
-    uart_send_payload(reply, sizeof(reply));
-}
-
-static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
-    if (s_hall_detect.active) return; /* Stock VESC discards a second blocking command. */
-    if (len < 4u) {
-        uint8_t reply[10] = {COMM_DETECT_HALL_FOC,255,255,255,255,255,255,255,255,1};
-        uart_send_payload(reply, sizeof(reply));
-        return;
-    }
-    int32_t ind = 0;
-    float current = (float)buffer_get_int32(data, &ind) / 1000.0f;
-    if (current < 0.0f) current = -current;
+static void hall_detect_start_current(bool second, float current) {
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
     float max_i = m->m_conf.l_current_max;
     if (max_i <= 0.0f || max_i > (float)I_MOT_MAX) max_i = (float)I_MOT_MAX;
-    /* VESC hall detect itself does not impose an arbitrary 4 A cap. The normal
-     * motor/current limit is the clamp, so VESC Tool's default 10 A behaves as
-     * expected on a 15 A hoverboard configuration. */
-    if (current > max_i) current = max_i;
+    if(current<0.0f)current=-current;
+    if(current<0.10f)current=0.10f;
+    if(current>max_i)current=max_i;
 
     memset(&s_hall_detect, 0, sizeof(s_hall_detect));
     s_hall_detect.active = 1u;
@@ -659,11 +699,139 @@ static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
     mc_interface_select_motor_thread(1);
 }
 
+static void detect_all_reply(int16_t result) {
+    uint8_t b[3];
+    int32_t i=0;
+    b[i++]=COMM_DETECT_APPLY_ALL_FOC;
+    buffer_append_int16(b,result,&i);
+    uart_send_payload(b,(uint16_t)i);
+}
+
+static bool detect_all_apply_motor(bool second, const uint8_t hall[8]) {
+    mc_configuration c=*mc_interface_get_configuration_motor(second);
+    memcpy(c.foc_hall_table,hall,8u);
+    c.motor_type=MOTOR_TYPE_FOC;
+    c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    if(s_detect_all.min_current_in < -0.001f &&
+       s_detect_all.min_current_in >= -(float)I_DC_MAX) c.l_in_current_min=s_detect_all.min_current_in;
+    if(s_detect_all.max_current_in > 0.001f &&
+       s_detect_all.max_current_in <= (float)I_DC_MAX) c.l_in_current_max=s_detect_all.max_current_in;
+    if(s_detect_all.openloop_rpm > 0.001f &&
+       s_detect_all.openloop_rpm <= (float)MCCONF_OPENLOOP_RPM_MAX) c.foc_openloop_rpm=s_detect_all.openloop_rpm;
+    if(s_detect_all.sl_erpm > 0.001f) c.foc_sl_erpm=s_detect_all.sl_erpm;
+
+    mc_interface_select_motor_thread(second?2:1);
+    mc_interface_set_configuration(&c);
+    const bool ok=mc_interface_store_configuration_motor(second);
+    mc_interface_select_motor_thread(1);
+    s_last_hall_store_ok[second?1u:0u]=ok?1u:0u;
+    return ok;
+}
+
+static void detect_all_finish(int16_t result) {
+    mc_interface_select_motor_thread(1);
+    mc_interface_release_motor();
+    mc_interface_select_motor_thread(2);
+    mc_interface_release_motor();
+    mc_interface_select_motor_thread(1);
+    memset(&s_hall_detect,0,sizeof(s_hall_detect));
+    s_detect_all.active=0u;
+    /* Upstream sends the freshly detected MC configuration before the final
+     * Detect-All result. VESC Tool relies on this to render the success page. */
+    if(result>=0) reply_mcconf(false,COMM_GET_MCCONF);
+    detect_all_reply(result);
+}
+
+static void hall_detect_reply_and_stop(bool success) {
+    uint8_t table[8];
+    uint8_t fails=0u;
+    for(uint8_t h=0u;h<8u;++h){
+        const uint8_t a=hall_detect_angle200(s_hall_detect.sum_s[h],s_hall_detect.sum_c[h],
+                                             s_hall_detect.samples[h]);
+        table[h]=a;
+        if(a==255u)fails++;
+    }
+    if(fails!=2u)success=false;
+    const bool second=s_hall_detect.second!=0u;
+    mc_interface_select_motor_thread(second?2:1);
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(second);
+    mc_interface_select_motor_thread(1);
+
+    if(s_detect_all.active){
+        if(!success){
+            detect_all_finish(-10);
+            return;
+        }
+        memcpy(s_detect_all.hall[second?1u:0u],table,8u);
+        if(!detect_all_apply_motor(second,table)){
+            detect_all_finish(-1);
+            return;
+        }
+        memset(&s_hall_detect,0,sizeof(s_hall_detect));
+        if(!second){
+            s_detect_all.motor_index=1u;
+            /* 1 A is the validated Hall-detect operating point on this board.
+             * It is clamped to each motor's configured current limit. */
+            hall_detect_start_current(true,1.0f);
+            return;
+        }
+        /* Non-negative result is success to VESC Tool; 2 denotes Hall sensing. */
+        detect_all_finish(2);
+        return;
+    }
+
+    uint8_t reply[10];
+    reply[0]=COMM_DETECT_HALL_FOC;
+    memcpy(&reply[1],table,8u);
+    reply[9]=success?0u:1u;
+    s_last_hall_store_ok[second?1u:0u]=0u; /* standalone detect is not a store */
+    memset(&s_hall_detect,0,sizeof(s_hall_detect));
+    uart_send_payload(reply,sizeof(reply));
+}
+
+static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
+    if (s_hall_detect.active || s_detect_all.active) return;
+    if (len < 4u) {
+        uint8_t reply[10] = {COMM_DETECT_HALL_FOC,255,255,255,255,255,255,255,255,1};
+        uart_send_payload(reply, sizeof(reply));
+        return;
+    }
+    int32_t ind = 0;
+    float current = (float)buffer_get_int32(data, &ind) / 1000.0f;
+    hall_detect_start_current(second,current);
+}
+
+static void detect_all_begin(const uint8_t *data,uint16_t len) {
+    if(s_hall_detect.active || s_detect_all.active) return;
+    if(len<21u){ detect_all_reply(-1); return; }
+    int32_t k=0;
+    const uint8_t detect_can=data[k++];
+    (void)detect_can; /* virtual ID2 is the on-board second motor, always detect it */
+    const float max_power_loss=buffer_get_float32(data,1e3f,&k);
+    (void)max_power_loss; /* board-specific current PI is pre-characterized; no sensorless R/L fit */
+    memset(&s_detect_all,0,sizeof(s_detect_all));
+    s_detect_all.active=1u;
+    s_detect_all.min_current_in=buffer_get_float32(data,1e3f,&k);
+    s_detect_all.max_current_in=buffer_get_float32(data,1e3f,&k);
+    s_detect_all.openloop_rpm=buffer_get_float32(data,1e3f,&k);
+    s_detect_all.sl_erpm=buffer_get_float32(data,1e3f,&k);
+
+    /* Same safety semantics as upstream blocking Detect All: application output
+     * remains gated and command timeout is refreshed for the motor under test. */
+    app_vesc_disable_output(180000);
+    mc_interface_select_motor_thread(1); mc_interface_release_motor();
+    mc_interface_select_motor_thread(2); mc_interface_release_motor();
+    mc_interface_select_motor_thread(1);
+    hall_detect_start_current(false,1.0f);
+}
+
 static void hall_detect_periodic(uint32_t now_ms) {
     if (!s_hall_detect.active) return;
     if ((int32_t)(now_ms - s_hall_detect.next_ms) < 0) return;
     const bool second = s_hall_detect.second != 0u;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
+    mcpwm_foc_vesc_override_touch(second);
     if (m->m_fault != FAULT_CODE_NONE) { hall_detect_reply_and_stop(false); return; }
 
     if (s_hall_detect.stage == HALL_DETECT_ALIGN) {
@@ -817,7 +985,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[192];
+        uint8_t b[208];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         struct {
@@ -949,6 +1117,10 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint16(b,adc_buffer.rrC,&i); buffer_append_uint16(b,adc_buffer.dcr,&i);
             buffer_append_int16(b,ds.off0,&i); buffer_append_int16(b,ds.off1,&i); buffer_append_int16(b,ds.offdc,&i);
             buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid;
+            buffer_append_uint32(b,s_tx_queue_drop,&i);
+            buffer_append_uint32(b,s_tx_start_fail,&i);
+            buffer_append_uint32(b,s_rx_queue_highwater,&i);
+            buffer_append_uint32(b,s_process_gap_max_ms,&i);
         }
         uart_send_payload(b, (uint16_t)i);
     }
@@ -1052,8 +1224,22 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_SET_APPCONF:
         set_appconf(second, d, n);
         break;
+    case COMM_APP_DISABLE_OUTPUT:
+        /* VESC Tool sends [forward_can][time_ms] before Detect All. This dual
+         * board has no physical CAN bus, so one shared app-output gate covers
+         * the local and virtual motor endpoints. */
+        if(n>=5u){
+            const uint8_t fwd_can=d[k++];
+            const int32_t time_ms=buffer_get_int32(d,&k);
+            (void)fwd_can;
+            app_vesc_disable_output(time_ms);
+        }
+        break;
     case COMM_DETECT_HALL_FOC:
         hall_detect_begin(second, d, n);
+        break;
+    case COMM_DETECT_APPLY_ALL_FOC:
+        if(!second) detect_all_begin(d,n);
         break;
     case COMM_CUSTOM_APP_DATA:
         process_custom_app(second, d, n);
@@ -1086,6 +1272,13 @@ static void process_top_packet(const uint8_t *p, uint16_t len) {
 }
 
 void vesc_protocol_process_pending(void) {
+    const uint32_t process_now_ms = HAL_GetTick();
+    if (s_process_last_ms != 0u) {
+        const uint32_t gap = process_now_ms - s_process_last_ms;
+        if (gap > s_process_gap_max_ms) s_process_gap_max_ms = gap;
+    }
+    s_process_last_ms = process_now_ms;
+    vesc_tx_service();
     for (;;) {
         uint16_t n = 0u;
         uint8_t slot = 0u;
@@ -1104,5 +1297,7 @@ void vesc_protocol_process_pending(void) {
         __enable_irq();
         s_link_last_ms = HAL_GetTick();
         process_top_packet(s_process_payload, n);
+        vesc_tx_service();
     }
+    vesc_tx_service();
 }

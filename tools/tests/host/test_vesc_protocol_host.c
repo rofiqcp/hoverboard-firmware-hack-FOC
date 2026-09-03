@@ -159,15 +159,18 @@ static bool transact(const uint8_t *p,uint16_t n,uint8_t *reply,uint16_t *rn){
     if(tx_capture_len==0u){*rn=0u;return true;}
     return decode_tx(reply,rn);
 }
-static bool pump_until_reply(uint32_t max_ms,uint8_t *reply,uint16_t *rn){
+static bool pump_until_cmd(uint32_t max_ms,uint8_t cmd,uint8_t *reply,uint16_t *rn){
     tx_capture_len=0u;
     for(uint32_t n=0;n<max_ms;n++){
         tick_ms++;
         vesc_protocol_process_pending();
         vesc_protocol_periodic(tick_ms);
-        if(tx_capture_len!=0u && decode_tx(reply,rn) && *rn>0u && reply[0]==COMM_DETECT_HALL_FOC)return true;
+        if(tx_capture_len!=0u && decode_tx(reply,rn) && *rn>0u && reply[0]==cmd)return true;
     }
     *rn=0u;return false;
+}
+static bool pump_until_reply(uint32_t max_ms,uint8_t *reply,uint16_t *rn){
+    return pump_until_cmd(max_ms,COMM_DETECT_HALL_FOC,reply,rn);
 }
 static void enqueue_only(const uint8_t *p,uint16_t n){
     uint8_t f[800];const uint16_t fn=make_frame(p,n,f);
@@ -397,6 +400,36 @@ int main(void){
     if(!transact(dhr,sizeof(dhr),r,&rn)||rn!=0u)return fail("right hall detect must start asynchronously");
     if(!pump_until_reply(14000u,r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]!=0u)return fail("right VESC Tool hall reply");
     if(store_count[1]!=st1||memcmp(oldhall1,confs[1].foc_hall_table,8)!=0)return fail("right detect must not apply/store mcconf");
+
+    /* VESC Tool Detect All (COMM 58): non-blocking on this bare-metal target,
+     * app outputs gated, dual Hall detection applied/stored, and an int16
+     * non-negative result is returned after both virtual motors complete. */
+    {
+        uint8_t da[22]={0}; int32_t ai=0;
+        da[ai++]=COMM_DETECT_APPLY_ALL_FOC;
+        da[ai++]=1u;
+        buffer_append_float32(da,50.0f,1e3f,&ai);
+        buffer_append_float32(da,-8.0f,1e3f,&ai);
+        buffer_append_float32(da,8.0f,1e3f,&ai);
+        buffer_append_float32(da,250.0f,1e3f,&ai);
+        buffer_append_float32(da,2500.0f,1e3f,&ai);
+        const unsigned b0=store_count[0], b1=store_count[1];
+        if(ai!=22 || !transact(da,(uint16_t)ai,r,&rn) || rn!=0u)return fail("detect all must start asynchronously");
+        for(int z=0;z<100;z++){tick_ms++;vesc_protocol_periodic(tick_ms);}
+        { uint8_t qv[1]={COMM_GET_VALUES}; if(!transact(qv,1u,r,&rn)||rn==0u||r[0]!=COMM_GET_VALUES)return fail("request/reply stalled during detect all"); }
+        if(!pump_until_cmd(28000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all result timeout");
+        { int32_t ri=1; if(buffer_get_int16(r,&ri)<0)return fail("detect all returned failure"); }
+        if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
+        for(int m=0;m<2;m++){
+            int valid=0;
+            for(int h=0;h<8;h++)if((uint8_t)confs[m].foc_hall_table[h]!=255u)valid++;
+            if(valid!=6 || confs[m].foc_sensor_mode!=FOC_SENSOR_MODE_HALL)return fail("detect all hall apply");
+        }
+        if(!nearf32(confs[0].l_in_current_min,-8.0f,0.01f)||!nearf32(confs[1].l_in_current_max,8.0f,0.01f))return fail("detect all input-current apply");
+        if(!nearf32(confs[0].foc_openloop_rpm,250.0f,0.01f)||!nearf32(confs[1].foc_sl_erpm,2500.0f,0.01f))return fail("detect all FOC setup fields");
+        uint8_t ena[6]={COMM_APP_DISABLE_OUTPUT,0u,0u,0u,0u,0u};
+        if(!transact(ena,sizeof(ena),r,&rn))return fail("re-enable app output");
+    }
     printf("VESC_PROTOCOL_HOST_PASS fw=6.00 can=2 rightIqInternal=%.2f localRpm=%.0f posL=%.0f posRinternal=%.0f hall=ok values=ok mcconf=rw\n",set_current[1],set_rpm[0],set_pos[0],set_pos[1]);
     return 0;
 }

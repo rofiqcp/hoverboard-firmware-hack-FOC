@@ -23,6 +23,8 @@ typedef struct {
 
 static app_configuration s_conf[2];
 static app_adc_state_t s_state[2];
+static volatile int8_t s_output_disable_mode = 0; /* 0 enabled, 1 timed, 2 forever */
+static volatile uint32_t s_output_disable_until_ms = 0u;
 static volatile float s_v1 = 0.0f;
 static volatile float s_v2 = 0.0f;
 static volatile float s_dec1 = 0.0f;
@@ -211,6 +213,8 @@ void app_vesc_init(void) {
     mcpwm_foc_vesc_timeout_configure(false, s_conf[0].timeout_msec, s_conf[0].timeout_brake_current);
     mcpwm_foc_vesc_timeout_configure(true, s_conf[1].timeout_msec, s_conf[1].timeout_brake_current);
     memset(s_state, 0, sizeof(s_state));
+    s_output_disable_mode = 0;
+    s_output_disable_until_ms = 0u;
 }
 
 static bool adc_app_enabled(const app_configuration *a);
@@ -248,6 +252,26 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current);
     memset(&s_state[second ? 1 : 0], 0, sizeof(s_state[0]));
     return true;
+}
+
+
+void app_vesc_disable_output(int32_t time_ms) {
+    if(time_ms==0){
+        s_output_disable_mode=0; s_output_disable_until_ms=0u;
+    }else if(time_ms<0){
+        s_output_disable_mode=2; s_output_disable_until_ms=0u;
+    }else{
+        s_output_disable_mode=1; s_output_disable_until_ms=HAL_GetTick()+(uint32_t)time_ms;
+    }
+}
+
+bool app_vesc_output_disabled(uint32_t now_ms) {
+    if(s_output_disable_mode==2) return true;
+    if(s_output_disable_mode==1){
+        if((int32_t)(now_ms-s_output_disable_until_ms)<0) return true;
+        s_output_disable_mode=0; s_output_disable_until_ms=0u;
+    }
+    return false;
 }
 
 static bool adc_app_enabled(const app_configuration *a) {
@@ -410,6 +434,7 @@ static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, 
 }
 
 void app_vesc_process(uint32_t now_ms) {
+    if(app_vesc_output_disabled(now_ms)) { mc_interface_select_motor_thread(1); return; }
     const float v1 = (float)adc_buffer.adc2_spare4 * (3.3f / 4095.0f); /* PA2 / ADC2 CH2 */
     const float v2 = (float)adc_buffer.adc2_spare5 * (3.3f / 4095.0f); /* PA3 / ADC2 CH3 */
     const bool local_adc = adc_app_enabled(&s_conf[0]);
@@ -424,4 +449,3 @@ void app_vesc_process(uint32_t now_ms) {
 
 float app_vesc_adc_decoded(bool second_channel) { return second_channel ? s_dec2 : s_dec1; }
 float app_vesc_adc_voltage(bool second_channel) { return second_channel ? s_v2 : s_v1; }
-bool app_vesc_adc_range_ok(void) { return s_range_ok; }

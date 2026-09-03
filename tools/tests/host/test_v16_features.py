@@ -26,9 +26,12 @@ assert 'period_for_filter' in mc and 'floor_period' in mc and 'm->m_hall_period_
 assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
 assert 'stop_zone' in mc and 'iq_setpoint_slew_step(m);' in mc and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in mc
 assert 'm->m_iq_set_q4==0 && m->m_iq_set_ramp_q16==0' in mc, 'speed STOP must release only after Iq reaches zero'
-assert 'speed PID\n     * produces an Iq/current request' in mc
+assert 'VESC speed PID -> Iq' in mc
 assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
 assert 'speed PI drives Vq directly' not in mc
+assert 'MCCONF_POSITION_PHASE_DEADBAND_MDEG' in mcc and 'MCCONF_POSITION_RUN_CURRENT_MAX_MA' in mcc and 'MCCONF_POSITION_BREAKAWAY_CURRENT_MA' in mcc
+assert 'normalized position PID -> Iq' in mc and 'm_position_prev_proc_phase' in mch
+assert 'actual electrical phase delta' in mc and 'm_position_kd_proc_phase_coeff_q4' in mch and 'm_position_motion_seen' in mch
 mi=(R/'Src/motor/mc_interface.c').read_text()
 assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrate_speed_pid' in mi
 
@@ -38,10 +41,10 @@ assert 'pass < 6u' in mc and 'const bool reverse = pass >= 3u' in mc
 assert 'k < 360u' in mc and '359u - k' in mc and 'HAL_Delay(5u)' in mc
 assert 'hall_detect_angle200' in mc and 'pass_n[h]' in mc and 'hall_detect_distance200' in mc
 assert 'forward_ref' in mc and 'reverse_ref' in mc and '> 4u' in mc and '> 8u' in mc
-assert 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp and 'Detect is intentionally not a store' in vp
-assert 'mc_interface_store_configuration_motor(second)' in vp and 'case COMM_SET_MCCONF:' in vp
+assert 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp and 'standalone detect is not a store' in vp
+assert 'mc_interface_store_configuration_motor(second)' in vp and 'case COMM_SET_MCCONF:' in vp and 'case COMM_DETECT_APPLY_ALL_FOC:' in vp
 assert 'm->m_iq_target_q4 != 0 || m->m_iq_set_q4 != 0' in mc and 'm->m_fault != FAULT_CODE_NONE' in mc
-assert 'test_hall_detect_repeat.py' in (R/'tools/run_all_checks.py').read_text()
+assert (R/'tools/tests/hardware/test_hall_detect_repeat.py').exists()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
 assert 'COMM_DETECT_HALL_FOC, 20.0)' in dual
 

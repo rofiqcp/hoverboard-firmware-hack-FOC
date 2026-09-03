@@ -12,9 +12,10 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf);
 bool app_vesc_store_configuration(bool second);
 bool app_vesc_load_configuration(bool second);
 void app_vesc_process(uint32_t now_ms);
+void app_vesc_disable_output(int32_t time_ms);
+bool app_vesc_output_disabled(uint32_t now_ms);
 
 float app_vesc_adc_decoded(bool second_channel);
 float app_vesc_adc_voltage(bool second_channel);
-bool app_vesc_adc_range_ok(void);
 
 #endif

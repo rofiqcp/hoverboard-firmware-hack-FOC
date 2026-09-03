@@ -39,14 +39,19 @@
 #define MCCONF_SPEED_KP_Q11                   200u /* 0.00200 */
 #define MCCONF_SPEED_KI_Q16                   200u /* 0.00200 */
 #define MCCONF_SPEED_KD_Q11                     0u
-#define MCCONF_POSITION_KP_Q11                  60u /* 0.060: ~0.24 A per 1 Hall count at 1 A limit */
+#define MCCONF_POSITION_KP_Q11                  25u /* 0.025: upstream VESC default position Kp */
 #define MCCONF_POSITION_KI_Q16                   0u
 #define MCCONF_POSITION_KD_Q11                   0u
 #define MCCONF_POSITION_KD_FILTER_Q16         13107u /* 0.20, VESC default D filter */
 /* Hall-count position safety/tuning. Position PID follows VESC normalized
  * current-output architecture, but this low-resolution steering actuator gets a
- * hard current cap and velocity damping so one-sector commands cannot run away. */
-#define MCCONF_POSITION_CURRENT_MAX_MA         1000u
+ * hardware-safe current cap and VESC process-D damping so one-sector commands cannot run away. */
+#define MCCONF_POSITION_CURRENT_MAX_MA          600u /* custom count-position ceiling */
+#define MCCONF_POSITION_RUN_CURRENT_MAX_MA      200u /* SET_POS tracking after first Hall motion */
+#define MCCONF_POSITION_BREAKAWAY_CURRENT_MA    600u /* measured left-motor static breakaway */
+#define MCCONF_POSITION_BREAKAWAY_KICK_MS       350u
+#define MCCONF_POSITION_BREAKAWAY_REARM_MS      600u
+#define MCCONF_POSITION_PHASE_DEADBAND_MDEG    30000u /* Hall-only resolution: +/- half one 60-deg sector */
 #define MCCONF_POSITION_SETTLE_CURRENT_MA        150u
 #define MCCONF_POSITION_SETTLE_MS                120u
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps

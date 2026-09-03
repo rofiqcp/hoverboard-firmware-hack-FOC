@@ -17,7 +17,7 @@ assert re.search(r'#define\s+MCCONF_HALL_TIMEOUT_TICKS\s+8000u',mcc)
 assert 'm_speed_target_rpm_q16' in mch and 'erpm_to_mech_rpm_q16' in mc
 assert 'measured_mech_rpm_q16' in mc
 assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
-assert 'measured_mech_rpm_q16(m, second) * pp' in mc
+assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 
 # Hall detect fixed phase must not be overwritten by rotating mode-4 updater.
@@ -48,9 +48,10 @@ assert 'post-6.00 fields' in fwfun and 'buffer_append_uint32' not in fwfun
 # Detect returns [cmd + 8 table + result], stays UART-responsive, and does not apply/store MC config.
 det=vp[vp.index('static uint8_t hall_detect_angle200'):vp.index('static int32_t q4_to_milliamps_normalized')]
 assert 'hall_detect_begin' in det and 'hall_detect_periodic' in det and 'uint8_t reply[10]' in det
-assert 'reply[9] = success ? 0u : 1u' in det and 'Detect is intentionally not a store' in det
+assert 'reply[9]=success?0u:1u' in det and 'standalone detect is not a store' in det
 assert 'mc_interface_release_motor()' in det and 'mcpwm_foc_vesc_override_clear(second)' in det
-assert 'mc_interface_store_configuration_motor(second)' not in det and 'uart_send_payload(reply, sizeof(reply))' in det
+assert 'COMM_DETECT_APPLY_ALL_FOC' in det and 'detect_all_apply_motor' in det
+assert 'mc_interface_store_configuration_motor(second)' in det and 'uart_send_payload(reply,sizeof(reply))' in det
 
 # Standard VESC position stays single-turn; project multi-turn uses CUSTOM_APP_DATA signed int32.
 assert 'case COMM_SET_POS:' in vp and 'COMM_CUSTOM_APP_DATA' in vp

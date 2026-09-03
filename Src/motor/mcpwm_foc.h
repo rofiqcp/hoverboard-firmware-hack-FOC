@@ -50,6 +50,10 @@ typedef struct {
     volatile int32_t m_position_target_counts;
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
+    /* Stock VESC COMM_SET_POS is single-turn electrical rotor position. Keep it
+     * separate from this project's long-range Hall-count position extension. */
+    volatile uint16_t m_pos_pid_set_phase;
+    volatile uint8_t m_pos_pid_phase_mode;
     volatile int16_t m_current_limit_q4;
     volatile int16_t m_input_current_max_q4;   /* positive DC-link draw limit */
     volatile int16_t m_input_current_regen_q4; /* magnitude of negative DC-link limit */
@@ -153,10 +157,21 @@ typedef struct {
     int32_t m_speed_integrator;
     int32_t m_speed_prev_error;
     int32_t m_position_integrator;
-    int16_t m_position_prev_error;
+    int16_t m_position_prev_error; /* retained for custom count diagnostics */
+    int32_t m_position_prev_error_mdeg;
     uint16_t m_position_dt_ticks;
     int32_t m_position_d_filter_q15;
+    int32_t m_position_d_proc_filter_q15;
+    uint16_t m_position_prev_proc_phase;
+    uint16_t m_position_proc_dt_ticks;
+    uint16_t m_position_breakaway_ticks;
+    uint16_t m_position_no_motion_ticks;
+    uint8_t m_position_motion_seen;
     uint16_t m_position_kd_filter_q16;
+    /* Precomputed p_pid_kd_proc process-derivative coefficient. This preserves
+     * VESC-scale sub-millith gain resolution without float math in the ISR. */
+    uint32_t m_position_kd_proc_coeff_q16;
+    uint16_t m_position_kd_proc_phase_coeff_q4;
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
@@ -235,7 +250,6 @@ void mcpwm_foc_release_motor(bool is_second_motor);
 void mcpwm_foc_vesc_timeout_configure(bool is_second_motor, uint32_t timeout_ms, float brake_current);
 void mcpwm_foc_vesc_override_touch(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active(bool is_second_motor);
-bool mcpwm_foc_vesc_override_active_any(void);
 bool mcpwm_foc_vesc_command_live(bool is_second_motor);
 void mcpwm_foc_vesc_override_clear(bool is_second_motor);
 void mcpwm_foc_energy_update(uint32_t now_ms);
@@ -246,7 +260,6 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
 
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
 float mcpwm_foc_get_tot_current_in_motor(bool is_second_motor);
-float mcpwm_foc_get_rpm_motor(bool is_second_motor); /* integer Hall mechanical RPM estimator */
 float mcpwm_foc_get_erpm_motor(bool is_second_motor);  /* VESC electrical RPM */
 float mcpwm_foc_get_motor_mechanical_rpm(bool is_second_motor);
 float mcpwm_foc_get_output_rpm(bool is_second_motor); /* after si_gear_ratio */
@@ -261,7 +274,6 @@ float mcpwm_foc_get_phase_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
-int32_t mcpwm_foc_get_position_counts(bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */

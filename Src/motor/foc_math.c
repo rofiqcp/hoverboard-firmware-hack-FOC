@@ -26,7 +26,6 @@ int16_t foc_sat_s16(int32_t x) {
     return (int16_t)x;
 }
 
-int32_t foc_abs_i32(int32_t x) { return x < 0 ? -x : x; }
 
 void foc_sin_cos_q15(uint16_t phase, int16_t *s, int16_t *c) {
     const uint8_t idx = (uint8_t)(phase >> 8);
@@ -71,7 +70,6 @@ void foc_inv_park(const foc_dq_t *vdvq, uint16_t phase, foc_ab_t *ab) {
     ab->beta  = foc_sat_s16((((int32_t)vdvq->d * s) + ((int32_t)vdvq->q * c)) >> 15);
 }
 
-void foc_lpf2_reset(foc_lpf2_fixed_t *f) { f->state_q16[0]=0; f->state_q16[1]=0; }
 
 void foc_lpf2_run(foc_lpf2_fixed_t *f, uint16_t coef, const foc_dq_t *in, foc_dq_t *out) {
     const int16_t u[2] = {in->q, in->d};
@@ -84,7 +82,6 @@ void foc_lpf2_run(foc_lpf2_fixed_t *f, uint16_t coef, const foc_dq_t *in, foc_dq
     }
 }
 
-void foc_pi_reset(foc_pi_fixed_t *pi) { pi->integrator = 0; pi->sat_hold = 0; }
 
 int16_t foc_pi_run(foc_pi_fixed_t *pi, int16_t err, uint16_t kp, uint16_t ki,
                    int16_t sat_max, int16_t sat_min) {

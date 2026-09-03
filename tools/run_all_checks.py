@@ -99,7 +99,8 @@ def check_static():
     assert '(((i_sum >> 16) << 1) + (int32_t)p_term) >> 1' in mathc, 'PI equation no longer matches generated PI_clamp_fixdt'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
-    assert 'HAL_UART_Transmit_DMA(&huart3, tx, i)' in vp, 'VESC reply path must use USART3 TX DMA'
+    assert 'VESC_TX_QUEUE_DEPTH' in vp and 'vesc_tx_service' in vp and 'HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n)' in vp, 'VESC reply path must use nonblocking USART3 TX DMA FIFO'
+    assert 'while (huart3.gState != HAL_UART_STATE_READY)' not in vp, 'VESC reply path must never busy-wait on UART TX'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
     assert 'COMM_DETECT_HALL_FOC' in vp and 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp, 'VESC-standard async Hall detect command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
@@ -175,7 +176,8 @@ def config_size_check():
 
 if __name__ == '__main__':
     check_static()
-    run([sys.executable,'-m','py_compile','tools/hoverserial.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/tests/host/test_vesc_dual.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/hardware/vesc_response_lab.py', 'tools/tests/hardware/vesc_manual_spin_monitor.py','tools/tests/hardware/test_hall_detect_repeat.py','tools/tests/hardware/test_duty_ramp100.py'])
+    py_files=sorted(str(p.relative_to(ROOT)) for p in (ROOT/'tools').rglob('*.py'))
+    run([sys.executable,'-m','py_compile',*py_files])
     run([sys.executable,'tools/tests/host/host_compile_check.py'])
     run([sys.executable,'tools/tests/host/test_foc_math.py'])
     run([sys.executable,'tools/tests/host/test_motor_control_v12.py'])

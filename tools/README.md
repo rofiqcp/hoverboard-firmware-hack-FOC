@@ -39,6 +39,7 @@ python3 tools/tests/hardware/test_vesc_tool_rt50.py /dev/ttyUSB0 --seconds 5 --h
 ```
 
 Hall detection repeat test dan duty/speed test berada di `tests/hardware/`; jalankan hanya saat roda aman untuk berputar.
+Script hardware yang menggerakkan motor harus dijalankan dengan `--arm` bila opsi tersebut tersedia.
 
 ## Aturan Folder
 

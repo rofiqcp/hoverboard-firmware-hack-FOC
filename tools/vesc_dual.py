@@ -243,6 +243,10 @@ class Diag:
     off_offset_samples: int | None = None
     off_settle_ticks: int | None = None
     off_offset_valid: bool | None = None
+    tx_queue_drops: int | None = None
+    tx_start_failures: int | None = None
+    rx_queue_highwater: int | None = None
+    process_gap_max_ms: int | None = None
 
     def short(self) -> str:
         return (
@@ -329,6 +333,12 @@ def parse_diag(payload: bytes) -> Diag:
         oo0, oo1, oodc, osamp, osettle, oval = struct.unpack_from(">3hHHB", payload, 178)
         ext.update(off_offset0=oo0, off_offset1=oo1, off_offset_dc=oodc,
                    off_offset_samples=osamp, off_settle_ticks=osettle, off_offset_valid=bool(oval))
+    if len(payload) >= 197:
+        txdrop, txfail = struct.unpack_from(">2I", payload, 189)
+        ext.update(tx_queue_drops=txdrop, tx_start_failures=txfail)
+    if len(payload) >= 205:
+        rxhi, gapmax = struct.unpack_from(">2I", payload, 197)
+        ext.update(rx_queue_highwater=rxhi, process_gap_max_ms=gapmax)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok),

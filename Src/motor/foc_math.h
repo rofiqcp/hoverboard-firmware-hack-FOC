@@ -35,15 +35,12 @@ typedef struct {
 } foc_abc_t;
 
 int16_t foc_sat_s16(int32_t x);
-int32_t foc_abs_i32(int32_t x);
 void foc_sin_cos_q15(uint16_t phase, int16_t *s, int16_t *c);
 void foc_clarke_ab_q4(int16_t ia_q4, int16_t ib_q4, foc_ab_t *out);
 void foc_clarke_bc_q4(int16_t ib_q4, int16_t ic_q4, foc_ab_t *out);
 void foc_park_q4(const foc_ab_t *ab, uint16_t phase, foc_dq_t *dq);
 void foc_inv_park(const foc_dq_t *vdvq, uint16_t phase, foc_ab_t *ab);
-void foc_lpf2_reset(foc_lpf2_fixed_t *f);
 void foc_lpf2_run(foc_lpf2_fixed_t *f, uint16_t coef, const foc_dq_t *in, foc_dq_t *out);
-void foc_pi_reset(foc_pi_fixed_t *pi);
 int16_t foc_pi_run(foc_pi_fixed_t *pi, int16_t err, uint16_t kp, uint16_t ki,
                    int16_t sat_max, int16_t sat_min);
 void foc_vector_limit(foc_dq_t *vdvq, int16_t max_mag);
