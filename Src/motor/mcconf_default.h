@@ -94,15 +94,18 @@
  * Remove a few ADC counts of amplifier noise without hiding real passive/regen
  * current changes when the wheel is back-driven manually. 4 counts = 0.08 A. */
 #define MCCONF_OFF_TELEM_DEADBAND_COUNTS              4
-#define MCCONF_OFF_TELEM_SETTLE_SAMPLES             800u /* 50 ms @16 kHz after bridge release */
+#define MCCONF_OFF_TELEM_SETTLE_SAMPLES           16000u /* 1 s @16 kHz: high-Z shunt common-mode benar-benar stabil */
 #define MCCONF_CURRENT_SLEW_A_PER_S              10u
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
 #define MCCONF_POLE_PAIRS_LEFT               15u
 #define MCCONF_POLE_PAIRS_RIGHT              15u
 #define MCCONF_HALL_INTERP_ENABLE              1u
-#define MCCONF_HALL_INTERP_ON_RPM              30
-#define MCCONF_HALL_INTERP_OFF_RPM             15
+/* VESC mcconf_default.h: foc_hall_interp_erpm default = 500 ERPM.
+ * Nilai runtime tetap berasal dari Motor Config dan diprecompute ke integer
+ * sebelum masuk ISR; jangan ubah menjadi mechanical RPM karena pole-pair bisa
+ * berbeda antar motor dan dapat diubah dari VESC Tool. */
+#define MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT    500u
 #define MCCONF_FOC_CONTROL_DIV                  3u
 /* Hall timeout must be longer than one Hall sector at low VESC ERPM.
  * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.

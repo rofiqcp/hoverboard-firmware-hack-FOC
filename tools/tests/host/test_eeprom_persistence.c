@@ -97,8 +97,8 @@ int main(void){
     cl.p_pid_kd_filter=0.37f; cr.p_pid_kd_filter=0.63f;
     cl.foc_duty_dowmramp_kp=23.4f; cl.foc_duty_dowmramp_ki=456.7f;
     cr.foc_duty_dowmramp_kp=17.8f; cr.foc_duty_dowmramp_ki=321.2f;
-    cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f; cl.foc_current_filter_const=0.0731f;
-    cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f;
+    cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f; cl.foc_current_filter_const=0.0731f; cl.foc_hall_interp_erpm=620.0f;
+    cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f; cr.foc_hall_interp_erpm=900.0f;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
     m_motor_1.m_kpq_q11=1111u; m_motor_1.m_kiq_q16=2222u;
@@ -180,15 +180,37 @@ int main(void){
     if(m_motor_2.m_conf.si_motor_poles!=14u || fabsf(m_motor_2.m_conf.si_gear_ratio-1.0f)>0.02f) return fail("right poles/gear persistence");
     if(fabsf(m_motor_1.m_conf.foc_current_filter_const-0.0731f)>0.00011f) return fail("left telemetry filter persistence");
     if(fabsf(m_motor_2.m_conf.foc_current_filter_const-0.2197f)>0.00011f) return fail("right telemetry filter persistence");
+    if(fabsf(m_motor_1.m_conf.foc_hall_interp_erpm-620.0f)>0.5f || fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-900.0f)>0.5f)
+        return fail("Hall interpolation ERPM persistence");
+    if(m_motor_1.m_hall_interp_erpm!=620u || m_motor_2.m_hall_interp_erpm!=900u ||
+       m_motor_1.m_hall_interp_max_ticks==0u || m_motor_2.m_hall_interp_max_ticks==0u ||
+       m_motor_1.m_hall_rate_min_step==0u || m_motor_2.m_hall_rate_min_step==0u)
+        return fail("Hall interpolation runtime coefficient restore");
     if(m_motor_1.m_kpq_q11!=1111u || m_motor_1.m_kiq_q16!=2222u || m_motor_1.m_kdp_q11!=111u) return fail("left gains persistence");
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
     if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
     if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_rpm!=8u) return fail("right speed persistence");
 
+    /* V29 (0x601B) sudah punya seluruh safety persistence tetapi belum punya
+     * slot foc_hall_interp_erpm. Migrasi harus memakai default upstream 500
+     * ERPM, membangun koefisien runtime, lalu menulis schema/slot baru. */
+    ee_value[43]=0x601Bu; ee_value[44]=0x601Bu;
+    ee_valid[179]=ee_valid[180]=0u;
+    mcpwm_foc_init();
+    if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+        return fail("V29 migration load");
+    if(fabsf(m_motor_1.m_conf.foc_hall_interp_erpm-500.0f)>0.5f ||
+       fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-500.0f)>0.5f ||
+       m_motor_1.m_hall_interp_erpm!=500u || m_motor_2.m_hall_interp_erpm!=500u)
+        return fail("V29 Hall interpolation migration default/runtime");
+    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu || !ee_valid[179] || !ee_valid[180] ||
+       ee_value[179]!=500u || ee_value[180]!=500u)
+        return fail("V29 migration Hall slots/signature");
+
     /* Simulasikan upgrade image V28 (0x601A), yaitu firmware yang sudah punya
      * filter x10000 tetapi belum punya slot Vin/watt/temperatur. Field lama
      * harus tetap utuh, safety baru memakai default aman, lalu schema ditulis
-     * ulang atomik menjadi 0x601B. */
+     * ulang atomik menjadi 0x601C. */
     ee_value[43]=0x601Au; ee_value[44]=0x601Au;
     for(unsigned i=163u;i<179u;i++)ee_valid[i]=0u;
     mcpwm_foc_init();
@@ -202,9 +224,11 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.l_min_vin-MCCONF_L_MIN_VIN)>0.011f ||
        fabsf(m_motor_2.m_conf.l_temp_fet_end-MCCONF_L_TEMP_FET_END)>0.051f)
         return fail("V28 safety default migration");
-    if(ee_value[43]!=0x601Bu || ee_value[44]!=0x601Bu)
+    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu)
         return fail("V28 migration signature");
     for(unsigned i=163u;i<179u;i++)if(!ee_valid[i])return fail("V28 migration safety slots");
+    if(!ee_valid[179] || !ee_valid[180] || ee_value[179]!=500u || ee_value[180]!=500u)
+        return fail("V28 migration Hall interpolation slots");
 
     /* V27 (0x6019) juga harus tetap diterima. Hilangkan slot filter dan safety
      * untuk meniru image lama, lalu pastikan keduanya dibuat kembali. */
@@ -214,7 +238,8 @@ int main(void){
     mcpwm_foc_init();
     if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
         return fail("V27 migration load");
-    if(ee_value[43]!=0x601Bu || ee_value[44]!=0x601Bu || !ee_valid[161] || !ee_valid[162])
+    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu || !ee_valid[161] || !ee_valid[162] ||
+       !ee_valid[179] || !ee_valid[180])
         return fail("V27 migration rewrite/signature");
 
     /* Independent signatures: corrupt only right signature; left remains valid. */

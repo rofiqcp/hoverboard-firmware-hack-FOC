@@ -286,9 +286,9 @@ int main(void){
     if(A2BIT_CONV!=50 || FOC_CURRENT_Q4_PER_A!=800)return fail("EFeru current unit 50count/A Q4=800/A");
     mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
 
-    /* Match upstream VESC: public motor-current telemetry is exactly zero while
-     * released. The separate high-Z offset/raw ADC state remains diagnostic-only
-     * and must never arm PWM or feed over-current protection. */
+    /* Telemetry sensor harus tetap live ketika bridge released. Baseline high-Z
+     * dipelajari terpisah dari offset kontrol, dan perubahan ADC saat idle harus
+     * muncul di Id/Iq/Ibattery tanpa pernah mengaktifkan PWM/proteksi arus. */
     mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     mc_configuration telem=m_motor_1.m_conf; telem.foc_current_filter_const=0.10f;
     mcpwm_foc_set_configuration(&telem,false);
@@ -298,19 +298,20 @@ int main(void){
     LEFT_TIM->BDTR&=~TIM_BDTR_MOE; RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
     /* Learn the actual high-Z amplifier zero after startup. */
     adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
-    for(int i=0;i<280;i++)DMA1_Channel1_IRQHandler();
+    for(int i=0;i<(int)MCCONF_OFF_TELEM_SETTLE_SAMPLES+300;i++)DMA1_Channel1_IRQHandler();
     if(!m_motor_1.m_off_offset_valid)return fail("OFF telemetry offset did not calibrate");
     mc_values off0; mcpwm_foc_get_values(&off0,false);
     if(fabsf(off0.current_in)>0.05f || fabsf(off0.id)+fabsf(off0.iq)>0.10f)return fail("OFF baseline not near zero");
-    /* Simulate a manual back-drive/raw ADC change. Standard VESC telemetry must
-     * still remain zero because the motor is released; custom diag owns raw data. */
+    /* Simulasikan perubahan sensor saat manual back-drive. COMM_GET_VALUES harus
+     * memperlihatkan perubahan nyata walaupun state motor tetap OFF. */
     m_motor_1.m_hall_direction=1; m_motor_1.m_hall_ticks=0u; m_motor_1.m_rpm=1;
     adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
     for(int i=0;i<120;i++)DMA1_Channel1_IRQHandler();
     mc_values offv; mcpwm_foc_get_values(&offv,false);
     if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_vd!=0 || m_motor_1.m_vq!=0)return fail("undriven telemetry must keep bridge/control off");
-    if(fabsf(offv.current_in)>0.001f)return fail("VESC OFF Ibattery must be zero");
-    if(fabsf(offv.id)+fabsf(offv.iq)>0.001f)return fail("VESC OFF Id/Iq must be zero");
+    if(fabsf(offv.current_in)<0.01f)return fail("OFF live Ibattery telemetry missing");
+    if(fabsf(offv.id)+fabsf(offv.iq)<0.01f)return fail("OFF live Id/Iq telemetry missing");
+    if(fabsf(offv.current_in)>2.0f || fabsf(offv.id)+fabsf(offv.iq)>3.0f)return fail("OFF live current telemetry unreasonable");
     if(m_motor_1.m_current_trip_count!=0u)return fail("OFF telemetry must never feed over-current protection");
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("OFF telemetry must not arm bridge");
     if(m_motor_1.m_telem_avg_samples!=0u)return fail("COMM_GET_VALUES must read/reset current average window");

@@ -104,4 +104,5 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_sector_brake=1 position_cap=1')
+assert 'Jangan hapus nilai telemetry itu' in mc, 'idle live current telemetry path missing'
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_sector_brake=1 position_cap=1')

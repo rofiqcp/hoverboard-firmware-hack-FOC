@@ -1280,8 +1280,17 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             if (n >= 22u) {
                 uint16_t fa=buffer_get_uint16(d,&k);
                 if(fa<1u)fa=1u;
+                /* Custom tuning exposes Q16, while the standard VESC 6.00
+                 * MC-config wire/persistence field is float16 scale 1e4.
+                 * Canonicalize the mirrored MC field to the nearest 1e-4 grid
+                 * so GET_TUNING -> SET_TUNING(same) is idempotent and a
+                 * subsequent GET_MCCONF/reboot cannot drift by one LSB due to
+                 * float truncation (e.g. 0.1018 -> 0.1017). */
                 m->m_telem_current_filter_q16=fa;
-                m->m_conf.foc_current_filter_const=(float)fa/65535.0f;
+                uint32_t fx10000=((uint32_t)fa*10000u+32767u)/65535u;
+                if(fx10000<10u)fx10000=10u;
+                if(fx10000>10000u)fx10000=10000u;
+                m->m_conf.foc_current_filter_const=(float)fx10000/10000.0f;
                 if(n>=23u)store=d[22]!=0u;
             } else if (n >= 21u) store=d[20]!=0u;
             if (store) (void)mc_interface_store_configuration_motor(second);

@@ -121,9 +121,12 @@ enum {
     EE_R_EXT4_VIN_MIN_CV = 171, EE_R_EXT4_VIN_MAX_CV,
     EE_R_EXT4_TEMP_START_X10, EE_R_EXT4_TEMP_END_X10,
     EE_R_EXT4_WATT_MAX_X10_LO, EE_R_EXT4_WATT_MAX_X10_HI,
-    EE_R_EXT4_WATT_REGEN_X10_LO, EE_R_EXT4_WATT_REGEN_X10_HI
+    EE_R_EXT4_WATT_REGEN_X10_LO, EE_R_EXT4_WATT_REGEN_X10_HI,
+    /* V29+: standard VESC foc_hall_interp_erpm, one word per motor. */
+    EE_L_EXT5_HALL_INTERP_ERPM = 179, EE_R_EXT5_HALL_INTERP_ERPM = 180
 };
-#define EE_CFG_SIGNATURE_VALUE 0x601Bu
+#define EE_CFG_SIGNATURE_VALUE 0x601Cu
+#define EE_CFG_SIGNATURE_V29   0x601Bu /* before foc_hall_interp_erpm persistence */
 #define EE_CFG_SIGNATURE_V28   0x601Au /* before Vin/watt/temperature safety persistence */
 #define EE_CFG_SIGNATURE_V27   0x6019u /* before exact x10000 telemetry-filter persistence */
 #define EE_CFG_SIGNATURE_V26   0x6018u /* before battery-cut/current-scale/speed/wheel persistence */
@@ -196,6 +199,7 @@ bool mc_interface_store_configuration_motor(bool second) {
     const uint8_t bat_ah_slot = second ? EE_R_EXT2_BAT_AH_X100 : EE_L_EXT2_BAT_AH_X100;
     const uint8_t telem_filter_slot = second ? EE_R_EXT3_TELEM_FILTER_X10000 : EE_L_EXT3_TELEM_FILTER_X10000;
     const uint8_t safety_base = second ? EE_R_EXT4_VIN_MIN_CV : EE_L_EXT4_VIN_MIN_CV;
+    const uint8_t hall_interp_slot = second ? EE_R_EXT5_HALL_INTERP_ERPM : EE_L_EXT5_HALL_INTERP_ERPM;
     const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
     int32_t ca = (int32_t)(m->m_conf.l_current_max * 100.0f + 0.5f);
     if (ca < 1) ca = 1;
@@ -350,6 +354,13 @@ bool mc_interface_store_configuration_motor(bool second) {
         ok &= ee_write_u32_pair((uint8_t)(safety_base+4u),wmax10);
         ok &= ee_write_u32_pair((uint8_t)(safety_base+6u),wregen10);
     }
+    {
+        float hi=m->m_conf.foc_hall_interp_erpm;
+        if(!(hi>=0.0f && hi<=MCCONF_L_MAX_ERPM)) hi=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
+        uint32_t erpm=(uint32_t)(hi+0.5f);
+        if(erpm>65535u)erpm=65535u;
+        ok &= ee_write_slot(hall_interp_slot,(uint16_t)erpm);
+    }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
     ok &= ee_write_slot(second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE, EE_CFG_SIGNATURE_VALUE);
@@ -363,7 +374,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||
         !ee_read_slot(sig_slot, &sig) ||
-        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V28 && sig != EE_CFG_SIGNATURE_V27 && sig != EE_CFG_SIGNATURE_V26 && sig != EE_CFG_SIGNATURE_V25 && sig != EE_CFG_SIGNATURE_V24 && sig != EE_CFG_SIGNATURE_V23 && sig != EE_CFG_SIGNATURE_V22 && sig != EE_CFG_SIGNATURE_V21 && sig != EE_CFG_SIGNATURE_V20 && sig != EE_CFG_SIGNATURE_V19 &&
+        (sig != EE_CFG_SIGNATURE_VALUE && sig != EE_CFG_SIGNATURE_V29 && sig != EE_CFG_SIGNATURE_V28 && sig != EE_CFG_SIGNATURE_V27 && sig != EE_CFG_SIGNATURE_V26 && sig != EE_CFG_SIGNATURE_V25 && sig != EE_CFG_SIGNATURE_V24 && sig != EE_CFG_SIGNATURE_V23 && sig != EE_CFG_SIGNATURE_V22 && sig != EE_CFG_SIGNATURE_V21 && sig != EE_CFG_SIGNATURE_V20 && sig != EE_CFG_SIGNATURE_V19 &&
          sig != EE_CFG_SIGNATURE_V18 && sig != EE_CFG_SIGNATURE_V17 && sig != EE_CFG_SIGNATURE_V16)) {
         return false;
     }
@@ -372,6 +383,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const bool migrate_position_pid = (sig == EE_CFG_SIGNATURE_V21 || sig == EE_CFG_SIGNATURE_V18 || sig == EE_CFG_SIGNATURE_V17 || sig == EE_CFG_SIGNATURE_V16);
     const bool migrate_telem_filter = (sig != EE_CFG_SIGNATURE_VALUE);
     const bool migrate_mc_extension = (sig != EE_CFG_SIGNATURE_VALUE);
+    const bool migrate_hall_interp = (sig != EE_CFG_SIGNATURE_VALUE);
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
@@ -388,6 +400,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const uint8_t bat_ah_slot = second ? EE_R_EXT2_BAT_AH_X100 : EE_L_EXT2_BAT_AH_X100;
     const uint8_t telem_filter_slot = second ? EE_R_EXT3_TELEM_FILTER_X10000 : EE_L_EXT3_TELEM_FILTER_X10000;
     const uint8_t safety_base = second ? EE_R_EXT4_VIN_MIN_CV : EE_L_EXT4_VIN_MIN_CV;
+    const uint8_t hall_interp_slot = second ? EE_R_EXT5_HALL_INTERP_ERPM : EE_L_EXT5_HALL_INTERP_ERPM;
     uint16_t v = 0u;
     uint8_t hall[8];
     for (uint8_t i = 0u; i < 8u; ++i) {
@@ -397,7 +410,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     if (!hall_table_sane(hall)) return false;
     for (uint8_t i = 0u; i < 8u; ++i) m->m_conf.foc_hall_table[i] = hall[i];
 
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24 || sig == EE_CFG_SIGNATURE_V23) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24 || sig == EE_CFG_SIGNATURE_V23) {
         if (ee_read_slot(pole_slot, &v)) {
             const uint8_t poles=(uint8_t)(v & 0xffu);
             const uint8_t fq=(uint8_t)(v >> 8);
@@ -411,7 +424,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         if (ee_read_slot(gear_slot, &v) && v > 0u) m->m_conf.si_gear_ratio=(float)v/64.0f;
         m->m_conf.foc_current_filter_const=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28) {
         if (!ee_read_slot(telem_filter_slot, &v) || v < 10u || v > 10000u) return false;
         m->m_conf.foc_current_filter_const=(float)v/10000.0f;
     } else if (migrate_telem_filter) {
@@ -439,7 +452,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.l_current_min = -m->m_conf.l_current_max;
         m->m_current_limit_q4 = (int16_t)((int32_t)v * A2BIT_CONV * 16 / 100);
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25 || sig == EE_CFG_SIGNATURE_V24) {
         uint16_t e[6]; bool ext_ok=true;
         for(uint8_t i=0u;i<6u;++i) ext_ok &= ee_read_slot((uint8_t)(ext_base+i),&e[i]);
         if(ext_ok){
@@ -456,7 +469,7 @@ bool mc_interface_load_configuration_motor(bool second) {
             if(e[5]>0u)m->m_conf.foc_duty_dowmramp_ki=(float)e[5]/10.0f;
         }
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26 || sig == EE_CFG_SIGNATURE_V25) {
         uint16_t x[3]; bool io_ok=true;
         for(uint8_t i=0u;i<3u;++i)io_ok &= ee_read_slot((uint8_t)(io_base+i),&x[i]);
         if(io_ok){
@@ -466,12 +479,12 @@ bool mc_interface_load_configuration_motor(bool second) {
             if(x[2]>=1u && x[2]<=2000u)m->m_conf.m_duty_ramp_step=(float)x[2]/10000.0f;
         }
     }
-    if ((sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26) && ee_read_slot(ccmin_slot,&v) && v>=1u && v<=100u) {
+    if ((sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27 || sig == EE_CFG_SIGNATURE_V26) && ee_read_slot(ccmin_slot,&v) && v>=1u && v<=100u) {
         m->m_conf.cc_min_current=(float)v/100.0f;
     } else if (sig != EE_CFG_SIGNATURE_VALUE) {
         m->m_conf.cc_min_current=MCCONF_CC_MIN_CURRENT;
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29 || sig == EE_CFG_SIGNATURE_V28 || sig == EE_CFG_SIGNATURE_V27) {
         uint16_t x[7]; bool ext2_ok=true;
         for(uint8_t i=0u;i<7u;++i)ext2_ok &= ee_read_slot((uint8_t)(ext2_base+i),&x[i]);
         if(ext2_ok){
@@ -506,7 +519,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.si_battery_cells=BAT_CELLS;
         m->m_conf.si_battery_ah=0.0f;
     }
-    if (sig == EE_CFG_SIGNATURE_VALUE) {
+    if (sig == EE_CFG_SIGNATURE_VALUE || sig == EE_CFG_SIGNATURE_V29) {
         uint16_t vmin_cv=0u,vmax_cv=0u,tsraw=0u,teraw=0u;
         uint32_t wmax10=0u,wregen10=0u;
         if(!ee_read_slot(safety_base+0u,&vmin_cv) || !ee_read_slot(safety_base+1u,&vmax_cv) ||
@@ -523,6 +536,14 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.l_min_vin=MCCONF_L_MIN_VIN; m->m_conf.l_max_vin=MCCONF_L_MAX_VIN;
         m->m_conf.l_temp_fet_start=MCCONF_L_TEMP_FET_START; m->m_conf.l_temp_fet_end=MCCONF_L_TEMP_FET_END;
         m->m_conf.l_watt_max=MCCONF_L_WATT_MAX; m->m_conf.l_watt_min=MCCONF_L_WATT_MIN;
+    }
+    if (sig == EE_CFG_SIGNATURE_VALUE) {
+        if(!ee_read_slot(hall_interp_slot,&v) || v>(uint16_t)MCCONF_L_MAX_ERPM) return false;
+        m->m_conf.foc_hall_interp_erpm=(float)v;
+    } else {
+        /* Semua image sampai V29 menyerialkan field ini ke VESC Tool tetapi
+         * belum menyimpannya. Migrasikan deterministik ke default upstream. */
+        m->m_conf.foc_hall_interp_erpm=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
     }
     m->m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
     m->m_conf.m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
@@ -691,7 +712,8 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_duty_kp_q12_per_permille=(uint32_t)(dkp*kscale+0.5f);
         m->m_duty_ki_q12_per_permille=(uint32_t)(dki*dt*kscale+0.5f);
     }
-    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension) {
+    mcpwm_foc_refresh_hall_interpolation(second);
+    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp) {
         /* Rewrite only after a complete successful load; signature is written last. */
         (void)mc_interface_store_configuration_motor(second);
     }

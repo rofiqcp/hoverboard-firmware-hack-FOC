@@ -531,11 +531,11 @@ def cmd_hall_phase(args, link: VescDual) -> int:
     seq0 = before.hall_sequence_rejects if before.hall_sequence_rejects is not None else before.hall_invalid
     per0 = before.hall_period_rejects or 0
     trip0 = before.current_trips
+    pos0 = before.position
     seen: set[int] = set()
     checked = 0
     max_center_err = 0.0
     max_phase_use_err = 0.0
-    worst = None
     sender = lambda: send_one(link, motor, COMM_SET_RPM, erpm)
     start = time.monotonic()
     try:
@@ -566,8 +566,15 @@ def cmd_hall_phase(args, link: VescDual) -> int:
                         seen.add(d.hall); checked += 1
                         max_center_err = max(max_center_err, center_err)
                         max_phase_use_err = max(max_phase_use_err, phase_use_err)
-                        if center_err > 42.0 or phase_use_err > 3.0:
-                            worst = (d.hall, table_angle, center_err, phase_use_err, d.erpm)
+                        # Jangan jadikan jumlah state yang tertangkap serial sebagai bukti
+                        # coverage. Pada 750 ERPM ada ~75 edge Hall/s, sedangkan satu
+                        # transaksi diagnostic besar hanya puluhan Hz sehingga sampling
+                        # dapat alias tepat ke 2 state. VESC juga rate-limit koreksi Hall;
+                        # sesaat setelah edge, fase yang dipakai boleh tertinggal dari
+                        # center sektor. Yang wajib: FOC benar-benar memakai phase Hall,
+                        # tidak keluar lebih dari satu sektor, dan ISR menerima edge tanpa
+                        # reject. Coverage final dibuktikan dari counter posisi ISR.
+                        if center_err > 70.0 or phase_use_err > 3.0:
                             print(f"HALL_PHASE_FAIL state={d.hall} table={table_angle}/200 center_err={center_err:.1f}deg phase_use_err={phase_use_err:.1f}deg erpm={d.erpm}")
                             return 2
                 time.sleep(0.04)
@@ -578,11 +585,13 @@ def cmd_hall_phase(args, link: VescDual) -> int:
     after = link.diag(is_right)
     seq1 = after.hall_sequence_rejects if after.hall_sequence_rejects is not None else after.hall_invalid
     per1 = after.hall_period_rejects or 0
-    print(f"HALL_PHASE_RESULT motor={motor} cmd={erpm:+d} samples={checked} states={sorted(seen)} "
-          f"max_center_err={max_center_err:.1f}deg max_phase_use_err={max_phase_use_err:.2f}deg "
-          f"seq_reject={seq0}->{seq1} period_reject={per0}->{per1}")
-    if checked < 10 or len(seen) < 4:
-        print("HALL_PHASE_FAIL coverage kurang")
+    edge_delta = abs(int(after.position) - int(pos0))
+    print(f"HALL_PHASE_RESULT motor={motor} cmd={erpm:+d} samples={checked} sampled_states={sorted(seen)} "
+          f"accepted_edges={edge_delta} max_center_err={max_center_err:.1f}deg "
+          f"max_phase_use_err={max_phase_use_err:.2f}deg seq_reject={seq0}->{seq1} "
+          f"period_reject={per0}->{per1}")
+    if checked < 4 or edge_delta < 6:
+        print(f"HALL_PHASE_FAIL coverage kurang: samples={checked} accepted_edges={edge_delta}")
         return 2
     if seq1 != seq0:
         print("HALL_PHASE_FAIL ada electrical Hall sequence reject")
@@ -611,22 +620,28 @@ def cmd_wiring_check(args, link: VescDual) -> int:
         print("WIRING_CHECK_FAIL Detect All returned error")
         return 2
     for motor, is_right in (("left", False), ("right", True)):
+        motor_rc = 0
         d=link.diag(is_right)
         ok,why=hall_table_valid(d.hall_table)
         if not ok or not d.hall_store_ok:
-            print(f"WIRING_CHECK_FAIL {motor}: Hall table/persistence {why}"); rc=2; continue
+            print(f"WIRING_CHECK_FAIL {motor}: Hall table/persistence {why}")
+            rc=2
+            continue
         print(f"{motor.upper()} Hall aktif+stored {d.hall_table}")
         for amps in (0.10, -0.10):
             print(f"=== {motor.upper()} CURRENT {amps:+.2f} A ===")
             class C: pass
             c=C(); c.arm=True; c.motor=motor; c.amps=amps; c.seconds=0.8; c.hz=50.0
-            if cmd_current(c, link): rc=2; break
-        if rc: continue
-        print(f"=== {motor.upper()} HALL/FOC PHASE +750 ERPM ===")
-        class P: pass
-        p=P(); p.arm=True; p.motor=motor; p.erpm=750.0; p.mech_rpm=None; p.seconds=2.0; p.hz=40.0
-        if cmd_hall_phase(p, link): rc=2
+            if cmd_current(c, link):
+                motor_rc=2
+                break
+        if motor_rc == 0:
+            print(f"=== {motor.upper()} HALL/FOC PHASE +750 ERPM ===")
+            class P: pass
+            p=P(); p.arm=True; p.motor=motor; p.erpm=750.0; p.mech_rpm=None; p.seconds=2.0; p.hz=40.0
+            if cmd_hall_phase(p, link): motor_rc=2
         release_one(link,motor)
+        if motor_rc: rc=2
     print("WIRING_CHECK_RESULT:", "PASS - wiring learned and low-energy direction/current checks passed" if rc==0 else "FAIL - jangan gunakan normal drive sebelum diperbaiki")
     return rc
 

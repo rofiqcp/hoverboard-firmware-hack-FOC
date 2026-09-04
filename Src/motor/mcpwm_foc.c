@@ -288,7 +288,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_current_ki = 266.710f;
     c->foc_current_filter_const = MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
     c->foc_openloop_rpm = (float)MCCONF_OPENLOOP_RPM_DEFAULT;
-    c->foc_hall_interp_erpm = 0.0f;
+    c->foc_hall_interp_erpm = (float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
     c->s_pid_ramp_erpms_s = (float)MCCONF_SPEED_RAMP_ERPMS_S;
     c->s_pid_min_erpm = (float)MCCONF_SPEED_RELEASE_ERPM;
     c->s_pid_allow_braking = true;
@@ -312,6 +312,38 @@ static void conf_defaults(mc_configuration *c, bool second) {
 
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool second) {
     if (conf) conf_defaults(conf, second);
+}
+
+static void hall_interp_recompute(mcpwm_foc_motor_t *m) {
+    if (!m) return;
+    float erpm_f=m->m_conf.foc_hall_interp_erpm;
+    if (!(erpm_f >= 0.0f && erpm_f <= MCCONF_L_MAX_ERPM))
+        erpm_f=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
+    uint32_t erpm=(uint32_t)(erpm_f+0.5f);
+    if (erpm>65535u) erpm=65535u;
+    m->m_hall_interp_erpm=(uint16_t)erpm;
+
+    /* VESC foc_correct_hall(): interpolation is disabled when
+     * 10*PWM_FREQ/max(edge_age,last_period) falls below foc_hall_interp_erpm.
+     * Precompute the equivalent tick boundary so the 16-kHz ISR needs no divide. */
+    if(erpm==0u){
+        m->m_hall_interp_max_ticks=MCCONF_HALL_TIMEOUT_TICKS;
+        m->m_hall_rate_min_step=1u;
+    }else{
+        uint32_t ticks=((uint32_t)PWM_FREQ*10u)/erpm;
+        if(ticks<1u)ticks=1u;
+        if(ticks>MCCONF_HALL_TIMEOUT_TICKS)ticks=MCCONF_HALL_TIMEOUT_TICKS;
+        m->m_hall_interp_max_ticks=(uint16_t)ticks;
+        /* Upstream rate limiter: max(hall_erpm, interp_erpm) * 1.5. */
+        uint32_t step=((uint64_t)erpm*65536u*3u)/(60u*(uint32_t)PWM_FREQ*2u);
+        if(step<1u)step=1u;
+        if(step>32767u)step=32767u;
+        m->m_hall_rate_min_step=(uint16_t)step;
+    }
+}
+
+void mcpwm_foc_refresh_hall_interpolation(bool second) {
+    hall_interp_recompute(mcpwm_foc_get_motor(second));
 }
 
 static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
@@ -416,6 +448,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_duty_ramp_step_permille=(uint16_t)(MCCONF_DUTY_RAMP_STEP_DEFAULT*1000.0f+0.5f);
     speed_pid_recompute_coeff(m);
     position_pid_recompute_coeff(m);
+    hall_interp_recompute(m);
     m->m_abs_current_limit_counts=(int16_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV+0.5f);
     m->m_duty_limit_permille=(int16_t)(MCCONF_L_MAX_DUTY*1000.0f+0.5f);
     m->m_telem_current_filter_q16=(uint16_t)(MCCONF_FOC_TELEMETRY_FILTER_DEFAULT*65535.0f+0.5f);
@@ -527,6 +560,8 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
      * standard MC-config field control monitoring smoothness only. */
     if (!(next.foc_current_filter_const >= 0.001f && next.foc_current_filter_const <= 1.0f))
         next.foc_current_filter_const=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+    if (!(next.foc_hall_interp_erpm >= 0.0f && next.foc_hall_interp_erpm <= MCCONF_L_MAX_ERPM))
+        next.foc_hall_interp_erpm=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
     if (!(next.p_pid_kd_filter >= 0.0f && next.p_pid_kd_filter <= 1.0f))
         next.p_pid_kd_filter=(float)MCCONF_POSITION_KD_FILTER_Q16/65536.0f;
     const bool poles_changed = m->m_conf.si_motor_poles != next.si_motor_poles;
@@ -537,6 +572,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         for (uint8_t h=0u;h<8u;++h) next.foc_hall_table[h]=m->m_conf.foc_hall_table[h];
     }
     m->m_conf = next;
+    hall_interp_recompute(m);
     if (poles_changed) {
         /* A live pole-count change would instantly rescale the speed loop.
          * Release first, matching upstream's stop-on-structural-config-change policy. */
@@ -1148,9 +1184,10 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                     uint32_t rs = (uint32_t)(((uint64_t)sector * 3u + raw_period) /
                                              ((uint64_t)raw_period * 2u));
                     if (rs == 0u) rs = 1u;
-                    const uint32_t min_erpm=(uint32_t)MCCONF_HALL_INTERP_ON_RPM*(uint32_t)motor_pole_pairs(second);
-                    uint32_t min_step=(uint32_t)((min_erpm*65536u)/(60u*PWM_FREQ));
-                    if (min_step == 0u) min_step = 1u;
+                    /* Minimum rate follows VESC foc_correct_hall exactly:
+                     * max(hall_erpm, foc_hall_interp_erpm) * dt * 1.5.
+                     * m_hall_rate_min_step is precomputed from Motor Config. */
+                    const uint32_t min_step=m->m_hall_rate_min_step?m->m_hall_rate_min_step:1u;
                     if (rs < min_step) rs = min_step;
                     if (rs > 32767u) rs = 32767u;
                     m->m_hall_rate_limit_step=(uint16_t)rs;
@@ -1203,9 +1240,19 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
         m->m_rpm = 0;
     }
 
-    const int16_t abs_rpm = (int16_t)abs(m->m_rpm);
-    if (abs_rpm >= MCCONF_HALL_INTERP_ON_RPM) m->m_hall_interp_active = 1u;
-    else if (abs_rpm <= MCCONF_HALL_INTERP_OFF_RPM) m->m_hall_interp_active = 0u;
+    /* VESC uses electrical RPM and max(time since edge,last edge period), not
+     * mechanical RPM hysteresis. Compare ticks against a precomputed boundary
+     * to avoid integer division in the 16-kHz ISR. This also disables
+     * interpolation naturally when the wheel slows/stops between Hall edges. */
+    if (m->m_hall_direction != 0 && m->m_hall_period > 0u &&
+        m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
+        uint16_t hall_age=m->m_hall_ticks;
+        if(hall_age<m->m_hall_period)hall_age=m->m_hall_period;
+        m->m_hall_interp_active=(uint8_t)(m->m_hall_interp_erpm==0u ||
+                                         hall_age<=m->m_hall_interp_max_ticks);
+    } else {
+        m->m_hall_interp_active=0u;
+    }
 
     uint16_t desired = m->m_phase_hall;
     if (valid) {
@@ -1226,10 +1273,15 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
             const int16_t abs_interp_err = interp_center_err < 0 ?
                                            (int16_t)-interp_center_err : interp_center_err;
 
-            if (abs_interp_err < max_interp_err) {
-                /* Sama seperti foc_correct_hall VESC 6.00: selama estimator
-                 * masih <30 deg dari center Hall, lanjutkan interpolasi 60 deg
-                 * berdasarkan period sector terakhir. */
+            const bool err_same_direction=
+                (interp_center_err>0 && m->m_hall_direction>0) ||
+                (interp_center_err<0 && m->m_hall_direction<0);
+            if (abs_interp_err < max_interp_err || !err_same_direction) {
+                /* foc_correct_hall VESC: interpolate when error is <30 deg OR
+                 * its sign differs from Hall speed. The second condition is
+                 * essential after acceleration/reversal: an estimator that is
+                 * behind the new center must be allowed to catch up instead of
+                 * being pulled backwards by the 1%% correction branch. */
                 desired = interp_phase;
             } else {
                 /* Jika tabel Hall tidak seragam atau akselerasi membuat
@@ -1763,10 +1815,11 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
      * doing that while a rotor is already moving can fold real BEMF/current into
      * the offset and adds a visible dead time at every OFF->RUN transition. */
 
-    /* Keep the ADC/current estimator running for hardware diagnostics, but match
-     * upstream VESC semantics at the public motor-state boundary: when the motor
-     * is released, standard Id/Iq/i_abs/i_bus telemetry is zero. Raw ADC and the
-     * high-impedance baseline remain available only through custom diagnostics. */
+    /* ADC/current estimator tetap berjalan walaupun bridge OFF. Pada hardware
+     * low-side-shunt ini baseline amplifier berbeda antara driven dan high-Z,
+     * sehingga ISR memilih baseline OFF khusus untuk telemetry. Nilai sensor
+     * tersebut tetap dipublikasikan saat idle/coast; hanya state kontrol yang
+     * dinolkan sebelum keluar agar tidak pernah menghasilkan torsi. */
     /* The generated PI regulators run at PWM/3 = 5.333 kHz. Clarke/Park is
      * therefore only needed on this motor's regulator slot; on the other two
      * 16-kHz PWM frames Vd/Vq are held while Hall phase and SVPWM still update.
@@ -1799,14 +1852,16 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         m->m_speed_sat_hold=0; reset_position_pid(m);
         m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
         m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
-        /* Upstream VESC reports zero current while the motor is undriven. Clear
-         * both public/current-filter state and the read/reset averaging window so
-         * an OFF high-impedance amplifier bias cannot leak into COMM_GET_VALUES. */
-        m->m_i_alpha_q4=0; m->m_i_beta_q4=0; m->m_id_q4=0; m->m_iq_q4=0; m->m_current_in_counts=0; m->m_dq_sample_fresh=0u;
-        m->m_current_lpf_q16[0]=0; m->m_current_lpf_q16[1]=0;
-        m->m_id_telem_q4=0; m->m_iq_telem_q4=0; m->m_current_in_telem_counts=0;
-        m->m_telem_current_lpf_q16[0]=0; m->m_telem_current_lpf_q16[1]=0; m->m_telem_current_lpf_q16[2]=0;
-        m->m_telem_sum_id_q4=0; m->m_telem_sum_iq_q4=0; m->m_telem_sum_ibus_counts=0; m->m_telem_avg_samples=0u;
+        /* Saat bridge OFF, state kontrol harus benar-benar nol agar noise ADC
+         * tidak pernah masuk ke PI, current-circle, proteksi, atau integrator
+         * energi. Namun jalur telemetry tetap hidup: sebelum cabang ini, ADC
+         * sudah diproses memakai baseline high-impedance khusus OFF lalu masuk
+         * ke m_*_telem dan averaging window. Jangan hapus nilai telemetry itu.
+         * Dengan demikian VESC Tool tetap melihat Id/Iq/Imotor/Iin sensor nyata
+         * saat idle/coast, sementara aktuator tetap high-impedance dan aman. */
+        m->m_i_alpha_q4=0; m->m_i_beta_q4=0;
+        m->m_id_q4=0; m->m_iq_q4=0; m->m_current_in_counts=0;
+        m->m_dq_sample_fresh=0u;
         m->m_vd=0; m->m_vq=0;
         m->m_pwm_a=0; m->m_pwm_b=0; m->m_pwm_c=0; m->m_duty_now_permille=0;
         m->m_ccr_a=pwm_res/2u; m->m_ccr_b=pwm_res/2u; m->m_ccr_c=pwm_res/2u;
@@ -1913,11 +1968,15 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                     }
                 } else if(m->m_control_mode==CONTROL_MODE_POS){
                     m->m_iq_target_q4=position_pid_iq_target_step(m,second);
-                    /* Hall-position drive and kinetic damping need to exchange
-                     * torque before rotor inertia crosses the next 60-deg sector.
-                     * Use a position-only 20 A/s slew; all other VESC current
-                     * modes retain the normal conservative current slew. */
-                    iq_setpoint_slew_step_rate(m,(uint16_t)MCCONF_POSITION_CURRENT_SLEW_A_PER_S);
+                    /* Upstream VESC foc_run_pid_control_pos writes m_iq_set
+                     * directly on every control step. A position-only slew here
+                     * delayed torque reversal by tens of milliseconds; at a few
+                     * hundred ERPM that is more than one Hall sector and creates
+                     * the observed 0<->360 limit cycle. Keep the hardware-safe
+                     * 0.6-A position ceiling inside position_pid_iq_target_step,
+                     * but apply its signed output immediately like VESC. */
+                    m->m_iq_set_q4=m->m_iq_target_q4;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
                 } else if (m->m_control_mode==CONTROL_MODE_CURRENT_BRAKE) {
                     bool same_motion=false;
                     if(m->m_brake_direction!=0 && m->m_hall_initialized &&
@@ -2189,16 +2248,16 @@ void DMA1_Channel1_IRQHandler(void) {
      * observable. This path is telemetry-only and never feeds protection. */
     if(m_motor_1.m_off_offset_valid && !leftBridgeWasOn && !leftDriveRequest && leftOffStationary){
         if((++m_motor_1.m_off_offset_samples & 7u)==0u){
-            if(adc_buffer.rlA>m_motor_1.m_off_offset0)m_motor_1.m_off_offset0++; else if(adc_buffer.rlA<m_motor_1.m_off_offset0)m_motor_1.m_off_offset0--;
-            if(adc_buffer.rlB>m_motor_1.m_off_offset1)m_motor_1.m_off_offset1++; else if(adc_buffer.rlB<m_motor_1.m_off_offset1)m_motor_1.m_off_offset1--;
-            if(adc_buffer.dcl>m_motor_1.m_off_offsetdc)m_motor_1.m_off_offsetdc++; else if(adc_buffer.dcl<m_motor_1.m_off_offsetdc)m_motor_1.m_off_offsetdc--;
+            int32_t d=(int32_t)adc_buffer.rlA-m_motor_1.m_off_offset0; d=CLAMP(d,-64,64); m_motor_1.m_off_offset0+=(int16_t)(d/8);
+            d=(int32_t)adc_buffer.rlB-m_motor_1.m_off_offset1; d=CLAMP(d,-64,64); m_motor_1.m_off_offset1+=(int16_t)(d/8);
+            d=(int32_t)adc_buffer.dcl-m_motor_1.m_off_offsetdc; d=CLAMP(d,-32,32); m_motor_1.m_off_offsetdc+=(int16_t)(d/8);
         }
     }
     if(m_motor_2.m_off_offset_valid && !rightBridgeWasOn && !rightDriveRequest && rightOffStationary){
         if((++m_motor_2.m_off_offset_samples & 7u)==0u){
-            if(adc_buffer.rrB>m_motor_2.m_off_offset0)m_motor_2.m_off_offset0++; else if(adc_buffer.rrB<m_motor_2.m_off_offset0)m_motor_2.m_off_offset0--;
-            if(adc_buffer.rrC>m_motor_2.m_off_offset1)m_motor_2.m_off_offset1++; else if(adc_buffer.rrC<m_motor_2.m_off_offset1)m_motor_2.m_off_offset1--;
-            if(adc_buffer.dcr>m_motor_2.m_off_offsetdc)m_motor_2.m_off_offsetdc++; else if(adc_buffer.dcr<m_motor_2.m_off_offsetdc)m_motor_2.m_off_offsetdc--;
+            int32_t d=(int32_t)adc_buffer.rrB-m_motor_2.m_off_offset0; d=CLAMP(d,-64,64); m_motor_2.m_off_offset0+=(int16_t)(d/8);
+            d=(int32_t)adc_buffer.rrC-m_motor_2.m_off_offset1; d=CLAMP(d,-64,64); m_motor_2.m_off_offset1+=(int16_t)(d/8);
+            d=(int32_t)adc_buffer.dcr-m_motor_2.m_off_offsetdc; d=CLAMP(d,-32,32); m_motor_2.m_off_offsetdc+=(int16_t)(d/8);
         }
     }
     if(!m_motor_1.m_off_offset_valid && m_motor_1.m_off_settle_ticks==0u && !leftBridgeWasOn && !leftDriveRequest && leftOffStationary){

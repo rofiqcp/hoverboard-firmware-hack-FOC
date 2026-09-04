@@ -144,7 +144,10 @@ typedef struct {
     uint16_t m_hall_ticks;
     uint16_t m_hall_period;
     uint32_t m_hall_interp_step_q16; /* electrical phase units/tick in Q16 */
-    uint16_t m_hall_rate_limit_step; /* precomputed Hall phase correction slew */
+    uint16_t m_hall_rate_limit_step; /* Hall phase correction slew from latest edge */
+    uint16_t m_hall_interp_erpm;     /* VESC foc_hall_interp_erpm, cached integer */
+    uint16_t m_hall_interp_max_ticks;/* max(edge age,last period) for interpolation */
+    uint16_t m_hall_rate_min_step;   /* VESC 1.5x minimum rate-limit step */
     uint16_t m_hall_period_hist[4];
     uint8_t m_hall_hist_pos;
     uint8_t m_hall_initialized;
@@ -294,6 +297,7 @@ mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
+void mcpwm_foc_refresh_hall_interpolation(bool is_second_motor);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
 bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);
