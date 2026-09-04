@@ -265,12 +265,12 @@ int main(void){
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("duty95 bridge did not arm");
     while(m_motor_1.m_bridge_settle_ticks>0u)DMA1_Channel1_IRQHandler();
     adc_buffer.rlA=950; /* raw reconstructed phase >20 A; intentionally ignored as direct ABS source */
-    m_motor_1.m_id_q4=0; m_motor_1.m_iq_q4=0; DMA1_Channel1_IRQHandler();
+    m_motor_1.m_id_q4=0; m_motor_1.m_iq_q4=0; m_motor_1.m_dq_sample_fresh=1u; DMA1_Channel1_IRQHandler();
     if(m_motor_1.m_fault!=FAULT_CODE_NONE || m_motor_1.m_phase_overcurrent_streak!=0u)
         return fail("raw two-shunt phase glitch must not trip ABS");
     adc_buffer.rlA=adc_buffer.rlB=2000;
     for(int k=1;k<=3;k++){
-        m_motor_1.m_id_q4=(int16_t)(21*FOC_CURRENT_Q4_PER_A); m_motor_1.m_iq_q4=0;
+        m_motor_1.m_id_q4=(int16_t)(21*FOC_CURRENT_Q4_PER_A); m_motor_1.m_iq_q4=0; m_motor_1.m_dq_sample_fresh=1u;
         DMA1_Channel1_IRQHandler();
         if(k<3 && m_motor_1.m_fault!=FAULT_CODE_NONE)return fail("DQ ABS faulted before qualifier");
     }

@@ -86,11 +86,19 @@ int main(void){
     cr.l_current_max=9.87f; cr.l_current_min=-6.54f; cr.l_abs_current_max=17.75f; cr.l_max_duty=0.8765f; cr.l_slow_abs_current=false;
     cl.l_in_current_max=14.50f; cl.l_in_current_min=-13.50f; cl.m_duty_ramp_step=0.0312f; cl.cc_min_current=0.17f;
     cr.l_in_current_max=12.25f; cr.l_in_current_min=-11.75f; cr.m_duty_ramp_step=0.0175f; cr.cc_min_current=0.23f;
+    cl.l_current_max_scale=0.80f; cl.l_current_min_scale=0.60f;
+    cr.l_current_max_scale=0.70f; cr.l_current_min_scale=0.50f;
+    cl.l_battery_cut_start=37.20f; cl.l_battery_cut_end=33.10f;
+    cr.l_battery_cut_start=36.80f; cr.l_battery_cut_end=32.90f;
+    cl.l_min_vin=28.50f; cl.l_max_vin=52.30f; cl.l_watt_max=1234.5f; cl.l_watt_min=-987.6f; cl.l_temp_fet_start=61.2f; cl.l_temp_fet_end=72.3f;
+    cr.l_min_vin=29.20f; cr.l_max_vin=51.70f; cr.l_watt_max=1111.1f; cr.l_watt_min=-888.8f; cr.l_temp_fet_start=59.4f; cr.l_temp_fet_end=70.5f;
+    cl.l_min_erpm=-12000.0f; cl.l_max_erpm=10000.0f; cl.si_wheel_diameter=0.2450f;
+    cr.l_min_erpm=-9000.0f; cr.l_max_erpm=11000.0f; cr.si_wheel_diameter=0.3100f;
     cl.p_pid_kd_filter=0.37f; cr.p_pid_kd_filter=0.63f;
     cl.foc_duty_dowmramp_kp=23.4f; cl.foc_duty_dowmramp_ki=456.7f;
     cr.foc_duty_dowmramp_kp=17.8f; cr.foc_duty_dowmramp_ki=321.2f;
-    cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f; cl.foc_current_filter_const=0.07f;
-    cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.21f;
+    cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f; cl.foc_current_filter_const=0.0731f;
+    cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
     m_motor_1.m_kpq_q11=1111u; m_motor_1.m_kiq_q16=2222u;
@@ -118,6 +126,40 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.l_in_current_min+13.50f)>0.011f || fabsf(m_motor_2.m_conf.l_in_current_min+11.75f)>0.011f) return fail("input current min persistence");
     if(fabsf(m_motor_1.m_conf.m_duty_ramp_step-0.0312f)>0.00011f || fabsf(m_motor_2.m_conf.m_duty_ramp_step-0.0175f)>0.00011f) return fail("duty ramp persistence");
     if(fabsf(m_motor_1.m_conf.cc_min_current-0.17f)>0.011f || fabsf(m_motor_2.m_conf.cc_min_current-0.23f)>0.011f) return fail("cc_min_current persistence");
+    if(fabsf(m_motor_1.m_conf.l_current_max_scale-0.80f)>0.00011f ||
+       fabsf(m_motor_1.m_conf.l_current_min_scale-0.60f)>0.00011f ||
+       fabsf(m_motor_2.m_conf.l_current_max_scale-0.70f)>0.00011f ||
+       fabsf(m_motor_2.m_conf.l_current_min_scale-0.50f)>0.00011f) return fail("current scale persistence");
+    if(fabsf(m_motor_1.m_conf.l_battery_cut_start-1.0f*37.20f)>0.011f ||
+       fabsf(m_motor_1.m_conf.l_battery_cut_end-33.10f)>0.011f ||
+       fabsf(m_motor_2.m_conf.l_battery_cut_start-36.80f)>0.011f ||
+       fabsf(m_motor_2.m_conf.l_battery_cut_end-32.90f)>0.011f) return fail("battery cut persistence");
+    if(fabsf(m_motor_1.m_conf.l_min_vin-28.50f)>0.011f || fabsf(m_motor_1.m_conf.l_max_vin-52.30f)>0.011f ||
+       fabsf(m_motor_2.m_conf.l_min_vin-29.20f)>0.011f || fabsf(m_motor_2.m_conf.l_max_vin-51.70f)>0.011f) return fail("Vin safety persistence");
+    if(fabsf(m_motor_1.m_conf.l_watt_max-1234.5f)>0.11f || fabsf(m_motor_1.m_conf.l_watt_min+987.6f)>0.11f ||
+       fabsf(m_motor_2.m_conf.l_watt_max-1111.1f)>0.11f || fabsf(m_motor_2.m_conf.l_watt_min+888.8f)>0.11f) return fail("watt safety persistence");
+    if(fabsf(m_motor_1.m_conf.l_temp_fet_start-61.2f)>0.051f || fabsf(m_motor_1.m_conf.l_temp_fet_end-72.3f)>0.051f ||
+       fabsf(m_motor_2.m_conf.l_temp_fet_start-59.4f)>0.051f || fabsf(m_motor_2.m_conf.l_temp_fet_end-70.5f)>0.051f) return fail("FET temperature persistence");
+    if(m_motor_1.m_watt_max_x10!=12345u || m_motor_1.m_watt_regen_x10!=9876u ||
+       m_motor_2.m_watt_max_x10!=11111u || m_motor_2.m_watt_regen_x10!=8888u) return fail("watt runtime restore");
+    if(m_motor_1.m_temp_fet_start_x10!=612 || m_motor_1.m_temp_fet_end_x10!=723 ||
+       m_motor_2.m_temp_fet_start_x10!=594 || m_motor_2.m_temp_fet_end_x10!=705) return fail("temperature runtime restore");
+    if(abs((int)m_motor_1.m_vin_min_adc-(int)(28.50f*100.0f*BAT_CALIB_ADC/BAT_CALIB_REAL_VOLTAGE+0.5f))>1 ||
+       abs((int)m_motor_2.m_vin_max_adc-(int)(51.70f*100.0f*BAT_CALIB_ADC/BAT_CALIB_REAL_VOLTAGE+0.5f))>1) return fail("Vin ADC runtime restore");
+    if(fabsf(m_motor_1.m_conf.l_min_erpm+12000.0f)>0.5f || fabsf(m_motor_1.m_conf.l_max_erpm-10000.0f)>0.5f ||
+       fabsf(m_motor_2.m_conf.l_min_erpm+9000.0f)>0.5f || fabsf(m_motor_2.m_conf.l_max_erpm-11000.0f)>0.5f) return fail("ERPM persistence/clamp");
+    if(fabsf(m_motor_1.m_conf.si_wheel_diameter-0.2450f)>0.00011f ||
+       fabsf(m_motor_2.m_conf.si_wheel_diameter-0.3100f)>0.00011f) return fail("wheel diameter persistence");
+    if(abs((int)m_motor_1.m_current_limit_q4-7898)>1 || abs((int)m_motor_1.m_current_limit_neg_q4-3672)>1 ||
+       abs((int)m_motor_2.m_current_limit_q4-5527)>1 || abs((int)m_motor_2.m_current_limit_neg_q4-2616)>1)
+        return fail("scaled bidirectional current runtime restore");
+    {
+        const int left_start=(int)(37.20f*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
+        const int left_end=(int)(33.10f*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
+        if(abs((int)m_motor_1.m_battery_cut_start_adc-left_start)>1 ||
+           abs((int)m_motor_1.m_battery_cut_end_adc-left_end)>1)
+            return fail("battery cut ADC runtime restore");
+    }
     if(m_motor_1.m_input_current_max_q4!=11600 || m_motor_1.m_input_current_regen_q4!=10800 ||
        m_motor_2.m_input_current_max_q4!=9800 || m_motor_2.m_input_current_regen_q4!=9400) return fail("input current runtime restore");
     if(m_motor_1.m_duty_ramp_step_permille!=31u || m_motor_2.m_duty_ramp_step_permille!=18u) return fail("duty ramp runtime restore");
@@ -136,12 +178,44 @@ int main(void){
        m_motor_2.m_duty_kp_q12_per_permille==0u || m_motor_2.m_duty_ki_q12_per_permille==0u) return fail("duty PI runtime restore");
     if(m_motor_1.m_conf.si_motor_poles!=20u || fabsf(m_motor_1.m_conf.si_gear_ratio-5.25f)>0.02f) return fail("left poles/gear persistence");
     if(m_motor_2.m_conf.si_motor_poles!=14u || fabsf(m_motor_2.m_conf.si_gear_ratio-1.0f)>0.02f) return fail("right poles/gear persistence");
-    if(fabsf(m_motor_1.m_conf.foc_current_filter_const-0.07f)>0.005f) return fail("left telemetry filter persistence");
-    if(fabsf(m_motor_2.m_conf.foc_current_filter_const-0.21f)>0.005f) return fail("right telemetry filter persistence");
+    if(fabsf(m_motor_1.m_conf.foc_current_filter_const-0.0731f)>0.00011f) return fail("left telemetry filter persistence");
+    if(fabsf(m_motor_2.m_conf.foc_current_filter_const-0.2197f)>0.00011f) return fail("right telemetry filter persistence");
     if(m_motor_1.m_kpq_q11!=1111u || m_motor_1.m_kiq_q16!=2222u || m_motor_1.m_kdp_q11!=111u) return fail("left gains persistence");
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
     if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
     if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_rpm!=8u) return fail("right speed persistence");
+
+    /* Simulasikan upgrade image V28 (0x601A), yaitu firmware yang sudah punya
+     * filter x10000 tetapi belum punya slot Vin/watt/temperatur. Field lama
+     * harus tetap utuh, safety baru memakai default aman, lalu schema ditulis
+     * ulang atomik menjadi 0x601B. */
+    ee_value[43]=0x601Au; ee_value[44]=0x601Au;
+    for(unsigned i=163u;i<179u;i++)ee_valid[i]=0u;
+    mcpwm_foc_init();
+    if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+        return fail("V28 migration load");
+    if(fabsf(m_motor_1.m_conf.l_battery_cut_start-37.20f)>0.011f ||
+       fabsf(m_motor_2.m_conf.l_battery_cut_end-32.90f)>0.011f ||
+       fabsf(m_motor_1.m_conf.foc_current_filter_const-0.0731f)>0.00011f ||
+       fabsf(m_motor_2.m_conf.si_wheel_diameter-0.3100f)>0.00011f)
+        return fail("V28 old-field preservation");
+    if(fabsf(m_motor_1.m_conf.l_min_vin-MCCONF_L_MIN_VIN)>0.011f ||
+       fabsf(m_motor_2.m_conf.l_temp_fet_end-MCCONF_L_TEMP_FET_END)>0.051f)
+        return fail("V28 safety default migration");
+    if(ee_value[43]!=0x601Bu || ee_value[44]!=0x601Bu)
+        return fail("V28 migration signature");
+    for(unsigned i=163u;i<179u;i++)if(!ee_valid[i])return fail("V28 migration safety slots");
+
+    /* V27 (0x6019) juga harus tetap diterima. Hilangkan slot filter dan safety
+     * untuk meniru image lama, lalu pastikan keduanya dibuat kembali. */
+    ee_value[43]=0x6019u; ee_value[44]=0x6019u;
+    ee_valid[161]=ee_valid[162]=0u;
+    for(unsigned i=163u;i<179u;i++)ee_valid[i]=0u;
+    mcpwm_foc_init();
+    if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+        return fail("V27 migration load");
+    if(ee_value[43]!=0x601Bu || ee_value[44]!=0x601Bu || !ee_valid[161] || !ee_valid[162])
+        return fail("V27 migration rewrite/signature");
 
     /* Independent signatures: corrupt only right signature; left remains valid. */
     ee_value[44]=0u;

@@ -30,8 +30,18 @@ assert 'VESC speed PID -> Iq' in mc
 assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
 assert 'speed PI drives Vq directly' not in mc
 assert 'MCCONF_POSITION_PHASE_DEADBAND_MDEG' in mcc and 'MCCONF_POSITION_RUN_CURRENT_MAX_MA' in mcc and 'MCCONF_POSITION_BREAKAWAY_CURRENT_MA' in mcc
-assert 'normalized position PID -> Iq' in mc and 'm_position_prev_proc_phase' in mch
-assert 'actual electrical phase delta' in mc and 'm_position_kd_proc_phase_coeff_q4' in mch and 'm_position_motion_seen' in mch
+assert 'm_position_prev_proc_phase' in mch and 'm_position_kd_proc_phase_coeff_q4' in mch
+# Standard COMM_SET_POS mengikuti foc_run_pid_control_pos VESC: shortest-path
+# angular PID -> Iq, lengkap dengan anti-windup dan D-on-measurement. State
+# machine Hall per-sektor hanya dipakai API custom count multi-putaran.
+assert 'VESC foc_run_pid_control_pos: shortest-path angular PID' in mc
+assert 'p_q15=CLAMP' in mc and 'i_lim_q15=32768-' in mc
+assert 'm_position_d_filter_q15' in mch and 'm_position_d_proc_filter_q15' in mch
+assert 'proc_delta=(int16_t)(m->m_phase-m->m_position_prev_proc_phase)' in mc
+assert 'out_q15=p_q15+(m->m_position_integrator>>16)+' in mc
+assert 'm_position_step_braking' in mch and 'm_position_brake_direction' in mch
+assert 'hall_motion_same_direction' in mc and 'position_brake_iq_q4' in mc
+assert 'm_position_motion_seen' in mch
 mi=(R/'Src/motor/mc_interface.c').read_text()
 assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrate_speed_pid' in mi
 
@@ -70,7 +80,7 @@ assert 'vesc_protocol_periodic(uint32_t now_ms)' in vp
 assert 'vesc_protocol_periodic(HAL_GetTick())' in main
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
-assert 'rx fifo burst' in host and 'request/reply only' in host
+assert 'realtime mailbox latest setpoint' in host and 'request/reply only' in host
 assert 'rotor stream local value' in host and 'rotor stream right value' in host
 
 
@@ -94,4 +104,4 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_cap=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_sector_brake=1 position_cap=1')

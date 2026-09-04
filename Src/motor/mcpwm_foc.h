@@ -47,6 +47,7 @@ typedef struct {
     uint32_t m_speed_kd_coeff_q8;
     volatile uint16_t m_kpp_q11, m_kip_q16, m_kdp_q11;
     volatile int32_t m_position_counts;
+    volatile uint32_t m_position_abs_counts; /* total edge Hall absolut sejak reset */
     volatile int32_t m_position_target_counts;
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
@@ -54,9 +55,19 @@ typedef struct {
      * separate from this project's long-range Hall-count position extension. */
     volatile uint16_t m_pos_pid_set_phase;
     volatile uint8_t m_pos_pid_phase_mode;
-    volatile int16_t m_current_limit_q4;
-    volatile int16_t m_input_current_max_q4;   /* positive DC-link draw limit */
-    volatile int16_t m_input_current_regen_q4; /* magnitude of negative DC-link limit */
+    volatile int16_t m_current_limit_q4;      /* batas Iq motoring (+), Q4 */
+    volatile int16_t m_current_limit_neg_q4;  /* magnitudo batas Iq regen/brake (-), Q4 */
+    volatile uint16_t m_battery_cut_start_adc;/* awal derating baterai dalam hitungan ADC */
+    volatile uint16_t m_battery_cut_end_adc;  /* arus motoring nol dalam hitungan ADC */
+    volatile int16_t m_input_current_max_q4;   /* batas arus DC positif */
+    volatile int16_t m_input_current_regen_q4; /* magnitudo batas arus DC regeneratif */
+    volatile uint16_t m_vin_min_adc;           /* l_min_vin dalam hitungan ADC baterai */
+    volatile uint16_t m_vin_max_adc;           /* l_max_vin dalam hitungan ADC baterai */
+    volatile uint32_t m_watt_max_x10;          /* batas daya motoring, 0,1 W */
+    volatile uint32_t m_watt_regen_x10;        /* magnitudo batas daya regeneratif, 0,1 W */
+    volatile int16_t m_temp_fet_start_x10;     /* awal derating temperatur board/MOS, 0,1 C */
+    volatile int16_t m_temp_fet_end_x10;       /* akhir derating / fault, 0,1 C */
+    volatile uint32_t m_wrong_voltage_integrator;
     volatile int16_t m_abs_current_limit_counts; /* precomputed l_abs_current_max * A2BIT_CONV */
     volatile int16_t m_duty_limit_permille;      /* precomputed l_max_duty * 1000 */
 
@@ -68,6 +79,10 @@ typedef struct {
     volatile int16_t m_vd;
     volatile int16_t m_vq;
     volatile int16_t m_current_in_counts;
+    /* Set only when Clarke/Park has produced a new D/Q sample on this motor's
+     * 5.33-kHz regulator slot. The outer ABS protection consumes this flag so
+     * its three-sample qualification always means three distinct ADC samples. */
+    volatile uint8_t m_dq_sample_fresh;
     /* Monitoring-only filtered currents. Upstream VESC keeps a separate current
      * filter for non-time-critical telemetry so the fast current controller is
      * not slowed down by display smoothing. */
@@ -167,6 +182,9 @@ typedef struct {
     uint16_t m_position_breakaway_ticks;
     uint16_t m_position_no_motion_ticks;
     uint8_t m_position_motion_seen;
+    uint8_t m_position_step_braking; /* one Hall edge -> brake-to-stop before next sector */
+    int8_t m_position_brake_direction; /* latched accepted-edge direction; never follows rebound */
+    int32_t m_position_last_motion_count; /* only validated Hall edge movement arms tracking */
     uint16_t m_position_kd_filter_q16;
     /* Precomputed p_pid_kd_proc process-derivative coefficient. This preserves
      * VESC-scale sub-millith gain resolution without float math in the ISR. */
@@ -253,6 +271,7 @@ bool mcpwm_foc_vesc_override_active(bool is_second_motor);
 bool mcpwm_foc_vesc_command_live(bool is_second_motor);
 void mcpwm_foc_vesc_override_clear(bool is_second_motor);
 void mcpwm_foc_energy_update(uint32_t now_ms);
+void mcpwm_foc_set_board_temperature_x10(int16_t temperature_x10);
 
 /* Integer API used by the bare-metal command layer. */
 void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,

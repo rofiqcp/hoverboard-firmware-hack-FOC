@@ -1,5 +1,6 @@
 #include <string.h>
 #include "stm32f1xx_hal.h"
+#include <stdio.h>
 #include "config.h"
 #include "defines.h"
 #include "motor/mcpwm_foc.h"
@@ -40,6 +41,15 @@
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
 extern volatile adc_buf_t adc_buffer;
+#ifdef STM32F103xE
+extern volatile uint32_t main_prof_vesc_max_cycles;
+extern volatile uint32_t main_prof_house_max_cycles;
+extern volatile uint32_t main_prof_tail_max_cycles;
+#else
+volatile uint32_t main_prof_vesc_max_cycles = 0u;
+volatile uint32_t main_prof_house_max_cycles = 0u;
+volatile uint32_t main_prof_tail_max_cycles = 0u;
+#endif
 
 static volatile uint8_t s_rx_active = 0u;
 static volatile uint16_t s_rx_index = 0u;
@@ -59,8 +69,20 @@ static volatile uint32_t s_rx_queue_highwater = 0u;
 static uint32_t s_process_last_ms = 0u;
 static uint32_t s_process_gap_max_ms = 0u;
 static volatile uint32_t s_link_last_ms = 0u;
+/* Offset odometer per endpoint. VESC menghitung odometer sebagai nilai dasar
+ * ditambah trip distance. Hardware ini tidak memiliki backup-domain RTC, jadi
+ * offset bersifat runtime; jarak trip tetap berasal dari edge Hall nyata. */
+static int64_t s_odometer_offset_m[2] = {0, 0};
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
+/* Realtime setpoint mailbox. SET_* packets have no reply and repeated packets
+ * supersede older setpoints. Coalescing them here prevents stale RPM/current/
+ * position commands from filling the generic request FIFO while VESC Tool is
+ * simultaneously polling GET_VALUES. The main loop applies one latest command
+ * per motor; configuration/detection/read requests remain strictly FIFO. */
+typedef struct { uint8_t pending; uint8_t len; uint8_t payload[5]; } rt_cmd_mailbox_t;
+static volatile rt_cmd_mailbox_t s_rt_cmd[2];
+static volatile uint32_t s_rt_cmd_coalesced = 0u;
 /* Framed reply FIFO. The in-flight slot remains owned by DMA until UART gState
  * returns READY, so no response buffer can be overwritten mid-transmission. */
 static uint8_t s_tx_frame[VESC_TX_QUEUE_DEPTH][VESC_MAX_FRAME];
@@ -144,6 +166,8 @@ void vesc_protocol_init(void) {
     s_link_last_ms = 0u;
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
+    memset((void *)s_rt_cmd, 0, sizeof(s_rt_cmd));
+    s_rt_cmd_coalesced = 0u;
     s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
     memset(s_tx_len, 0, sizeof(s_tx_len));
     s_tx_queue_drop = 0u;
@@ -158,6 +182,26 @@ void vesc_protocol_init(void) {
 }
 
 bool vesc_protocol_rx_in_progress(void) { return s_rx_active != 0u; }
+
+static bool rt_command_extract(const uint8_t *vp, uint16_t n, uint8_t *motor, const uint8_t **cmdp) {
+    if (!vp || !motor || !cmdp) return false;
+    const uint8_t *c = vp; uint16_t cn = n; uint8_t mi = 0u;
+    if (n >= 3u && vp[0] == COMM_FORWARD_CAN && vp[1] == VESC_SECOND_MOTOR_ID) {
+        c = vp + 2u; cn = (uint16_t)(n - 2u); mi = 1u;
+    }
+    if (cn != 5u) return false;
+    switch ((COMM_PACKET_ID)c[0]) {
+    case COMM_SET_DUTY: case COMM_SET_CURRENT: case COMM_SET_CURRENT_BRAKE:
+    case COMM_SET_HANDBRAKE: case COMM_SET_RPM: case COMM_SET_POS:
+    /* COMM_SET_CURRENT_REL is the same kind of no-reply realtime setpoint as
+     * COMM_SET_CURRENT (1 cmd byte + int32 = 5 bytes either way) and was
+     * missing from this list, so it fell through to the plain FIFO instead
+     * of getting "latest setpoint wins" coalescing like its sibling. */
+    case COMM_SET_CURRENT_REL:
+        *motor = mi; *cmdp = c; return true;
+    default: return false;
+    }
+}
 
 static void complete_frame(void) {
     const uint16_t p = s_payload_start;
@@ -185,6 +229,21 @@ static void complete_frame(void) {
             s_rx_ok++;
             rx_reset();
             return;
+        }
+        {
+            uint8_t mi=0u; const uint8_t *cp=0;
+            if (rt_command_extract(vp,n,&mi,&cp)) {
+                rt_cmd_mailbox_t *mb=(rt_cmd_mailbox_t *)&s_rt_cmd[mi];
+                if (mb->pending) s_rt_cmd_coalesced++;
+                mb->len=5u;
+                memcpy((void *)mb->payload,cp,5u);
+                mb->pending=1u;
+                /* Reset VESC timeout at wire-receive time. Even if the main loop
+                 * is busy for a few milliseconds, a valid fresh setpoint must
+                 * count as alive exactly like upstream timeout_reset(). */
+                mcpwm_foc_vesc_override_touch(mi!=0u);
+                s_link_last_ms=HAL_GetTick(); s_rx_ok++; rx_reset(); return;
+            }
         }
 
         /* UART DMA/ISR can deliver several VESC Tool requests before the 5-ms
@@ -523,6 +582,89 @@ static void reply_values(bool second, bool selective, const uint8_t *data, uint1
      * chooses the polling rate. Never arm an unsolicited values stream here. */
 }
 
+/** Batasi nilai float tanpa menarik dependensi utilitas VESC yang tidak dipakai. */
+static float vesc_clampf(float value, float min_value, float max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+/**
+ * Hitung level baterai seperti VESC 6.00 dari tipe baterai, jumlah sel, dan Vin.
+ * Estimasi Wh hanya diaktifkan bila kapasitas Ah memang diisi pengguna; firmware
+ * tidak mengarang kapasitas baterai yang tidak diketahui.
+ */
+static float setup_battery_level(const mc_configuration *conf, float vin, float *wh_left) {
+    if (wh_left) *wh_left = 0.0f;
+    if (!conf || conf->si_battery_cells < 1) return 0.0f;
+
+    const float cells = (float)conf->si_battery_cells;
+    const float cell_v = vin / cells;
+    float level = 0.0f;
+    float ah_left = 0.0f;
+    float ah_total = conf->si_battery_ah;
+    float avg_voltage_left = 0.0f;
+
+    if (conf->si_battery_type == BATTERY_TYPE_LIION_3_0__4_2) {
+        float x = vesc_clampf((cell_v - 3.2f) / (4.2f - 3.2f), 0.0f, 1.0f);
+        const float x2 = x * x;
+        const float x3 = x2 * x;
+        const float x4 = x3 * x;
+        const float x5 = x4 * x;
+        /* Polynomial resmi utils_batt_liion_norm_v_to_capacity VESC 6.00. */
+        level = -2.979767f * x5 + 5.487810f * x4 - 3.501286f * x3 +
+                1.675683f * x2 + 0.317147f * x;
+        level = vesc_clampf(level, 0.0f, 1.0f);
+        ah_total *= 0.85f;
+        ah_left = level * ah_total;
+        avg_voltage_left = (3.2f * cells + vin) * 0.5f;
+    } else if (conf->si_battery_type == BATTERY_TYPE_LIIRON_2_6__3_6) {
+        level = vesc_clampf((cell_v - 2.6f) / (3.6f - 2.6f), 0.0f, 1.0f);
+        ah_left = level * ah_total;
+        avg_voltage_left = (2.8f * cells + vin) * 0.5f;
+    } else {
+        level = vesc_clampf((cell_v - 2.1f) / (2.36f - 2.1f), 0.0f, 1.0f);
+        ah_left = level * ah_total;
+        avg_voltage_left = (2.1f * cells + vin) * 0.5f;
+    }
+
+    if (wh_left && ah_total > 0.0f) *wh_left = ah_left * avg_voltage_left;
+    return level;
+}
+
+/**
+ * Turunkan speed dan distance dari ERPM/tachometer dengan rumus VESC 6.00.
+ * Tachometer firmware ini bertambah sekali per edge Hall, tepat enam edge per
+ * revolusi elektrik, sehingga skala wheel*pi/(3*poles*gear) tetap identik.
+ */
+static void setup_motion_values(bool second, const mc_values *values,
+                                float *speed_mps, float *distance_m,
+                                float *distance_abs_m) {
+    const mc_configuration *conf =
+        (const mc_configuration *)mc_interface_get_configuration_motor(second);
+    float wheel = conf->si_wheel_diameter;
+    float gear = conf->si_gear_ratio;
+    int poles = conf->si_motor_poles;
+    if (!(wheel > 0.001f && wheel < 5.0f)) wheel = MCCONF_SI_WHEEL_DIAMETER;
+    if (!(gear > 0.0f)) gear = 1.0f;
+    if (poles < 2 || (poles & 1)) poles = 2;
+    const float pi = 3.14159265358979323846f;
+    const float pole_pairs = (float)poles * 0.5f;
+    if (speed_mps) *speed_mps = (values->rpm / pole_pairs / 60.0f) * wheel * pi / gear;
+    const float tacho_scale = (wheel * pi) / (3.0f * (float)poles * gear);
+    if (distance_m) *distance_m = (float)values->tachometer * tacho_scale;
+    if (distance_abs_m) *distance_abs_m = (float)values->tachometer_abs * tacho_scale;
+}
+
+/** Hitung odometer VESC dari offset SET_ODOMETER dan distance_abs Hall. */
+static uint32_t setup_odometer_m(bool second, float distance_abs_m) {
+    int64_t trip = (int64_t)(distance_abs_m >= 0.0f ? distance_abs_m : 0.0f);
+    int64_t value = s_odometer_offset_m[second ? 1u : 0u] + trip;
+    if (value < 0) value = 0;
+    if (value > (int64_t)UINT32_MAX) value = (int64_t)UINT32_MAX;
+    return (uint32_t)value;
+}
+
 static void send_values_setup_packet(bool second, bool selective, uint32_t mask) {
     uint8_t b[128];
     int32_t i = 0;
@@ -532,27 +674,46 @@ static void send_values_setup_packet(bool second, bool selective, uint32_t mask)
 
     mc_values v;
     get_values_normalized(second, &v);
+    mc_values totals = v;
+    if (!second) {
+        /* COMM_GET_VALUES_SETUP upstream menjumlahkan controller lokal dan CAN
+         * yang aktif. Motor-2 board ini adalah endpoint virtual CAN ID2, jadi
+         * agregasikan arus dan counter energi yang sama seperti VESC dual. */
+        mc_values right_values;
+        get_values_normalized(true, &right_values);
+        totals.current_motor += right_values.current_motor;
+        totals.current_in += right_values.current_in;
+        totals.amp_hours += right_values.amp_hours;
+        totals.amp_hours_charged += right_values.amp_hours_charged;
+        totals.watt_hours += right_values.watt_hours;
+        totals.watt_hours_charged += right_values.watt_hours_charged;
+    }
+    float speed_mps = 0.0f, distance_m = 0.0f, distance_abs_m = 0.0f, wh_left = 0.0f;
+    setup_motion_values(second, &v, &speed_mps, &distance_m, &distance_abs_m);
+    const mc_configuration *conf =
+        (const mc_configuration *)mc_interface_get_configuration_motor(second);
+    const float battery_level = setup_battery_level(conf, v.v_in, &wh_left);
     if (mask & (1u << 0)) buffer_append_float16(b, v.temp_mos, 1e1f, &i);
     if (mask & (1u << 1)) buffer_append_float16(b, v.temp_motor, 1e1f, &i);
-    if (mask & (1u << 2)) buffer_append_float32(b, v.current_motor, 1e2f, &i);
-    if (mask & (1u << 3)) buffer_append_float32(b, v.current_in, 1e2f, &i);
+    if (mask & (1u << 2)) buffer_append_float32(b, totals.current_motor, 1e2f, &i);
+    if (mask & (1u << 3)) buffer_append_float32(b, totals.current_in, 1e2f, &i);
     if (mask & (1u << 4)) buffer_append_float16(b, v.duty_now, 1e3f, &i);
     if (mask & (1u << 5)) buffer_append_float32(b, v.rpm, 1e0f, &i);
-    if (mask & (1u << 6)) buffer_append_float32(b, 0.0f, 1e3f, &i); /* vehicle speed: no wheel setup */
+    if (mask & (1u << 6)) buffer_append_float32(b, speed_mps, 1e3f, &i);
     if (mask & (1u << 7)) buffer_append_float16(b, v.v_in, 1e1f, &i);
-    if (mask & (1u << 8)) buffer_append_float16(b, 0.0f, 1e3f, &i); /* battery level unavailable */
-    if (mask & (1u << 9)) buffer_append_float32(b, v.amp_hours, 1e4f, &i);
-    if (mask & (1u << 10)) buffer_append_float32(b, v.amp_hours_charged, 1e4f, &i);
-    if (mask & (1u << 11)) buffer_append_float32(b, v.watt_hours, 1e4f, &i);
-    if (mask & (1u << 12)) buffer_append_float32(b, v.watt_hours_charged, 1e4f, &i);
-    if (mask & (1u << 13)) buffer_append_float32(b, 0.0f, 1e3f, &i); /* distance */
-    if (mask & (1u << 14)) buffer_append_float32(b, 0.0f, 1e3f, &i); /* distance abs */
+    if (mask & (1u << 8)) buffer_append_float16(b, battery_level, 1e3f, &i);
+    if (mask & (1u << 9)) buffer_append_float32(b, totals.amp_hours, 1e4f, &i);
+    if (mask & (1u << 10)) buffer_append_float32(b, totals.amp_hours_charged, 1e4f, &i);
+    if (mask & (1u << 11)) buffer_append_float32(b, totals.watt_hours, 1e4f, &i);
+    if (mask & (1u << 12)) buffer_append_float32(b, totals.watt_hours_charged, 1e4f, &i);
+    if (mask & (1u << 13)) buffer_append_float32(b, distance_m, 1e3f, &i);
+    if (mask & (1u << 14)) buffer_append_float32(b, distance_abs_m, 1e3f, &i);
     if (mask & (1u << 15)) buffer_append_float32(b, v.position, 1e6f, &i);
     if (mask & (1u << 16)) b[i++] = (uint8_t)v.fault_code;
     if (mask & (1u << 17)) b[i++] = (uint8_t)v.vesc_id;
     if (mask & (1u << 18)) b[i++] = second ? 1u : 2u;
-    if (mask & (1u << 19)) buffer_append_float32(b, 0.0f, 1e3f, &i); /* Wh battery left */
-    if (mask & (1u << 20)) buffer_append_uint32(b, 0u, &i); /* persistent odometer not implemented */
+    if (mask & (1u << 19)) buffer_append_float32(b, wh_left, 1e3f, &i);
+    if (mask & (1u << 20)) buffer_append_uint32(b, setup_odometer_m(second, distance_abs_m), &i);
     if (mask & (1u << 21)) buffer_append_uint32(b, HAL_GetTick(), &i);
     uart_send_payload(b, (uint16_t)i);
 }
@@ -569,6 +730,9 @@ static void reply_values_setup(bool second, bool selective, const uint8_t *data,
 }
 
 static float right_sign(bool second, float value) { return second ? -value : value; }
+
+/* Forward declaration: dipakai command config/current sebelum implementasi detector. */
+static bool hall_detect_motor_locked(bool second);
 
 static void touch_motor(bool second) { mcpwm_foc_vesc_override_touch(second); }
 
@@ -638,16 +802,172 @@ static void reply_appconf(bool second, COMM_PACKET_ID id) {
     if (n > 0 && (uint32_t)(i + n) <= sizeof(s_config_payload)) uart_send_payload(s_config_payload, (uint16_t)(i + n));
 }
 
-static void set_appconf(bool second, const uint8_t *data, uint16_t len) {
+/**
+ * Terapkan App Configuration VESC 6.00.
+ *
+ * `store_to_eeprom=false` dipakai COMM_SET_APPCONF_NO_STORE sehingga tombol
+ * pengaturan sementara di VESC Tool benar-benar tidak mengubah flash.
+ */
+static void set_appconf(bool second, const uint8_t *data, uint16_t len,
+                        bool store_to_eeprom, COMM_PACKET_ID ack_id) {
     app_configuration tmp = *app_vesc_get_configuration(second);
     const int32_t expected = confgenerator_serialize_appconf(s_config_payload, &tmp);
     if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_appconf(data, &tmp)) {
-        /* VESC Tool SET_APPCONF is persistent. Apply first, then store only the
-         * implemented application subset into EEPROM-emulation slots. */
-        if (app_vesc_set_configuration(second, &tmp)) (void)app_vesc_store_configuration(second);
+        if (app_vesc_set_configuration(second, &tmp) && store_to_eeprom) {
+            (void)app_vesc_store_configuration(second);
+        }
     }
-    uint8_t ack = COMM_SET_APPCONF;
+    uint8_t ack = (uint8_t)ack_id;
     uart_send_payload(&ack, 1u);
+}
+
+/**
+ * Jalankan COMM_SET_CURRENT_REL dengan semantik VESC: nilai -1..+1 diskalakan
+ * terhadap batas arus motor dan current-scale aktif. Motor kanan tetap melalui
+ * normalisasi tanda yang sama dengan COMM_SET_CURRENT biasa.
+ */
+static void set_current_relative(bool second, const uint8_t *data, uint16_t len) {
+    if (len < 4u || hall_detect_motor_locked(second)) return;
+    int32_t ind = 0;
+    float rel = (float)buffer_get_int32(data, &ind) / 100000.0f;
+    if (rel > 1.0f) rel = 1.0f;
+    if (rel < -1.0f) rel = -1.0f;
+    const mc_configuration *c = (const mc_configuration *)mc_interface_get_configuration_motor(second);
+    float current;
+    if (rel >= 0.0f) {
+        float scale = c->l_current_max_scale;
+        if (!(scale >= 0.0f && scale <= 1.0f)) scale = 1.0f;
+        current = rel * c->l_current_max * scale;
+    } else {
+        float scale = c->l_current_min_scale;
+        if (!(scale >= 0.0f && scale <= 1.0f)) scale = 1.0f;
+        current = (-rel) * c->l_current_min * scale;
+    }
+    touch_motor(second);
+    mc_interface_set_current(right_sign(second, current));
+}
+
+/** Kirim dua ambang battery-cut sesuai format wire VESC 6.00. */
+static void reply_battery_cut(bool second) {
+    const mc_configuration *c = (const mc_configuration *)mc_interface_get_configuration_motor(second);
+    uint8_t b[12]; int32_t i = 0;
+    b[i++] = COMM_GET_BATTERY_CUT;
+    buffer_append_float32(b, c->l_battery_cut_start, 1e3f, &i);
+    buffer_append_float32(b, c->l_battery_cut_end, 1e3f, &i);
+    uart_send_payload(b, (uint16_t)i);
+}
+
+/**
+ * Terapkan battery-cut secara live. Derating arusnya dilakukan oleh loop FOC
+ * menggunakan threshold ADC yang sudah diprekomputasi saat config diterapkan.
+ */
+static void set_battery_cut(bool second, const uint8_t *data, uint16_t len) {
+    if (len < 10u || hall_detect_motor_locked(second)) return;
+    int32_t i = 0;
+    const float start = buffer_get_float32(data, 1e3f, &i);
+    const float end = buffer_get_float32(data, 1e3f, &i);
+    const bool store = data[i++] != 0u;
+    const bool forward = data[i++] != 0u;
+    if (!(start > end && end >= 0.0f && start <= 80.0f)) return;
+
+    for (uint8_t motor = 0u; motor < 2u; ++motor) {
+        const bool target_second = motor != 0u;
+        if (target_second != second && !(forward && !second)) continue;
+        mc_configuration c = *mc_interface_get_configuration_motor(target_second);
+        c.l_battery_cut_start = start;
+        c.l_battery_cut_end = end;
+        mc_interface_select_motor_thread(target_second ? 2 : 1);
+        mc_interface_set_configuration(&c);
+        if (store) (void)mc_interface_store_configuration_motor(target_second);
+    }
+    mc_interface_select_motor_thread(second ? 2 : 1);
+    { uint8_t ack = COMM_SET_BATTERY_CUT; uart_send_payload(&ack, 1u); }
+}
+
+/** Kirim konfigurasi limit sementara yang dipakai halaman Setup VESC Tool. */
+static void reply_mcconf_temp(bool second) {
+    const mc_configuration *c = (const mc_configuration *)mc_interface_get_configuration_motor(second);
+    uint8_t b[64]; int32_t i = 0;
+    b[i++] = COMM_GET_MCCONF_TEMP;
+    buffer_append_float32_auto(b, c->l_current_min_scale, &i);
+    buffer_append_float32_auto(b, c->l_current_max_scale, &i);
+    buffer_append_float32_auto(b, c->l_min_erpm, &i);
+    buffer_append_float32_auto(b, c->l_max_erpm, &i);
+    buffer_append_float32_auto(b, c->l_min_duty, &i);
+    buffer_append_float32_auto(b, c->l_max_duty, &i);
+    buffer_append_float32_auto(b, c->l_watt_min, &i);
+    buffer_append_float32_auto(b, c->l_watt_max, &i);
+    buffer_append_float32_auto(b, c->l_in_current_min, &i);
+    buffer_append_float32_auto(b, c->l_in_current_max, &i);
+    b[i++] = c->si_motor_poles;
+    buffer_append_float32_auto(b, c->si_gear_ratio, &i);
+    buffer_append_float32_auto(b, c->si_wheel_diameter, &i);
+    uart_send_payload(b, (uint16_t)i);
+}
+
+/**
+ * Terapkan COMM_SET_MCCONF_TEMP/SETUP sesuai layout VESC 6.00. Pada variant
+ * SETUP, batas kecepatan masuk dalam m/s dan dikonversi ke ERPM menggunakan
+ * pole, gear ratio, dan diameter roda dari MC Config. `forward_can` diterapkan
+ * ke endpoint virtual motor-2 tanpa membuat CAN fisik palsu.
+ */
+static void set_mcconf_temp(bool second, COMM_PACKET_ID packet_id,
+                            const uint8_t *data, uint16_t len) {
+    if (len < 36u || hall_detect_motor_locked(second)) return;
+    int32_t i = 0;
+    const bool store = data[i++] != 0u;
+    const bool forward = data[i++] != 0u;
+    const bool ack = data[i++] != 0u;
+    const bool divide = data[i++] != 0u;
+    const float current_min_scale = buffer_get_float32_auto(data, &i);
+    const float current_max_scale = buffer_get_float32_auto(data, &i);
+    const float limit_min_in = buffer_get_float32_auto(data, &i);
+    const float limit_max_in = buffer_get_float32_auto(data, &i);
+    const float duty_min = buffer_get_float32_auto(data, &i);
+    const float duty_max = buffer_get_float32_auto(data, &i);
+    float watt_min = buffer_get_float32_auto(data, &i);
+    float watt_max = buffer_get_float32_auto(data, &i);
+    float input_min = 0.0f, input_max = 0.0f;
+    const bool has_input_limits = len >= (uint16_t)(i + 8);
+    if (has_input_limits) {
+        input_min = buffer_get_float32_auto(data, &i);
+        input_max = buffer_get_float32_auto(data, &i);
+    }
+    const float controllers = (divide && forward && !second) ? 2.0f : 1.0f;
+    watt_min /= controllers;
+    watt_max /= controllers;
+
+    for (uint8_t motor = 0u; motor < 2u; ++motor) {
+        const bool target_second = motor != 0u;
+        if (target_second != second && !(forward && !second)) continue;
+        mc_configuration c = *mc_interface_get_configuration_motor(target_second);
+        c.l_current_min_scale = current_min_scale;
+        c.l_current_max_scale = current_max_scale;
+        if (packet_id == COMM_SET_MCCONF_TEMP_SETUP) {
+            const float wheel = c.si_wheel_diameter > 0.001f ? c.si_wheel_diameter : MCCONF_SI_WHEEL_DIAMETER;
+            const float gear = c.si_gear_ratio > 0.0f ? c.si_gear_ratio : 1.0f;
+            const float fact = (((float)c.si_motor_poles * 0.5f) * 60.0f * gear) /
+                               (wheel * 3.14159265358979323846f);
+            c.l_min_erpm = limit_min_in * fact;
+            c.l_max_erpm = limit_max_in * fact;
+        } else {
+            c.l_min_erpm = limit_min_in;
+            c.l_max_erpm = limit_max_in;
+        }
+        c.l_min_duty = duty_min;
+        c.l_max_duty = duty_max;
+        c.l_watt_min = watt_min;
+        c.l_watt_max = watt_max;
+        if (has_input_limits) {
+            c.l_in_current_min = input_min;
+            c.l_in_current_max = input_max;
+        }
+        mc_interface_select_motor_thread(target_second ? 2 : 1);
+        mc_interface_set_configuration(&c);
+        if (store) (void)mc_interface_store_configuration_motor(target_second);
+    }
+    mc_interface_select_motor_thread(second ? 2 : 1);
+    if (ack) { uint8_t id = (uint8_t)packet_id; uart_send_payload(&id, 1u); }
 }
 
 static void reply_decoded_adc(void) {
@@ -1121,9 +1441,73 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint32(b,s_tx_start_fail,&i);
             buffer_append_uint32(b,s_rx_queue_highwater,&i);
             buffer_append_uint32(b,s_process_gap_max_ms,&i);
+            buffer_append_uint32(b,main_prof_vesc_max_cycles,&i);
+            buffer_append_uint32(b,main_prof_house_max_cycles,&i);
+            buffer_append_uint32(b,main_prof_tail_max_cycles,&i);
         }
         uart_send_payload(b, (uint16_t)i);
     }
+}
+
+/** Kirim teks Terminal sebagai COMM_PRINT agar framing VESC Tool tetap utuh. */
+static void terminal_send_text(const char *text) {
+    if (!text) return;
+    uint8_t b[192];
+    const size_t n = strlen(text);
+    const size_t copy = n > sizeof(b) - 1u ? sizeof(b) - 1u : n;
+    b[0] = COMM_PRINT;
+    memcpy(&b[1], text, copy);
+    uart_send_payload(b, (uint16_t)(copy + 1u));
+}
+
+/**
+ * Terminal minimum yang relevan untuk board dual-hoverboard.
+ * Perintah tidak pernah meneruskan raw printf ke USART3; semua keluaran selalu
+ * dibungkus COMM_PRINT sehingga VESC Tool tetap sinkron dengan CRC/framing.
+ */
+static void process_terminal_command(bool second, const uint8_t *data, uint16_t len) {
+    char cmd[48];
+    const uint16_t copy = len >= sizeof(cmd) ? (uint16_t)(sizeof(cmd) - 1u) : len;
+    if (copy > 0u) memcpy(cmd, data, copy);
+    cmd[copy] = '\0';
+    /* Track the live length ourselves. The previous version re-tested the
+     * loop guard against the original `copy` count instead of the string's
+     * current length, so an all-CR/LF command (e.g. a bare Enter keypress in
+     * the VESC Tool terminal) stripped the buffer down to "" and then read
+     * cmd[strlen(cmd)-1] == cmd[(size_t)-1] -- an out-of-bounds underflow
+     * read/write one byte before the stack buffer. Reproduced with ASan. */
+    size_t cmd_len = copy;
+    while (cmd_len > 0u && (cmd[cmd_len - 1u] == '\r' || cmd[cmd_len - 1u] == '\n')) {
+        cmd[--cmd_len] = '\0';
+    }
+
+    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
+        terminal_send_text("Commands: help, status, faults, stop, fw\n");
+        return;
+    }
+    if (strcmp(cmd, "stop") == 0) {
+        mc_interface_release_motor();
+        terminal_send_text(second ? "motor_right released\n" : "motor_left released\n");
+        return;
+    }
+    if (strcmp(cmd, "fw") == 0) {
+        terminal_send_text(second ? "motor_right FW 6.00\n" : "motor_left FW 6.00\n");
+        return;
+    }
+    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "faults") == 0) {
+        mc_values v;
+        get_values_normalized(second, &v);
+        const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
+        char out[180];
+        const int written = snprintf(out, sizeof(out),
+            "id=%u fault=%u hall=%u erpm=%ld duty=%ld/1000 Vin=%ldmV Iq=%ldmA Id=%ldmA\n",
+            (unsigned)v.vesc_id, (unsigned)v.fault_code, (unsigned)m->m_hall_state,
+            (long)v.rpm, (long)(v.duty_now * 1000.0f), (long)(v.v_in * 1000.0f),
+            (long)(v.iq * 1000.0f), (long)(v.id * 1000.0f));
+        if (written > 0) terminal_send_text(out);
+        return;
+    }
+    terminal_send_text("Unknown command. Type help.\n");
 }
 
 static void process_command(const uint8_t *p, uint16_t len, bool second) {
@@ -1176,6 +1560,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
             touch_motor(second); mc_interface_set_current(right_sign(second, current));
         }
         break;
+    case COMM_SET_CURRENT_REL:
+        set_current_relative(second, d, n);
+        break;
     case COMM_SET_CURRENT_BRAKE:
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
@@ -1214,6 +1601,19 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         if (hall_detect_motor_locked(second)) break;
         set_mcconf(second, d, n);
         break;
+    case COMM_SET_MCCONF_TEMP:
+    case COMM_SET_MCCONF_TEMP_SETUP:
+        set_mcconf_temp(second, id, d, n);
+        break;
+    case COMM_GET_MCCONF_TEMP:
+        reply_mcconf_temp(second);
+        break;
+    case COMM_GET_BATTERY_CUT:
+        reply_battery_cut(second);
+        break;
+    case COMM_SET_BATTERY_CUT:
+        set_battery_cut(second, d, n);
+        break;
     case COMM_GET_APPCONF:
     case COMM_GET_APPCONF_DEFAULT:
         reply_appconf(second, id);
@@ -1221,8 +1621,24 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_GET_DECODED_ADC:
         reply_decoded_adc();
         break;
+    case COMM_SET_ODOMETER:
+        /* Tombol Set Odometer VESC Tool tidak punya ACK. Simpan offset terhadap
+         * trip Hall saat ini supaya pembacaan berikutnya terus bertambah. */
+        if (n >= 4u) {
+            const uint32_t requested = buffer_get_uint32(d, &k);
+            mc_values ov;
+            float speed_unused = 0.0f, dist_unused = 0.0f, dist_abs = 0.0f;
+            get_values_normalized(second, &ov);
+            setup_motion_values(second, &ov, &speed_unused, &dist_unused, &dist_abs);
+            const int64_t trip = (int64_t)(dist_abs >= 0.0f ? dist_abs : 0.0f);
+            s_odometer_offset_m[second ? 1u : 0u] = (int64_t)requested - trip;
+        }
+        break;
     case COMM_SET_APPCONF:
-        set_appconf(second, d, n);
+        set_appconf(second, d, n, true, COMM_SET_APPCONF);
+        break;
+    case COMM_SET_APPCONF_NO_STORE:
+        set_appconf(second, d, n, false, COMM_SET_APPCONF_NO_STORE);
         break;
     case COMM_APP_DISABLE_OUTPUT:
         /* VESC Tool sends [forward_can][time_ms] before Detect All. This dual
@@ -1241,8 +1657,25 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_DETECT_APPLY_ALL_FOC:
         if(!second) detect_all_begin(d,n);
         break;
+    case COMM_TERMINAL_CMD:
+    case COMM_TERMINAL_CMD_SYNC:
+        process_terminal_command(second, d, n);
+        break;
+    case COMM_SHUTDOWN:
+        /* Board hoverboard tidak mempunyai power-latch VESC. Pertahankan
+         * command tetap aman: lepaskan bridge/motor tanpa mematikan MCU/UART. */
+        mc_interface_release_motor();
+        break;
     case COMM_CUSTOM_APP_DATA:
         process_custom_app(second, d, n);
+        break;
+    case COMM_REBOOT:
+        /* Sama seperti VESC: release bridge dahulu, lalu reset MCU. Host build
+         * sengaja tidak mengeksekusi register Cortex-M agar unit test aman. */
+        mc_interface_release_motor();
+#ifdef STM32F103xE
+        NVIC_SystemReset();
+#endif
         break;
     default:
         /* Unsupported commands are intentionally ignored, as stock VESC commands.c does
@@ -1271,6 +1704,19 @@ static void process_top_packet(const uint8_t *p, uint16_t len) {
     process_command(p, len, false);
 }
 
+static void process_rt_mailboxes(void) {
+    for (uint8_t mi=0u; mi<2u; ++mi) {
+        uint8_t p[5]; uint8_t have=0u;
+        __disable_irq();
+        if (s_rt_cmd[mi].pending && s_rt_cmd[mi].len==5u) {
+            memcpy(p,(const void *)s_rt_cmd[mi].payload,5u);
+            s_rt_cmd[mi].pending=0u; have=1u;
+        }
+        __enable_irq();
+        if (have) process_command(p,5u,mi!=0u);
+    }
+}
+
 void vesc_protocol_process_pending(void) {
     const uint32_t process_now_ms = HAL_GetTick();
     if (s_process_last_ms != 0u) {
@@ -1279,6 +1725,7 @@ void vesc_protocol_process_pending(void) {
     }
     s_process_last_ms = process_now_ms;
     vesc_tx_service();
+    process_rt_mailboxes();
     for (;;) {
         uint16_t n = 0u;
         uint8_t slot = 0u;
@@ -1297,6 +1744,7 @@ void vesc_protocol_process_pending(void) {
         __enable_irq();
         s_link_last_ms = HAL_GetTick();
         process_top_packet(s_process_payload, n);
+        process_rt_mailboxes();
         vesc_tx_service();
     }
     vesc_tx_service();

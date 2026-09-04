@@ -28,12 +28,34 @@ COMM_SET_CURRENT_BRAKE = 7
 COMM_SET_RPM = 8
 COMM_SET_POS = 9
 COMM_SET_HANDBRAKE = 10
+COMM_SET_MCCONF = 13
+COMM_GET_MCCONF = 14
+COMM_GET_MCCONF_DEFAULT = 15
+COMM_SET_APPCONF = 16
+COMM_GET_APPCONF = 17
+COMM_GET_APPCONF_DEFAULT = 18
+COMM_TERMINAL_CMD = 20
+COMM_PRINT = 21
+COMM_REBOOT = 29
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
+COMM_GET_DECODED_ADC = 32
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
+COMM_SET_MCCONF_TEMP = 48
+COMM_SET_MCCONF_TEMP_SETUP = 49
 COMM_GET_VALUES_SELECTIVE = 50
+COMM_GET_VALUES_SETUP_SELECTIVE = 51
+COMM_DETECT_APPLY_ALL_FOC = 58
 COMM_PING_CAN = 62
+COMM_TERMINAL_CMD_SYNC = 64
+COMM_SET_CURRENT_REL = 84
+COMM_SET_BATTERY_CUT = 86
+COMM_GET_MCCONF_TEMP = 91
+COMM_SET_ODOMETER = 110
+COMM_GET_BATTERY_CUT = 115
+COMM_SET_APPCONF_NO_STORE = 149
+COMM_SHUTDOWN = 156
 RIGHT_ID = 2
 POLE_PAIRS = 15
 STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
@@ -142,6 +164,51 @@ class Values:
                 f"Id={self.id:.2f}A Iq={self.iq:.2f}A Vd={self.vd:.2f}V "
                 f"Vq={self.vq:.2f}V Vin={self.vin:.1f}V pos={self.position:.2f}deg fault={self.fault}")
 
+
+
+@dataclass
+class SetupValues:
+    """Field COMM_GET_VALUES_SETUP VESC Tool 6.00 dalam satuan fisik."""
+    temp_mos: float
+    temp_motor: float
+    current_total: float
+    current_in_total: float
+    duty: float
+    rpm: float
+    speed_m_s: float
+    vin: float
+    battery_level: float
+    amp_hours: float
+    amp_hours_charged: float
+    watt_hours: float
+    watt_hours_charged: float
+    distance_m: float
+    distance_abs_m: float
+    position_deg: float
+    fault: int
+    vesc_id: int
+    num_vescs: int
+    wh_battery_left: float
+    odometer_m: int
+    uptime_ms: int
+
+
+@dataclass
+class McconfTemp:
+    """Subset limit runtime yang dibaca COMM_GET_MCCONF_TEMP VESC 6.00."""
+    current_min_scale: float
+    current_max_scale: float
+    min_erpm: float
+    max_erpm: float
+    min_duty: float
+    max_duty: float
+    watt_min: float
+    watt_max: float
+    input_current_min: float
+    input_current_max: float
+    motor_poles: int
+    gear_ratio: float
+    wheel_diameter: float
 
 
 @dataclass
@@ -391,6 +458,18 @@ def parse_selective(payload: bytes, expected_mask: int = VALUE_MASK) -> Values:
     return v
 
 
+def _pack_float32_auto(value: float) -> bytes:
+    """Encode float32_auto VESC; untuk angka normal layout-nya IEEE-754 big-endian."""
+    return struct.pack(">f", float(value))
+
+
+def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
+    """Decode satu float32_auto VESC dan kembalikan nilai serta offset berikutnya."""
+    if offset + 4 > len(data):
+        raise ValueError("short float32_auto")
+    return struct.unpack_from(">f", data, offset)[0], offset + 4
+
+
 class VescDual:
     def __init__(self, port: str, baud: int = 115200, timeout: float = 0.15):
         if serial is None:
@@ -439,6 +518,189 @@ class VescDual:
         r = bytes((COMM_SET_CURRENT,)) + struct.pack(">i", round(right * 1000))
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
+
+    def set_current_rel(self, left: float, right: float):
+        """Kirim Commands::setCurrentRel VESC Tool, skala -1.0..+1.0 = -100..+100%."""
+        if not -1.0 <= left <= 1.0 or not -1.0 <= right <= 1.0:
+            raise ValueError("relative current harus -1..1")
+        l = bytes((COMM_SET_CURRENT_REL,)) + struct.pack(">i", round(left * 100000.0))
+        r = bytes((COMM_SET_CURRENT_REL,)) + struct.pack(">i", round(right * 100000.0))
+        with self.io_lock:
+            self.send(l)
+            self.send(self.fwd(r))
+
+    def get_mcconf_raw(self, right: bool = False, default: bool = False) -> bytes:
+        """Baca payload MC Config mentah seperti tombol Read/Read Default VESC Tool."""
+        cmd = COMM_GET_MCCONF_DEFAULT if default else COMM_GET_MCCONF
+        req = bytes((cmd,))
+        p = self.transact(self.fwd(req) if right else req, cmd, 1.2)
+        if len(p) < 8:
+            raise ValueError("short MC Config reply")
+        return p[1:]
+
+    def set_mcconf_raw(self, raw: bytes, right: bool = False) -> None:
+        """Tulis kembali payload MC Config 6.00 persis seperti tombol Write VESC Tool."""
+        req = bytes((COMM_SET_MCCONF,)) + bytes(raw)
+        p = self.transact(self.fwd(req) if right else req, COMM_SET_MCCONF, 1.2)
+        if p != bytes((COMM_SET_MCCONF,)):
+            raise ValueError("invalid MC Config ACK")
+
+    def get_appconf_raw(self, right: bool = False, default: bool = False) -> bytes:
+        """Baca payload App Config mentah tanpa mengubah schema yang dibuat VESC 6.00."""
+        cmd = COMM_GET_APPCONF_DEFAULT if default else COMM_GET_APPCONF
+        req = bytes((cmd,))
+        p = self.transact(self.fwd(req) if right else req, cmd, 1.2)
+        if len(p) < 8:
+            raise ValueError("short App Config reply")
+        return p[1:]
+
+    def set_appconf_raw(self, raw: bytes, right: bool = False, store: bool = True) -> None:
+        """Tulis App Config dengan semantik SET_APPCONF atau SET_APPCONF_NO_STORE."""
+        cmd = COMM_SET_APPCONF if store else COMM_SET_APPCONF_NO_STORE
+        req = bytes((cmd,)) + bytes(raw)
+        p = self.transact(self.fwd(req) if right else req, cmd, 1.2)
+        if p != bytes((cmd,)):
+            raise ValueError("invalid App Config ACK")
+
+    def decoded_adc(self) -> tuple[float, float, float, float]:
+        """Baca ADC1/ADC2 seperti tab Realtime ADC VESC Tool."""
+        p = self.transact(bytes((COMM_GET_DECODED_ADC,)), COMM_GET_DECODED_ADC, 0.5)
+        if len(p) != 17:
+            raise ValueError(f"unexpected decoded ADC reply length {len(p)}")
+        return tuple(struct.unpack_from(">i", p, 1 + 4 * i)[0] / 1_000_000.0 for i in range(4))
+
+    def setup_values(self, right: bool = False) -> SetupValues:
+        """Baca COMM_GET_VALUES_SETUP dan parse dengan urutan Commands::getValuesSetup VESC 6.00."""
+        req = bytes((47,))
+        p = self.transact(self.fwd(req) if right else req, 47, 0.5)
+        i = 1
+        def i16(scale: float) -> float:
+            nonlocal i
+            v = struct.unpack_from(">h", p, i)[0] / scale; i += 2; return v
+        def i32(scale: float) -> float:
+            nonlocal i
+            v = struct.unpack_from(">i", p, i)[0] / scale; i += 4; return v
+        vals = [i16(10), i16(10), i32(100), i32(100), i16(1000), i32(1),
+                i32(1000), i16(10), i16(1000), i32(10000), i32(10000),
+                i32(10000), i32(10000), i32(1000), i32(1000), i32(1_000_000)]
+        fault = p[i]; vesc_id = p[i + 1]; num_vescs = p[i + 2]; i += 3
+        wh_left = i32(1000)
+        odometer = struct.unpack_from(">I", p, i)[0]; i += 4
+        uptime = struct.unpack_from(">I", p, i)[0]; i += 4
+        if i != len(p):
+            raise ValueError(f"Setup Values parser consumed {i}, packet has {len(p)}")
+        return SetupValues(*vals, fault, vesc_id, num_vescs, wh_left, odometer, uptime)
+
+    def terminal(self, command: str, right: bool = False, sync: bool = True) -> str:
+        """Kirim command Terminal VESC Tool dan tunggu COMM_PRINT framed reply."""
+        cmd = COMM_TERMINAL_CMD_SYNC if sync else COMM_TERMINAL_CMD
+        req = bytes((cmd,)) + command.encode("utf-8")
+        p = self.transact(self.fwd(req) if right else req, COMM_PRINT, 0.8)
+        return p[1:].decode("utf-8", errors="replace")
+
+    def set_odometer(self, meters: int, right: bool = False) -> None:
+        """Kirim tombol Set Odometer VESC Tool; command standar ini tidak memiliki ACK."""
+        if not 0 <= int(meters) <= 0xFFFFFFFF:
+            raise ValueError("odometer harus 0..4294967295 meter")
+        req = bytes((COMM_SET_ODOMETER,)) + struct.pack(">I", int(meters))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
+
+    def shutdown_safe(self, right: bool = False) -> None:
+        """Kirim COMM_SHUTDOWN; pada board ini firmware memetakan ke safe bridge release."""
+        req = bytes((COMM_SHUTDOWN, 0, 0))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
+
+    def detect_all_foc(self, max_power_loss: float = 50.0, min_current_in: float = -8.0,
+                       max_current_in: float = 8.0, openloop_rpm: float = 250.0,
+                       sl_erpm: float = 2500.0, detect_can: bool = True) -> int:
+        """Jalankan tombol Detect All FOC VESC Tool 6.00 pada kedua motor on-board."""
+        out = bytearray((COMM_DETECT_APPLY_ALL_FOC, 1 if detect_can else 0))
+        for value in (max_power_loss, min_current_in, max_current_in, openloop_rpm, sl_erpm):
+            out += struct.pack(">i", round(value * 1000.0))
+        p = self.transact(bytes(out), COMM_DETECT_APPLY_ALL_FOC, 35.0)
+        if len(p) != 3:
+            raise ValueError(f"unexpected Detect All reply length {len(p)}")
+        return struct.unpack_from(">h", p, 1)[0]
+
+    def get_battery_cut(self, right: bool = False) -> tuple[float, float]:
+        """Baca l_battery_cut_start/end dengan format persis VESC 6.00."""
+        req = bytes((COMM_GET_BATTERY_CUT,))
+        p = self.transact(self.fwd(req) if right else req, COMM_GET_BATTERY_CUT)
+        if len(p) != 9:
+            raise ValueError(f"unexpected battery-cut reply length {len(p)}")
+        return struct.unpack_from(">i", p, 1)[0] / 1000.0, struct.unpack_from(">i", p, 5)[0] / 1000.0
+
+    def set_battery_cut(self, start_v: float, end_v: float, *, store: bool = False,
+                        forward: bool = False, right: bool = False) -> None:
+        """Terapkan Commands::setBatteryCut; ACK wajib diterima sebelum fungsi selesai."""
+        if not (0.0 <= end_v < start_v <= 80.0):
+            raise ValueError("battery cut harus 0 <= end < start <= 80 V")
+        req = (bytes((COMM_SET_BATTERY_CUT,)) +
+               struct.pack(">iiBB", round(start_v * 1000.0), round(end_v * 1000.0),
+                           1 if store else 0, 1 if forward else 0))
+        p = self.transact(self.fwd(req) if right else req, COMM_SET_BATTERY_CUT)
+        if p != bytes((COMM_SET_BATTERY_CUT,)):
+            raise ValueError("invalid battery-cut ACK")
+
+    def get_mcconf_temp(self, right: bool = False) -> McconfTemp:
+        """Baca limit runtime halaman Setup VESC Tool tanpa mengubah konfigurasi."""
+        req = bytes((COMM_GET_MCCONF_TEMP,))
+        p = self.transact(self.fwd(req) if right else req, COMM_GET_MCCONF_TEMP)
+        if len(p) < 50:
+            raise ValueError(f"short MC temp reply: {len(p)}")
+        i = 1
+        vals = []
+        for _ in range(10):
+            value, i = _unpack_float32_auto(p, i)
+            vals.append(value)
+        poles = p[i]; i += 1
+        gear, i = _unpack_float32_auto(p, i)
+        wheel, i = _unpack_float32_auto(p, i)
+        if i != len(p):
+            raise ValueError(f"MC temp parser consumed {i}, packet has {len(p)}")
+        return McconfTemp(*vals, motor_poles=poles, gear_ratio=gear, wheel_diameter=wheel)
+
+    def set_mcconf_temp(self, conf: McconfTemp, *, store: bool = False,
+                        forward: bool = False, ack: bool = True,
+                        divide_by_controllers: bool = False, setup_units: bool = False,
+                        right: bool = False) -> None:
+        """Kirim Commands::setMcconfTemp/Setup persis urutan field VESC Tool 6.00."""
+        cmd = COMM_SET_MCCONF_TEMP_SETUP if setup_units else COMM_SET_MCCONF_TEMP
+        out = bytearray((cmd, 1 if store else 0, 1 if forward else 0,
+                         1 if ack else 0, 1 if divide_by_controllers else 0))
+        for value in (conf.current_min_scale, conf.current_max_scale, conf.min_erpm, conf.max_erpm,
+                      conf.min_duty, conf.max_duty, conf.watt_min, conf.watt_max,
+                      conf.input_current_min, conf.input_current_max):
+            out += _pack_float32_auto(value)
+        req = bytes(out)
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            if ack:
+                p = self.recv(cmd)
+                if p != bytes((cmd,)):
+                    raise ValueError("invalid MC temp ACK")
+
+    def appconf_roundtrip_no_store(self, right: bool = False) -> None:
+        """Uji tombol App Config no-store tanpa perlu memahami schema: GET lalu echo payload identik sebagai NO_STORE."""
+        get_req = bytes((COMM_GET_APPCONF,))
+        current = self.transact(self.fwd(get_req) if right else get_req, COMM_GET_APPCONF, 0.8)
+        if len(current) < 8:
+            raise ValueError("short App Config reply")
+        req = bytes((COMM_SET_APPCONF_NO_STORE,)) + current[1:]
+        p = self.transact(self.fwd(req) if right else req, COMM_SET_APPCONF_NO_STORE, 0.8)
+        if p != bytes((COMM_SET_APPCONF_NO_STORE,)):
+            raise ValueError("invalid App Config no-store ACK")
+
+    def reboot(self, right: bool = False) -> None:
+        """Kirim COMM_REBOOT. Tidak menunggu ACK karena VESC 6.00 langsung reset."""
+        req = bytes((COMM_REBOOT,))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
 
     def set_rpm(self, left: int, right: int):
         l = bytes((COMM_SET_RPM,)) + struct.pack(">i", int(left))

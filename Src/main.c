@@ -37,6 +37,9 @@ extern volatile int16_t foc_idL_q4;
 extern volatile int16_t foc_idR_q4;
 
 volatile uint32_t main_loop_counter = 0;
+volatile uint32_t main_prof_vesc_max_cycles = 0u;
+volatile uint32_t main_prof_house_max_cycles = 0u;
+volatile uint32_t main_prof_tail_max_cycles = 0u;
 int16_t batVoltageCalib = 0;
 int16_t board_temp_deg_c = 0;
 int16_t left_dc_curr = 0;
@@ -170,11 +173,16 @@ int main(void) {
      * Keeping this outside the ~5 ms housekeeping gate avoids adding one full
      * control-loop period of latency to every UART transaction. FOC itself
      * remains interrupt-driven and is not moved into this path. */
+    uint32_t prof0=DWT->CYCCNT;
     vesc_protocol_process_pending();
     vesc_protocol_periodic(HAL_GetTick());
+    uint32_t profd=DWT->CYCCNT-prof0;
+    // cppcheck-suppress unsignedLessThanZero -- CYCCNT dan maksimum profiler sama-sama uint32_t.
+    if(profd>main_prof_vesc_max_cycles)main_prof_vesc_max_cycles=profd;
 
     if ((buzzerTimer - buzzerTimerPrev) <= (16u * DELAY_IN_MAIN_LOOP)) continue;
 
+    prof0=DWT->CYCCNT;
     readCommand();
     const bool vescLinkActive = vesc_protocol_link_active();
     calcAvgSpeed();
@@ -191,6 +199,10 @@ int main(void) {
       enable = 1;
       printf("-- Motors enabled --\r\n");
     }
+
+    profd=DWT->CYCCNT-prof0;
+    if(profd>main_prof_house_max_cycles)main_prof_house_max_cycles=profd;
+    prof0=DWT->CYCCNT;
 
     /* Left and right motor commands are independent. STOP also follows the
      * same rate limiter so the motors decelerate instead of dropping torque
@@ -220,6 +232,7 @@ int main(void) {
     board_temp_deg_c = (TEMP_CAL_HIGH_DEG_C - TEMP_CAL_LOW_DEG_C) *
                        (boardTempAdcFilt - TEMP_CAL_LOW_ADC) /
                        (TEMP_CAL_HIGH_ADC - TEMP_CAL_LOW_ADC) + TEMP_CAL_LOW_DEG_C;
+    mcpwm_foc_set_board_temperature_x10(board_temp_deg_c);
     batVoltageCalib = batVoltage * BAT_CALIB_REAL_VOLTAGE / BAT_CALIB_ADC;
     left_dc_curr = -(m_motor_1.m_current_in_counts * 100) / A2BIT_CONV;
     right_dc_curr = -(m_motor_2.m_current_in_counts * 100) / A2BIT_CONV;
@@ -299,6 +312,8 @@ int main(void) {
     // else ++inactivityTimeoutCounter;
     // if (inactivityTimeoutCounter > (INACTIVITY_TIMEOUT * 60u * 1000u) / (DELAY_IN_MAIN_LOOP + 1u)) poweroff();
 
+    profd=DWT->CYCCNT-prof0;
+    if(profd>main_prof_tail_max_cycles)main_prof_tail_max_cycles=profd;
     buzzerTimerPrev = buzzerTimer;
     ++main_loop_counter;
   }

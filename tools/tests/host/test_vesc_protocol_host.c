@@ -9,6 +9,7 @@
 #include "vesc/buffer.h"
 #include "vesc/crc.h"
 #include "vesc/vesc_protocol.h"
+#include "vesc/app_vesc.h"
 #include "vesc/mcconf_serial.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
@@ -220,7 +221,20 @@ int main(void){
     diag_motors[0].m_hall_state=5u; diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT; diag_motors[0].m_state=MC_STATE_RUNNING;
     diag_motors[1].m_iq_target_q4=-2400; diag_motors[1].m_iq_set_q4=-1600; diag_motors[1].m_iq_q4=-800;
     diag_motors[1].m_hall_state=3u; diag_motors[1].m_control_mode=CONTROL_MODE_CURRENT; diag_motors[1].m_state=MC_STATE_RUNNING;
-    confs[0].l_current_max=confs[1].l_current_max=15.0f; confs[0].l_current_min=confs[1].l_current_min=-15.0f;
+    confs[0].l_current_max=confs[1].l_current_max=15.0f;
+    confs[0].l_current_min=confs[1].l_current_min=-15.0f;
+    confs[0].l_current_max_scale=confs[1].l_current_max_scale=1.0f;
+    confs[0].l_current_min_scale=confs[1].l_current_min_scale=1.0f;
+    confs[0].l_battery_cut_start=confs[1].l_battery_cut_start=35.0f;
+    confs[0].l_battery_cut_end=confs[1].l_battery_cut_end=33.7f;
+    confs[0].l_min_erpm=confs[1].l_min_erpm=-15000.0f;
+    confs[0].l_max_erpm=confs[1].l_max_erpm=15000.0f;
+    confs[0].si_motor_poles=confs[1].si_motor_poles=30u;
+    confs[0].si_gear_ratio=confs[1].si_gear_ratio=1.0f;
+    confs[0].si_wheel_diameter=confs[1].si_wheel_diameter=0.083f;
+    confs[0].si_battery_type=confs[1].si_battery_type=BATTERY_TYPE_LIION_3_0__4_2;
+    confs[0].si_battery_cells=confs[1].si_battery_cells=10;
+    confs[0].si_battery_ah=confs[1].si_battery_ah=0.0f;
     vesc_protocol_init();
     uint8_t r[800];uint16_t rn=0u; int32_t k=0;
     uint8_t fw[]={COMM_FW_VERSION}; if(!transact(fw,sizeof(fw),r,&rn)||rn<4u||r[0]!=COMM_FW_VERSION||r[1]!=6u||r[2]!=0u)return fail("local fw");
@@ -229,8 +243,10 @@ int main(void){
     uint8_t fwr[]={COMM_FORWARD_CAN,2u,COMM_FW_VERSION}; if(!transact(fwr,sizeof(fwr),r,&rn)||rn<4u||r[0]!=COMM_FW_VERSION)return fail("right fw");
     if(strcmp((const char *)&r[3],"motor_right")!=0)return fail("right hardware name");
 
-    /* Four valid request frames can arrive before the 5-ms main loop runs.
-     * The RX FIFO must preserve all of them rather than V15's one-slot drop. */
+    /* Realtime SET_* commands are intentionally coalesced per motor. If several
+     * arrive before the main loop runs, only the newest setpoint is meaningful;
+     * stale duty/current/rpm commands must not consume the generic request FIFO.
+     * Read/config requests remain FIFO elsewhere in this test. */
     {
         uint8_t qd[5]={COMM_SET_DUTY,0,0,0,0}; int32_t qi=1; buffer_append_int32(qd,5000,&qi);
         uint8_t qc[5]={COMM_SET_CURRENT,0,0,0,0}; qi=1; buffer_append_int32(qc,3000,&qi);
@@ -238,8 +254,9 @@ int main(void){
         uint8_t qp[5]={COMM_SET_POS,0,0,0,0}; qi=1; buffer_append_int32(qp,15000000,&qi);
         enqueue_only(qd,sizeof(qd)); enqueue_only(qc,sizeof(qc)); enqueue_only(qr,sizeof(qr)); enqueue_only(qp,sizeof(qp));
         vesc_protocol_process_pending();
-        if(!nearf32(set_duty[0],0.05f,0.0001f)||!nearf32(set_current[0],3.0f,0.001f)||
-           !nearf32(set_rpm[0],50.0f,0.001f)||!nearf32(set_pos[0],15.0f,0.001f))return fail("rx fifo burst");
+        if(!nearf32(set_pos[0],15.0f,0.001f))return fail("realtime mailbox latest setpoint");
+        if(!nearf32(set_duty[0],0.0f,0.0001f)||!nearf32(set_current[0],0.0f,0.001f)||
+           !nearf32(set_rpm[0],0.0f,0.001f))return fail("realtime mailbox stale command applied");
     }
 
     uint8_t gv[]={COMM_GET_VALUES}; if(!transact(gv,sizeof(gv),r,&rn) || check_values_reply(r,rn,false)) return 1;
@@ -251,7 +268,48 @@ int main(void){
      * exactly one request -> one reply. */
     {
         uint8_t gvs[]={COMM_GET_VALUES_SETUP};
-        if(!transact(gvs,sizeof(gvs),r,&rn)||rn<2u||r[0]!=COMM_GET_VALUES_SETUP)return fail("setup values immediate");
+        if(!transact(gvs,sizeof(gvs),r,&rn)||rn<50u||r[0]!=COMM_GET_VALUES_SETUP)return fail("setup values immediate");
+        int32_t si=1;
+        (void)buffer_get_float16(r,1e1f,&si); /* temp mos */
+        (void)buffer_get_float16(r,1e1f,&si); /* temp motor */
+        const float setup_imotor=buffer_get_float32(r,1e2f,&si);
+        const float setup_iin=buffer_get_float32(r,1e2f,&si);
+        (void)buffer_get_float16(r,1e3f,&si); /* duty */
+        (void)buffer_get_float32(r,1e0f,&si); /* ERPM */
+        const float speed=buffer_get_float32(r,1e3f,&si);
+        (void)buffer_get_float16(r,1e1f,&si); /* Vin */
+        const float battery=buffer_get_float16(r,1e3f,&si);
+        (void)buffer_get_float32(r,1e4f,&si); (void)buffer_get_float32(r,1e4f,&si);
+        (void)buffer_get_float32(r,1e4f,&si); (void)buffer_get_float32(r,1e4f,&si);
+        const float distance=buffer_get_float32(r,1e3f,&si);
+        const float distance_abs=buffer_get_float32(r,1e3f,&si);
+        const float expected_speed=(123.0f/15.0f/60.0f)*0.083f*3.14159265358979323846f;
+        const float expected_distance=31.0f*0.083f*3.14159265358979323846f/(3.0f*30.0f);
+        if(!nearf32(setup_imotor,4.0f,0.011f)||!nearf32(setup_iin,1.9f,0.011f))
+            return fail("setup dual current aggregation");
+        if(!nearf32(speed,expected_speed,0.0011f)||!nearf32(distance,expected_distance,0.0011f)||
+           !nearf32(distance_abs,expected_distance,0.0011f))return fail("setup speed/distance physical scaling");
+        if(battery<0.995f||battery>1.001f)return fail("setup Li-ion battery level");
+    }
+    /* VESC Tool Set Odometer has no ACK. Verify the selective Setup Values
+     * reader returns the requested runtime odometer value afterwards. */
+    {
+        uint8_t so[5]={COMM_SET_ODOMETER,0,0,0,0}; int32_t oi=1;
+        buffer_append_uint32(so,1234u,&oi);
+        if(!transact(so,sizeof(so),r,&rn)||rn!=0u)return fail("set odometer no-ack");
+        uint8_t gos[5]={COMM_GET_VALUES_SETUP_SELECTIVE,0,0,0,0}; oi=1;
+        buffer_append_uint32(gos,(1u<<20),&oi);
+        if(!transact(gos,sizeof(gos),r,&rn)||rn!=9u||r[0]!=COMM_GET_VALUES_SETUP_SELECTIVE)return fail("get selective odometer");
+        oi=1;
+        if(buffer_get_uint32(r,&oi)!=(1u<<20)||buffer_get_uint32(r,&oi)!=1234u)return fail("odometer value");
+    }
+    /* Power latch sengaja tidak digunakan pada board ini. COMM_SHUTDOWN tetap
+     * harus menghasilkan keadaan aman dengan melepas bridge tanpa ACK. */
+    {
+        diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT;
+        uint8_t sh[3]={COMM_SHUTDOWN,0u,0u};
+        if(!transact(sh,sizeof(sh),r,&rn)||rn!=0u)return fail("shutdown no-ack");
+        if(diag_motors[0].m_control_mode!=CONTROL_MODE_NONE)return fail("shutdown release");
     }
 
     uint8_t gvr[]={COMM_FORWARD_CAN,2u,COMM_GET_VALUES}; if(!transact(gvr,sizeof(gvr),r,&rn) || check_values_reply(r,rn,true)) return 1;
@@ -280,6 +338,99 @@ int main(void){
     uint8_t cur[7]={COMM_FORWARD_CAN,2u,COMM_SET_CURRENT,0,0,0,0}; k=3; buffer_append_int32(cur,2500,&k);
     if(!transact(cur,sizeof(cur),r,&rn)||rn!=0u)return fail("right current reply");
     if(fabsf(set_current[1]+2.5f)>0.001f||touch_count[1]==0u)return fail("right current sign/ownership");
+
+    /* VESC Tool Commands::setCurrentRel uses int32 x1e5. Verify both the
+     * percentage scaling and the virtual-right sign normalization. */
+    {
+        uint8_t rel[5]={COMM_SET_CURRENT_REL,0,0,0,0}; k=1; buffer_append_int32(rel,50000,&k);
+        if(!transact(rel,sizeof(rel),r,&rn)||rn!=0u||!nearf32(set_current[0],7.5f,0.002f))
+            return fail("set current relative local");
+        uint8_t relr[7]={COMM_FORWARD_CAN,2u,COMM_SET_CURRENT_REL,0,0,0,0}; k=3; buffer_append_int32(relr,50000,&k);
+        if(!transact(relr,sizeof(relr),r,&rn)||rn!=0u||!nearf32(set_current[1],-7.5f,0.002f))
+            return fail("set current relative right");
+    }
+
+    /* Battery-cut read/write is a standard VESC 6.00 control. First apply a
+     * volatile local value, then a stored+forwarded value to both endpoints. */
+    {
+        uint8_t gbc[]={COMM_GET_BATTERY_CUT};
+        if(!transact(gbc,sizeof(gbc),r,&rn)||rn!=9u||r[0]!=COMM_GET_BATTERY_CUT)return fail("get battery cut");
+        int32_t bi=1;
+        if(!nearf32(buffer_get_float32(r,1e3f,&bi),35.0f,0.002f)||
+           !nearf32(buffer_get_float32(r,1e3f,&bi),33.7f,0.002f))return fail("battery cut defaults");
+
+        uint8_t sbc[11]={COMM_SET_BATTERY_CUT}; bi=1;
+        buffer_append_float32(sbc,36.5f,1e3f,&bi); buffer_append_float32(sbc,33.0f,1e3f,&bi);
+        sbc[bi++]=0u; sbc[bi++]=0u;
+        const unsigned b0=store_count[0], b1=store_count[1];
+        if(!transact(sbc,(uint16_t)bi,r,&rn)||rn!=1u||r[0]!=COMM_SET_BATTERY_CUT)return fail("set battery cut volatile ack");
+        if(store_count[0]!=b0||store_count[1]!=b1||!nearf32(confs[0].l_battery_cut_start,36.5f,0.002f))
+            return fail("battery cut volatile semantics");
+
+        bi=1; buffer_append_float32(sbc,37.0f,1e3f,&bi); buffer_append_float32(sbc,33.2f,1e3f,&bi);
+        sbc[bi++]=1u; sbc[bi++]=1u;
+        if(!transact(sbc,(uint16_t)bi,r,&rn)||rn!=1u||r[0]!=COMM_SET_BATTERY_CUT)return fail("set battery cut stored ack");
+        if(store_count[0]!=b0+1u||store_count[1]!=b1+1u||
+           !nearf32(confs[0].l_battery_cut_start,37.0f,0.002f)||!nearf32(confs[1].l_battery_cut_end,33.2f,0.002f))
+            return fail("battery cut store/forward semantics");
+    }
+
+    /* Temporary MC limits are emitted by VESC Tool Setup. The ACK flag must
+     * be honored and store=false must not touch EEPROM. */
+    {
+        uint8_t mt[64]={0}; int32_t ti=0; mt[ti++]=COMM_SET_MCCONF_TEMP;
+        mt[ti++]=0u; mt[ti++]=0u; mt[ti++]=1u; mt[ti++]=0u;
+        buffer_append_float32_auto(mt,0.55f,&ti); buffer_append_float32_auto(mt,0.75f,&ti);
+        buffer_append_float32_auto(mt,-8000.0f,&ti); buffer_append_float32_auto(mt,9000.0f,&ti);
+        buffer_append_float32_auto(mt,0.01f,&ti); buffer_append_float32_auto(mt,0.80f,&ti);
+        buffer_append_float32_auto(mt,-50.0f,&ti); buffer_append_float32_auto(mt,75.0f,&ti);
+        const unsigned before=store_count[0];
+        if(!transact(mt,(uint16_t)ti,r,&rn)||rn!=1u||r[0]!=COMM_SET_MCCONF_TEMP)return fail("mcconf temp ack");
+        if(store_count[0]!=before||!nearf32(confs[0].l_current_min_scale,0.55f,0.001f)||
+           !nearf32(confs[0].l_current_max_scale,0.75f,0.001f)||!nearf32(confs[0].l_max_erpm,9000.0f,0.5f))
+            return fail("mcconf temp apply no-store");
+
+        uint8_t gmt[]={COMM_GET_MCCONF_TEMP};
+        if(!transact(gmt,sizeof(gmt),r,&rn)||rn<40u||r[0]!=COMM_GET_MCCONF_TEMP)return fail("get mcconf temp");
+        ti=1;
+        if(!nearf32(buffer_get_float32_auto(r,&ti),0.55f,0.001f)||!nearf32(buffer_get_float32_auto(r,&ti),0.75f,0.001f))
+            return fail("get mcconf temp scales");
+        if(!nearf32(buffer_get_float32_auto(r,&ti),-8000.0f,0.5f)||!nearf32(buffer_get_float32_auto(r,&ti),9000.0f,0.5f))
+            return fail("get mcconf temp erpm");
+    }
+
+    /* NO_STORE must still apply the App Config live and return its own command
+     * byte, matching Commands::setAppConfNoStore in VESC Tool. */
+    /* Hardware app support must be honest: only UART, ADC, and ADC+UART
+     * are accepted. Unsupported PPM/PAS modes canonicalize to UART. */
+    {
+        app_configuration ac;
+        app_vesc_defaults(&ac,1u);
+        ac.app_to_use=APP_PPM;
+        if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART)
+            return fail("unsupported app mode must canonicalize to UART");
+        ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_ADC;
+        if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_ADC)
+            return fail("APP_ADC support");
+        ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_ADC_UART;
+        if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_ADC_UART)
+            return fail("APP_ADC_UART support");
+        ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_UART;
+        if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART ||
+           app_vesc_get_configuration(false)->app_uart_baudrate!=115200u ||
+           !app_vesc_get_configuration(false)->permanent_uart_enabled)
+            return fail("APP_UART permanent 115200 support");
+    }
+
+    {
+        app_configuration ac=*app_vesc_get_configuration(false);
+        ac.timeout_msec=4321u;
+        uint8_t ap[700]; ap[0]=COMM_SET_APPCONF_NO_STORE;
+        const int32_t an=confgenerator_serialize_appconf(ap+1,&ac);
+        if(an<=0||!transact(ap,(uint16_t)(an+1),r,&rn)||rn!=1u||r[0]!=COMM_SET_APPCONF_NO_STORE)
+            return fail("appconf no-store ack");
+        if(app_vesc_get_configuration(false)->timeout_msec!=4321u)return fail("appconf no-store live apply");
+    }
     uint8_t rpm[5]={COMM_SET_RPM,0,0,0,0}; k=1;buffer_append_int32(rpm,300,&k);if(!transact(rpm,sizeof(rpm),r,&rn))return fail("local rpm frame");
     if(fabsf(set_rpm[0]-300.0f)>0.001f||touch_count[0]==0u)return fail("local rpm");
     uint8_t posl[5]={COMM_SET_POS,0,0,0,0}; k=1;buffer_append_int32(posl,45000000,&k);
@@ -430,6 +581,20 @@ int main(void){
         uint8_t ena[6]={COMM_APP_DISABLE_OUTPUT,0u,0u,0u,0u,0u};
         if(!transact(ena,sizeof(ena),r,&rn))return fail("re-enable app output");
     }
-    printf("VESC_PROTOCOL_HOST_PASS fw=6.00 can=2 rightIqInternal=%.2f localRpm=%.0f posL=%.0f posRinternal=%.0f hall=ok values=ok mcconf=rw\n",set_current[1],set_rpm[0],set_pos[0],set_pos[1]);
+    {
+        uint8_t th[]={COMM_TERMINAL_CMD,'h','e','l','p'};
+        if(!transact(th,sizeof(th),r,&rn)||rn<8u||r[0]!=COMM_PRINT||memcmp(r+1,"Commands:",9u)!=0)
+            return fail("terminal help framing");
+        uint8_t tf[]={COMM_FORWARD_CAN,2u,COMM_TERMINAL_CMD_SYNC,'f','w'};
+        if(!transact(tf,sizeof(tf),r,&rn)||r[0]!=COMM_PRINT||rn<12u||memcmp(r+1,"motor_right",11u)!=0)
+            return fail("terminal sync/right framing");
+    }
+    {
+        diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT;
+        uint8_t rb[]={COMM_REBOOT};
+        if(!transact(rb,sizeof(rb),r,&rn)||rn!=0u||diag_motors[0].m_control_mode!=CONTROL_MODE_NONE)
+            return fail("reboot release-before-reset contract");
+    }
+    printf("VESC_PROTOCOL_HOST_PASS fw=6.00 can=2 current_rel=ok battery_cut=rw mcconf_temp=rw app_nostore=ok odometer=ok shutdown=release reboot=ok hall=ok values=ok mcconf=rw\n");
     return 0;
 }

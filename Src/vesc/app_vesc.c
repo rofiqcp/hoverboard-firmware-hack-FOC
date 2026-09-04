@@ -229,8 +229,13 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     app_configuration c = *conf;
     c.controller_id = second ? 2u : 1u;
     c.can_mode = CAN_MODE_VESC;
-    c.permanent_uart_enabled = true; /* USART3 must always remain reachable by VESC Tool. */
-    if (c.app_to_use > APP_ADC_PAS) c.app_to_use = APP_UART;
+    c.permanent_uart_enabled = true; /* USART3 selalu harus dapat diakses VESC Tool. */
+    /* Hardware ini hanya mempunyai jalur aplikasi UART dan dua ADC PA2/PA3.
+     * Mode PPM/Nunchuk/NRF/PAS tidak memiliki input fisik, sehingga jangan
+     * menerima konfigurasi yang tampak valid tetapi tidak mungkin bekerja. */
+    if (c.app_to_use != APP_UART && c.app_to_use != APP_ADC && c.app_to_use != APP_ADC_UART) {
+        c.app_to_use = APP_UART;
+    }
     if (c.app_adc_conf.ctrl_type > ADC_CTRL_TYPE_PID_REV_BUTTON) c.app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
     if (c.app_adc_conf.update_rate_hz == 0u) c.app_adc_conf.update_rate_hz = 1u;
     /* This board has one physical VESC UART. Keep its electrical link fixed at
@@ -275,7 +280,7 @@ bool app_vesc_output_disabled(uint32_t now_ms) {
 }
 
 static bool adc_app_enabled(const app_configuration *a) {
-    return a->app_to_use == APP_ADC || a->app_to_use == APP_ADC_UART || a->app_to_use == APP_ADC_PAS;
+    return a->app_to_use == APP_ADC || a->app_to_use == APP_ADC_UART;
 }
 
 static void touch(bool second) {
@@ -437,6 +442,11 @@ void app_vesc_process(uint32_t now_ms) {
     if(app_vesc_output_disabled(now_ms)) { mc_interface_select_motor_thread(1); return; }
     const float v1 = (float)adc_buffer.adc2_spare4 * (3.3f / 4095.0f); /* PA2 / ADC2 CH2 */
     const float v2 = (float)adc_buffer.adc2_spare5 * (3.3f / 4095.0f); /* PA3 / ADC2 CH3 */
+    /* Realtime ADC VESC Tool harus tetap menampilkan tegangan pin walaupun
+     * App ADC tidak sedang dipilih. apply_adc() akan menimpa cache ini dengan
+     * nilai terfilter bila App ADC memang aktif. */
+    s_v1 = v1;
+    s_v2 = v2;
     const bool local_adc = adc_app_enabled(&s_conf[0]);
     if (local_adc) apply_adc(false, &s_conf[0], now_ms, v1, v2);
     if (local_adc && s_conf[0].app_adc_conf.multi_esc) {

@@ -4,16 +4,8 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import argparse,csv,struct,subprocess,tempfile,time
+import argparse,csv,struct,time
 from vesc_dual import VescDual,COMM_SET_RPM,COMM_SET_CURRENT_BRAKE,COMM_SET_HANDBRAKE,COMM_ALIVE
-COMM_GET_MCCONF=14; COMM_SET_MCCONF=13; GAIN_TOOL='/tmp/mc_speed_gain_tool'
-def getmc(l,r):
- p=l.transact(l.fwd(bytes([COMM_GET_MCCONF])) if r else bytes([COMM_GET_MCCONF]),COMM_GET_MCCONF,1.2); return p[1:]
-def setmc(l,r,raw):
- q=bytes([COMM_SET_MCCONF])+raw; p=l.transact(l.fwd(q) if r else q,COMM_SET_MCCONF,1.2); assert p==bytes([COMM_SET_MCCONF])
-def patch(raw,kp=.0095,ki=.022,kd=0):
- with tempfile.TemporaryDirectory() as td:
-  a=Path(td)/'a';b=Path(td)/'b';a.write_bytes(raw);subprocess.run([GAIN_TOOL,str(a),str(b),str(kp),str(ki),str(kd)],check=True,capture_output=True);return b.read_bytes()
 def send(l,r,c,val,scale):
  p=bytes([c])+struct.pack('>i',round(val*scale));
  with l.io_lock:l.send(l.fwd(p) if r else p)
@@ -29,9 +21,11 @@ def main():
  a=ap.parse_args()
  if not a.arm: ap.error('motor actuation requires --arm')
  stamp=time.strftime('%Y%m%d_%H%M%S');out=TOOLS_DIR/'results'/'speed_pid'/stamp;out.mkdir(parents=True,exist_ok=True);fpath=out/'brake_handbrake.csv'
- L=VescDual(a.port,115200,timeout=.7);orig={};rows=[]
+ L=VescDual(a.port,115200,timeout=.7);rows=[]
  try:
-  for r,m in [(False,'left'),(True,'right')]:orig[m]=getmc(L,r);setmc(L,r,patch(orig[m]));release(L,r)
+  # Audit memakai konfigurasi motor aktif apa adanya; test harness tidak boleh
+  # menulis MC config karena gain eksperimental dapat membuat hasil brake palsu.
+  for r,_m in [(False,'left'),(True,'right')]:release(L,r)
   for r,m in [(False,'left'),(True,'right')]:
    for sign in (1,-1):
     for ba in (.2,.4):
@@ -56,9 +50,8 @@ def main():
     print('HANDBRAKE',m,ha,'peakERPM',max(abs(x['erpm']) for x in hs),'finalERPM',hs[-1]['erpm'],'peakIq',max(abs(x['iq']) for x in hs),'fault',max(x['fault'] for x in hs))
  finally:
   for r,m in [(False,'left'),(True,'right')]:
-   try:
-    if m in orig:setmc(L,r,orig[m]);release(L,r)
-   except Exception as e:print('restore warn',m,e)
+   try: release(L,r)
+   except Exception as e: print('release warn',m,e)
   L.close()
  with fpath.open('w',newline='') as f:
   w=csv.DictWriter(f,fieldnames=['test','motor','sign','amps','phase','t','erpm','iq','imotor','duty','fault']);w.writeheader();w.writerows(rows)

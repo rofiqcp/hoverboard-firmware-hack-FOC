@@ -10,6 +10,21 @@
 #define MCCONF_L_CURRENT_MIN                -15.0f
 #define MCCONF_L_IN_CURRENT_MAX              15.0f
 #define MCCONF_L_IN_CURRENT_MIN             -15.0f
+/* Nilai konfigurasi VESC yang sebelumnya nol akibat memset. Battery cut
+ * mengikuti batas baterai 10S pada firmware hardware masteran (3.50/3.37 V/cell). */
+#define MCCONF_L_CURRENT_MAX_SCALE             1.0f
+#define MCCONF_L_CURRENT_MIN_SCALE             1.0f
+#define MCCONF_L_BATTERY_CUT_START            35.0f
+#define MCCONF_L_BATTERY_CUT_END              33.7f
+#define MCCONF_L_MIN_VIN                      30.0f
+#define MCCONF_L_MAX_VIN                      50.0f
+#define MCCONF_L_TEMP_FET_START                60.0f
+#define MCCONF_L_TEMP_FET_END                  65.0f
+#define MCCONF_L_TEMP_MOTOR_START              80.0f
+#define MCCONF_L_TEMP_MOTOR_END               100.0f
+#define MCCONF_L_WATT_MAX                1500000.0f
+#define MCCONF_L_WATT_MIN               -1500000.0f
+#define MCCONF_SI_WHEEL_DIAMETER              0.083f
 #define MCCONF_L_MAX_ERPM                 15000.0f
 #define MCCONF_L_MIN_ERPM                -15000.0f
 #define MCCONF_L_MIN_DUTY                     0.0f
@@ -25,7 +40,8 @@
 #define MCCONF_FOC_CURRENT_KI_Q16           1229u
 #define MCCONF_FOC_ID_KP_Q11                 819u
 #define MCCONF_FOC_ID_KI_Q16                 737u
-#define MCCONF_FOC_CURRENT_FILTER_Q16        7864u
+#define MCCONF_FOC_CURRENT_FILTER_Q16        7864u /* alpha=0.12 at raw 16-kHz sample rate */
+#define MCCONF_FOC_CURRENT_FILTER_CTRL_Q16  20874u /* 1-(1-0.12)^3 at 5.333-kHz D/Q update */
 /* VESC default foc_current_filter_const is 0.1. This port keeps the proven
  * 0.12 fixed-point feedback filter above, while the standard runtime config
  * field controls a separate monitoring LPF exactly as upstream intends. */
@@ -48,11 +64,16 @@
  * hardware-safe current cap and VESC process-D damping so one-sector commands cannot run away. */
 #define MCCONF_POSITION_CURRENT_MAX_MA          600u /* custom count-position ceiling */
 #define MCCONF_POSITION_RUN_CURRENT_MAX_MA      200u /* SET_POS tracking after first Hall motion */
+#define MCCONF_POSITION_DAMP_CURRENT_MA         400u /* kinetic brake; below measured 0.6 A static breakaway */
 #define MCCONF_POSITION_BREAKAWAY_CURRENT_MA    600u /* measured left-motor static breakaway */
 #define MCCONF_POSITION_BREAKAWAY_KICK_MS       350u
-#define MCCONF_POSITION_BREAKAWAY_REARM_MS      600u
+#define MCCONF_POSITION_COUNT_BREAKAWAY_CURRENT_MA 600u /* minimum bounded torque for +/-1 Hall-count stiction */
+#define MCCONF_POSITION_COUNT_BREAKAWAY_KICK_MS   350u /* short pulse; never continuous at target */
+#define MCCONF_POSITION_COUNT_BREAKAWAY_DELAY_MS    20u /* let normal VESC PID act first */
+#define MCCONF_POSITION_BREAKAWAY_REARM_MS      200u
 #define MCCONF_POSITION_PHASE_DEADBAND_MDEG    30000u /* Hall-only resolution: +/- half one 60-deg sector */
 #define MCCONF_POSITION_SETTLE_CURRENT_MA        150u
+#define MCCONF_POSITION_CURRENT_SLEW_A_PER_S      20u /* faster drive->damp transition only in SET_POS */
 #define MCCONF_POSITION_SETTLE_MS                120u
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
  * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */

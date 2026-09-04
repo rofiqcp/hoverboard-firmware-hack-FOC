@@ -312,11 +312,14 @@ def cmd_hall(args, link: VescDual) -> int:
         after = link.diag(is_right)
         print(f"{name}: protocol_result={'OK' if ok else 'FAIL'} table={table} {why}")
         print_diag(name + " AFTER", after)
-        if not ok or not valid or after.hall_table != table or not after.hall_store_ok:
-            print(f"{name}: RESULT FAIL (detect/table/apply/EEPROM)")
+        # Sesuai VESC 6.00, COMM_DETECT_HALL_FOC hanya mengembalikan tabel
+        # hasil deteksi lalu memulihkan konfigurasi lama. Apply/store dilakukan
+        # oleh VESC Tool melalui MC Config atau oleh Detect All FOC.
+        if not ok or not valid:
+            print(f"{name}: RESULT FAIL (detect/table invalid)")
             result = 2
         else:
-            print(f"{name}: RESULT PASS Hall table aktif + EEPROM")
+            print(f"{name}: RESULT PASS standalone Hall Detect (no auto-store, sesuai VESC 6.00)")
     return result
 
 
@@ -595,15 +598,24 @@ def cmd_wiring_check(args, link: VescDual) -> int:
     require_arm(args)
     rc = 0
     print("=== WIRING CHECK: MOTOR HARUS BEBAS BERPUTAR / RODA TERANGKAT ===")
+    print("=== DETECT ALL FOC: DETECT + APPLY + STORE BOTH MOTORS ===")
+    try:
+        detect_result = link.detect_all_foc(max_power_loss=50.0, min_current_in=-8.0,
+                                            max_current_in=8.0, openloop_rpm=250.0,
+                                            sl_erpm=2500.0, detect_can=True)
+    except Exception as exc:
+        print(f"WIRING_CHECK_FAIL Detect All exception: {exc}")
+        return 2
+    print(f"DETECT_ALL_RESULT={detect_result}")
+    if detect_result < 0:
+        print("WIRING_CHECK_FAIL Detect All returned error")
+        return 2
     for motor, is_right in (("left", False), ("right", True)):
-        print(f"=== {motor.upper()} HALL DETECT 1.0 A ===")
-        class H: pass
-        h=H(); h.arm=True; h.motor=motor; h.amps=1.0
-        if cmd_hall(h, link): rc = 2; continue
         d=link.diag(is_right)
         ok,why=hall_table_valid(d.hall_table)
         if not ok or not d.hall_store_ok:
             print(f"WIRING_CHECK_FAIL {motor}: Hall table/persistence {why}"); rc=2; continue
+        print(f"{motor.upper()} Hall aktif+stored {d.hall_table}")
         for amps in (0.10, -0.10):
             print(f"=== {motor.upper()} CURRENT {amps:+.2f} A ===")
             class C: pass

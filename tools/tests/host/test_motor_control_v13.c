@@ -25,6 +25,7 @@ extern volatile int32_t positionCommandL;
 extern volatile int32_t positionCommandR;
 extern int16_t curL_phaA, curL_phaB, curL_DC;
 extern int16_t curR_phaB, curR_phaC, curR_DC;
+extern int16_t batVoltage;
 
 void DMA1_Channel1_IRQHandler(void);
 
@@ -385,7 +386,9 @@ int main(void){
         if(m_motor_1.m_iq_target_q4<=0)return fail("VESC position positive phase error must request positive Iq");
         { const int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
           const int32_t abs_iq=m_motor_1.m_iq_target_q4<0?-m_motor_1.m_iq_target_q4:m_motor_1.m_iq_target_q4;
-          if(abs_iq>pos_lim_q4)return fail("VESC position current ceiling"); }
+          const int32_t abs_ref=m_motor_1.m_iq_set_q4<0?-m_motor_1.m_iq_set_q4:m_motor_1.m_iq_set_q4;
+          if(abs_iq>pos_lim_q4)return fail("VESC position current ceiling");
+          if(abs_ref>pos_lim_q4)return fail("VESC position slew reference overflow/cap"); }
         mcpwm_foc_set_pid_pos(mcpwm_foc_get_phase_motor(false),false);
         for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_iq_target_q4!=0)return fail("VESC position Hall deadband must release torque");
@@ -451,6 +454,64 @@ int main(void){
         if(fabsf(mcpwm_foc_get_output_rpm(false)-20.0f)>0.01f)return fail("gearbox output RPM");
         dyn.si_gear_ratio=1.0f; mcpwm_foc_set_configuration(&dyn,false);
         if(fabsf(mcpwm_foc_get_output_rpm(false)-100.0f)>0.01f)return fail("direct drive output RPM");
+    }
+
+    /* Batas safety VESC 6.00 harus benar-benar memengaruhi runtime, bukan
+     * sekadar terserialisasi di MC Config. Uji watt motoring/regen pada 40 V
+     * dan duty 0,5, lalu uji derating/fault temperatur dan Vin. */
+    {
+        mcpwm_foc_init(); enable=1u; set_halls(3u,3u);
+        mc_configuration saf=m_motor_1.m_conf;
+        saf.l_current_max=15.0f; saf.l_current_min=-15.0f;
+        saf.l_watt_max=100.0f; saf.l_watt_min=-80.0f;
+        saf.l_min_vin=30.0f; saf.l_max_vin=50.0f;
+        saf.l_temp_fet_start=60.0f; saf.l_temp_fet_end=65.0f;
+        mcpwm_foc_set_configuration(&saf,false);
+        batVoltage=(int16_t)((4000L*BAT_CALIB_ADC)/BAT_CALIB_REAL_VOLTAGE); /* 40,00 V */
+        m_motor_1.m_control_mode=CONTROL_MODE_CURRENT;
+        m_motor_1.m_duty_now_permille=500;
+        m_motor_1.m_iq_target_q4=10*FOC_CURRENT_Q4_PER_A;
+        m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
+        m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
+        mcpwm_foc_set_board_temperature_x10(250);
+        mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_iq_set_q4>5*FOC_CURRENT_Q4_PER_A+4)return fail("VESC watt max 100W @40V duty0.5");
+        m_motor_1.m_duty_now_permille=500;
+        m_motor_1.m_iq_target_q4=-10*FOC_CURRENT_Q4_PER_A;
+        m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
+        m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
+        mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_iq_set_q4<-(4*FOC_CURRENT_Q4_PER_A+4))return fail("VESC watt min -80W @40V duty0.5");
+
+        /* Pada 62,5 C (tengah 60..65 C) batas arus harus sekitar 50%. */
+        m_motor_1.m_duty_now_permille=0;
+        m_motor_1.m_iq_target_q4=15*FOC_CURRENT_Q4_PER_A;
+        m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
+        m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
+        mcpwm_foc_set_board_temperature_x10(625);
+        mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_iq_set_q4>7500*FOC_CURRENT_Q4_PER_A/1000+8)return fail("VESC FET temperature current derating");
+
+        /* Fault temperatur menggunakan jalur DMA safety yang sama dengan board. */
+        adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+        adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=(uint16_t)batVoltage;
+        for(int i=0;i<2001;i++)DMA1_Channel1_IRQHandler();
+        m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u;
+        mcpwm_foc_set_board_temperature_x10(650);
+        DMA1_Channel1_IRQHandler();
+        if(m_motor_1.m_fault!=FAULT_CODE_OVER_TEMP_FET)return fail("VESC FET over-temperature fault");
+
+        /* Setelah recovery, Vin di bawah/atas konfigurasi harus memicu fault
+         * tanpa mematikan jalur telemetry. Integrator memakai ADC raw. */
+        mcpwm_foc_set_board_temperature_x10(250);
+        m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u; m_motor_1.m_wrong_voltage_integrator=0u;
+        batVoltage=(int16_t)(m_motor_1.m_vin_min_adc-120u);
+        for(int i=0;i<32 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)DMA1_Channel1_IRQHandler();
+        if(m_motor_1.m_fault!=FAULT_CODE_UNDER_VOLTAGE)return fail("VESC under-voltage fault");
+        m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u; m_motor_1.m_wrong_voltage_integrator=0u;
+        batVoltage=(int16_t)(m_motor_1.m_vin_max_adc+120u);
+        for(int i=0;i<32 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)DMA1_Channel1_IRQHandler();
+        if(m_motor_1.m_fault!=FAULT_CODE_OVER_VOLTAGE)return fail("VESC over-voltage fault");
     }
 
     printf("MOTOR_CONTROL_V13_PASS speed_ramp=%uRPM/s trq50=0.50A posCPR=90 VESCcmd40_phase=%u VESCpos=%.1f runtime_poles_gear=1\n",
