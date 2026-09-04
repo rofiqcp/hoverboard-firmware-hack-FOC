@@ -321,7 +321,10 @@ float mcpwm_foc_get_iq_motor(bool is_second_motor);
 float mcpwm_foc_get_vd_motor(bool is_second_motor);
 float mcpwm_foc_get_vq_motor(bool is_second_motor);
 float mcpwm_foc_get_phase_motor(bool is_second_motor);
-float mcpwm_foc_get_phase_encoder_motor(bool is_second_motor);
+float mcpwm_foc_get_phase_encoder_motor(bool is_second_motor); /* corrected electrical */
+float mcpwm_foc_get_encoder_position_motor(bool is_second_motor); /* raw mechanical ABI */
+float mcpwm_foc_get_pid_pos_now_motor(bool is_second_motor);
+float mcpwm_foc_get_pid_pos_set_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);

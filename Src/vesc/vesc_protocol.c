@@ -394,29 +394,41 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         *out = phase;
         return true;
     case DISP_POS_MODE_ENCODER:
-        /* Standard VESC Encoder display. LEFT reports corrected TIM4 ABI
-         * electrical phase; RIGHT has no ABI peripheral and reports active phase. */
-        *out = (!second && m->m_encoder_configured) ? mcpwm_foc_get_phase_encoder_motor(false) : phase;
+        /* VESC main.c mengirim encoder_read_deg(): mechanical sensor angle,
+         * bukan corrected electrical phase. */
+        *out = (!second && m->m_encoder_configured) ?
+            mcpwm_foc_get_encoder_position_motor(false) : phase;
         return true;
     case DISP_POS_MODE_PID_POS:
-        *out = phase;
+        *out = mcpwm_foc_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
         if(m->m_pos_pid_phase_mode){
-            const float target=(float)m->m_pos_pid_set_phase*(360.0f/65536.0f);
-            const float err=wrap_angle_diff_deg(target,phase);
-            *out=second?-err:err;
+            const float target=mcpwm_foc_get_pid_pos_set_motor(second);
+            const float now=mcpwm_foc_get_pid_pos_now_motor(second);
+            float err=wrap_angle_diff_deg(target,now);
+            if(!second && m->m_encoder_configured && m->m_conf.foc_encoder_inverted)err=-err;
+            *out=err;
         }else{
             const int32_t dc=m->m_position_target_counts-m->m_position_counts;
-            const float pp=(float)mcpwm_foc_get_pole_pairs(second);
-            const float err=(pp>0.0f)?((float)dc*60.0f/pp):0.0f;
-            *out=second?-err:err;
+            float err;
+            if(!second && m->m_encoder_configured && m->m_encoder_counts>=4u){
+                err=(float)dc*360.0f/(float)m->m_encoder_counts;
+                if(m->m_conf.foc_encoder_inverted)err=-err;
+            }else{
+                const float pp=(float)mcpwm_foc_get_pole_pairs(second);
+                err=(pp>0.0f)?((float)dc*60.0f/pp):0.0f;
+                if(second)err=-err;
+            }
+            *out=err;
         }
         return true;
     }
     case DISP_POS_MODE_ENCODER_OBSERVER_ERROR:
         if(!second && m->m_encoder_configured)
-            *out = wrap_angle_diff_deg(mcpwm_foc_get_phase_encoder_motor(false),phase);
+            /* Target belum memiliki observer sensorless; active phase adalah
+             * referensi FOC terdekat. Gunakan sign upstream: observer-encoder. */
+            *out = wrap_angle_diff_deg(phase,mcpwm_foc_get_phase_encoder_motor(false));
         else *out = 0.0f;
         return true;
     case DISP_POS_MODE_HALL_OBSERVER_ERROR: {
@@ -1681,7 +1693,7 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         float off=1001.0f, ratio=0.0f; bool inv=false;
         float current=1.0f;
         if(n>=4u) current=(float)buffer_get_int32(d,&k)/1000.0f;
-        app_vesc_disable_output(15000);
+        app_vesc_disable_output(60000);
         (void)mcpwm_foc_encoder_detect(current,second,&off,&ratio,&inv);
         uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
         buffer_append_float32(reply,off,1e6f,&ri);

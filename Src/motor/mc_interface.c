@@ -50,7 +50,7 @@ void mc_interface_set_openloop_phase(float current, float phase) { mcpwm_foc_set
 void mc_interface_release_motor(void) { mcpwm_foc_release_motor(selected_second()); }
 float mc_interface_get_duty_cycle_now(void) { return mcpwm_foc_get_duty_cycle_motor(selected_second()); }
 float mc_interface_get_rpm(void) { return mcpwm_foc_get_erpm_motor(selected_second()); }
-float mc_interface_get_pid_pos_now(void){return mcpwm_foc_get_phase_motor(selected_second());}
+float mc_interface_get_pid_pos_now(void){return mcpwm_foc_get_pid_pos_now_motor(selected_second());}
 float mc_interface_get_tot_current(void) { return mcpwm_foc_get_tot_current_motor(selected_second()); }
 float mc_interface_get_tot_current_in(void) { return mcpwm_foc_get_tot_current_in_motor(selected_second()); }
 float mc_interface_get_id(void) { return mcpwm_foc_get_id_motor(selected_second()); }
