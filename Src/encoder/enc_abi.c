@@ -54,8 +54,11 @@ void enc_abi_deinit(ABI_config_t *cfg) {
     if (!cfg || !cfg->timer) return;
     cfg->timer->CR1 &= ~TIM_CR1_CEN;
     GPIO_InitTypeDef io = {0};
+    /* Upstream VESC mengembalikan pin ABI ke INPUT_PULLUP saat deinit.
+     * PB6/PB7 berbagi fungsi dengan Hall LEFT, jadi NOPULL di sini dapat
+     * merusak pembacaan Hall setelah mode sensor diganti lewat VESC Tool. */
     io.Mode = GPIO_MODE_INPUT;
-    io.Pull = GPIO_NOPULL;
+    io.Pull = GPIO_PULLUP;
     io.Speed = GPIO_SPEED_FREQ_LOW;
     io.Pin = cfg->A_pin;
     HAL_GPIO_Init(cfg->A_gpio, &io);

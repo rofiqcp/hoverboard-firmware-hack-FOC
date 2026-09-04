@@ -63,6 +63,12 @@ typedef struct {
      * separate from this project's long-range Hall-count position extension. */
     volatile uint16_t m_pos_pid_set_phase;
     volatile uint8_t m_pos_pid_phase_mode;
+    /* VESC p_pid_ang_div tracking. feedback_phase adalah m_pos_pid_now internal
+     * sebelum mc_interface menerapkan inversion/direction/p_pid_offset. */
+    volatile uint16_t m_pos_pid_feedback_phase;
+    uint16_t m_pos_pid_raw_last;
+    uint16_t m_pos_pid_div_accum;
+    uint32_t m_pos_pid_ang_div_inv_q16; /* (1/p_pid_ang_div)*65536 */
     volatile int16_t m_current_limit_q4;      /* batas Iq motoring (+), Q4 */
     volatile int16_t m_current_limit_neg_q4;  /* magnitudo batas Iq regen/brake (-), Q4 */
     volatile uint16_t m_battery_cut_start_adc;/* awal derating baterai dalam hitungan ADC */
@@ -218,6 +224,7 @@ typedef struct {
      * VESC-scale sub-millith gain resolution without float math in the ISR. */
     uint32_t m_position_kd_proc_coeff_q16;
     uint16_t m_position_kd_proc_phase_coeff_q4;
+    uint32_t m_position_gain_dec_mdeg; /* p_pid_gain_dec_angle/p_pid_ang_div */
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
@@ -331,6 +338,7 @@ void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
 void mcpwm_foc_refresh_hall_interpolation(bool is_second_motor);
 void mcpwm_foc_refresh_encoder_configuration(bool is_second_motor, bool reinitialize);
+void mcpwm_foc_refresh_position_configuration(bool is_second_motor);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
 bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);

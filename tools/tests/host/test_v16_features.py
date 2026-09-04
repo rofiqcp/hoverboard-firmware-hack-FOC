@@ -37,7 +37,7 @@ assert 'm_position_prev_proc_phase' in mch and 'm_position_kd_proc_phase_coeff_q
 assert 'VESC foc_run_pid_control_pos: shortest-path angular PID' in mc
 assert 'p_q15=CLAMP' in mc and 'i_lim_q15=32768-' in mc
 assert 'm_position_d_filter_q15' in mch and 'm_position_d_proc_filter_q15' in mch
-assert 'proc_delta=(int16_t)(m->m_phase-m->m_position_prev_proc_phase)' in mc
+assert 'proc_now=position_feedback_phase_u16(m,second)' in mc and 'proc_delta=(int16_t)(proc_now-m->m_position_prev_proc_phase)' in mc
 assert 'out_q15=p_q15+(m->m_position_integrator>>16)+' in mc
 assert 'm_position_step_braking' in mch and 'm_position_brake_direction' in mch
 assert 'hall_motion_same_direction' in mc and 'position_brake_iq_q4' in mc
@@ -62,7 +62,7 @@ assert 'COMM_DETECT_HALL_FOC, 20.0)' in dual
 # Keep the separately calibrated high-Z/raw ADC path diagnostic-only.
 assert 'leftOffTelemValid' in mc and 'rightOffTelemValid' in mc and 'off_telem_deadband_counts' in mc
 assert 'm_id_telem_q4' in mc and 'm_current_in_telem_counts' in mc
-off=mc[mc.index('if (!source_enabled || m->m_fault!=FAULT_CODE_NONE'):mc.index('return;',mc.index('if (!source_enabled || m->m_fault!=FAULT_CODE_NONE'))]
+off=mc[mc.index('if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE'):mc.index('return;',mc.index('if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE'))]
 for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0'):
     assert token in off, token
 for token in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
@@ -86,8 +86,8 @@ assert 'rotor stream local value' in host and 'rotor stream right value' in host
 
 assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'
 assert 'MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES' in mcc and 'm_hall_direction_stable_edges' in mc, 'Hall reversal/acceleration warmup missing'
-assert 'm_brake_direction' in mch and 'm_brake_current_q4' in mch and 'same_motion' in mc and 'const int32_t est_rpm=' in mc
-assert 'direction_same=(m->m_hall_direction==m->m_brake_direction)' in mc and 'est_rpm>MCCONF_TRQ_STOP_RPM_DEADBAND' in mc and 'mcpwm_foc_release_motor(second)' in mc
+assert 'm_brake_direction' in mch and 'm_brake_current_q4' in mch and 'feedback_motion_same_direction' in mc and 'encoder_motion_fresh' in mc
+assert 'm->m_hall_ticks>fresh' in mc and 'MCCONF_TRQ_STOP_RPM_DEADBAND' in mc and 'mcpwm_foc_release_motor(second)' in mc
 
 assert 'MCCONF_POSITION_CURRENT_MAX_MA' in mc or 'MCCONF_POSITION_CURRENT_MAX_MA' in mcc
 assert 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mc or 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mcc

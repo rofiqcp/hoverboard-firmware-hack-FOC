@@ -347,6 +347,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->p_pid_kd_filter = (float)MCCONF_POSITION_KD_FILTER_Q16 / 65536.0f;
     c->p_pid_kd_proc = 0.00035f; /* upstream VESC default process-D damping */
     c->p_pid_ang_div = 1.0f;
+    c->p_pid_gain_dec_angle = 0.0f;
     c->si_motor_poles = (uint8_t)default_motor_poles(second);
     c->si_gear_ratio = 1.0f; /* direct drive; set >0 in VESC Tool for a gearbox */
     c->si_wheel_diameter = MCCONF_SI_WHEEL_DIAMETER;
@@ -408,6 +409,38 @@ static float encoder_norm_deg(float deg) {
     return deg;
 }
 
+static void position_ang_div_recompute(mcpwm_foc_motor_t *m) {
+    if(!m)return;
+    float div=m->m_conf.p_pid_ang_div;
+    if(!(div>=0.01f && div<=1000.0f))div=1.0f;
+    m->m_conf.p_pid_ang_div=div;
+    double q=65536.0/(double)div;
+    if(q<1.0)q=1.0;
+    if(q>4294967295.0)q=4294967295.0;
+    m->m_pos_pid_ang_div_inv_q16=(uint32_t)(q+0.5);
+    m->m_pos_pid_div_accum=0u;
+    m->m_pos_pid_raw_last=0u;
+    m->m_pos_pid_feedback_phase=0u;
+}
+
+static void position_feedback_update(mcpwm_foc_motor_t *m, uint16_t raw) {
+    if(!m)return;
+    const float div=m->m_conf.p_pid_ang_div;
+    if(div>0.98f && div<1.02f){
+        m->m_pos_pid_feedback_phase=raw;
+        m->m_pos_pid_raw_last=raw;
+        m->m_pos_pid_div_accum=0u;
+        return;
+    }
+    const uint16_t last=m->m_pos_pid_raw_last;
+    const uint32_t step=m->m_pos_pid_ang_div_inv_q16?m->m_pos_pid_ang_div_inv_q16:65536u;
+    if(raw<16384u && last>49152u)m->m_pos_pid_div_accum=(uint16_t)(m->m_pos_pid_div_accum+step);
+    else if(raw>49152u && last<16384u)m->m_pos_pid_div_accum=(uint16_t)(m->m_pos_pid_div_accum-step);
+    m->m_pos_pid_raw_last=raw;
+    const uint32_t scaled=(uint32_t)(((uint64_t)raw*step)>>16);
+    m->m_pos_pid_feedback_phase=(uint16_t)(m->m_pos_pid_div_accum+scaled);
+}
+
 static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool reinitialize) {
     if (!m) return;
     if (!encoder_port_active(m, second)) {
@@ -441,6 +474,10 @@ static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool re
     m->m_encoder_raw_count=encoder_read_raw_count();
     m->m_encoder_prev_count=m->m_encoder_raw_count;
     m->m_encoder_delta_accum=0; m->m_encoder_speed_ticks=0u; m->m_encoder_idle_ticks=0u;
+    /* Rebase counter dan speed harus atomik secara semantik. Membawa RPM lama
+     * ke config/sync baru akan masuk ke speed PID dan p_pid_kd_proc sebagai
+     * derivative palsu selama satu timeout estimator. */
+    m->m_encoder_erpm_q16=0; m->m_encoder_mech_rpm_q16=0; m->m_rpm=0;
     m->m_encoder_configured=1u;
 }
 
@@ -448,12 +485,34 @@ void mcpwm_foc_refresh_encoder_configuration(bool second, bool reinitialize) {
     encoder_runtime_configure(mcpwm_foc_get_motor(second),second,reinitialize);
 }
 
+void mcpwm_foc_refresh_position_configuration(bool second) {
+    position_ang_div_recompute(mcpwm_foc_get_motor(second));
+}
+
+static void encoder_runtime_set_deg(mcpwm_foc_motor_t *m, float deg) {
+    if(!m || !m->m_encoder_configured)return;
+    /* encoder_set_deg() menulis TIM4->CNT. ISR 16 kHz dapat membaca counter
+     * pada saat yang sama, jadi sinkronkan seluruh delta/speed tracker secara
+     * atomik agar software-zero tidak pernah terlihat sebagai gerakan fisik. */
+    __disable_irq();
+    encoder_set_deg(deg);
+    const uint32_t cnt=encoder_read_raw_count();
+    m->m_encoder_raw_count=cnt;
+    m->m_encoder_prev_count=cnt;
+    m->m_encoder_delta_accum=0;
+    m->m_encoder_speed_ticks=0u;
+    m->m_encoder_idle_ticks=0u;
+    m->m_encoder_erpm_q16=0;
+    m->m_encoder_mech_rpm_q16=0;
+    m->m_rpm=0;
+    __enable_irq();
+}
+
 static uint16_t position_feedback_phase_u16(const mcpwm_foc_motor_t *m, bool second) {
-    /* VESC m_pos_pid_now memakai encoder_read_deg() mechanical bila encoder
-     * dikonfigurasi. Corrected electrical phase hanya untuk Park/SVPWM. */
-    if (!second && encoder_port_active(m,false) && m->m_encoder_configured)
-        return m->m_encoder_mech_phase;
-    return m ? m->m_phase : 0u;
+    (void)second;
+    /* Sama dengan upstream m_pos_pid_now: raw sensor/FOC position lebih dulu
+     * melewati p_pid_ang_div. mc_interface baru menerapkan inversion/direction. */
+    return m ? m->m_pos_pid_feedback_phase : 0u;
 }
 
 static int32_t position_error_sign(const mcpwm_foc_motor_t *m, bool second) {
@@ -502,6 +561,25 @@ static void position_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     if(v<0.0)v=0.0;
     if(v>65535.0)v=65535.0;
     m->m_position_kd_proc_phase_coeff_q4=(uint16_t)(v+0.5);
+    if(m->m_conf.p_pid_gain_dec_angle>0.1f){
+        float div=m->m_conf.p_pid_ang_div;
+        if(!(div>=0.01f && div<=1000.0f))div=1.0f;
+        double md=(double)m->m_conf.p_pid_gain_dec_angle*1000.0/(double)div;
+        if(md<1.0)md=1.0;
+        if(md>4294967295.0)md=4294967295.0;
+        m->m_position_gain_dec_mdeg=(uint32_t)(md+0.5);
+    }else{
+        m->m_position_gain_dec_mdeg=0u;
+    }
+}
+
+static uint16_t position_gain_scale_q15(const mcpwm_foc_motor_t *m,int32_t error_mdeg){
+    if(!m || m->m_position_gain_dec_mdeg==0u)return 32768u;
+    uint32_t ae=(uint32_t)(error_mdeg<0?-(int64_t)error_mdeg:error_mdeg);
+    if(ae>=m->m_position_gain_dec_mdeg)return 32768u;
+    uint32_t s=(uint32_t)(((uint64_t)ae*32768u)/m->m_position_gain_dec_mdeg);
+    if(s>32768u)s=32768u;
+    return (uint16_t)s;
 }
 
 static bool hall_table_runtime_sane(const uint8_t t[8]) {
@@ -586,6 +664,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     for (int i=0;i<4;i++) m->m_hall_period_hist[i] = MCCONF_HALL_TIMEOUT_TICKS;
     m->m_phase_openloop = SVPWM_ALIGN_PHASE;
     m->m_openloop_phase_acc_q32 = ((uint32_t)SVPWM_ALIGN_PHASE) << 16;
+    position_ang_div_recompute(m);
     /* VESC tacho bin untuk electrical phase 0 adalah step 3 pada peta
      * [-180,+180). Memulai dari 3 mencegah lonjakan tachometer +3 saat boot. */
     m->m_tacho_step_last = 3u;
@@ -700,6 +779,10 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         next.foc_hall_interp_erpm=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
     if (!(next.p_pid_kd_filter >= 0.0f && next.p_pid_kd_filter <= 1.0f))
         next.p_pid_kd_filter=(float)MCCONF_POSITION_KD_FILTER_Q16/65536.0f;
+    if (!(next.p_pid_ang_div>=0.01f && next.p_pid_ang_div<=1000.0f))next.p_pid_ang_div=1.0f;
+    if (!(next.p_pid_kd_proc>=0.0f && next.p_pid_kd_proc<=10.0f))next.p_pid_kd_proc=0.00035f;
+    if (!(next.p_pid_gain_dec_angle>=0.0f && next.p_pid_gain_dec_angle<=3276.7f))next.p_pid_gain_dec_angle=0.0f;
+    if (!(next.p_pid_offset>-100000.0f && next.p_pid_offset<100000.0f))next.p_pid_offset=0.0f;
     const bool poles_changed = m->m_conf.si_motor_poles != next.si_motor_poles;
     const bool encoder_reinit = (!second) &&
         (m->m_conf.m_sensor_port_mode != next.m_sensor_port_mode ||
@@ -725,6 +808,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (encoder_requires_resync) m->m_encoder_synced=0u;
     m->m_conf = next;
     hall_interp_recompute(m);
+    position_ang_div_recompute(m);
     encoder_runtime_configure(m,second,encoder_reinit);
     if (poles_changed) {
         /* A live pole-count change would instantly rescale the speed loop.
@@ -1096,7 +1180,7 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     float raw=m->m_conf.foc_encoder_offset/ratio;
     raw=encoder_norm_deg(raw);
     if(m->m_conf.foc_encoder_inverted && raw>0.0f) raw=360.0f-raw;
-    encoder_set_deg(raw);
+    encoder_runtime_set_deg(m,raw);
 
     /* A/B tanpa index tidak dapat membedakan counter software yang baru ditulis
      * dari encoder fisik yang kabelnya putus. Verifikasi dengan jog kecil: +30
@@ -1134,7 +1218,7 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     if((db<0?-db:db)>max_move)goto align_fail;
 
     /* Re-establish exact software zero after the physical plausibility jog. */
-    encoder_set_deg(raw);
+    encoder_runtime_set_deg(m,raw);
     m->m_position_counts=0; m->m_position_abs_counts=0u;
     encoder_runtime_configure(m,false,false);
     encoder_feedback_update(m,false);
@@ -1212,7 +1296,7 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
         mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
         if(m->m_fault!=FAULT_CODE_NONE)goto detect_fail;
     }
-    encoder_set_deg(0.0f);
+    encoder_runtime_set_deg(m,0.0f);
     float phase_cont=0.0f;
     if(!encoder_detect_move(m,current,&phase_cont,360.0f))goto detect_fail;
     HAL_Delay(300u);
@@ -1716,12 +1800,17 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
         const int32_t dc=m->m_encoder_delta_accum;
         const uint32_t ticks=m->m_encoder_speed_ticks;
         if(dc!=0){
-            const int64_t num=(int64_t)dc*60LL*(int64_t)PWM_FREQ*(int64_t)m->m_encoder_ratio_q16;
+            /* Upstream RPM berasal dari PLL atas corrected rotor phase. Jika
+             * foc_encoder_inverted aktif, derivative raw ABI harus dibalik juga
+             * agar SET_RPM, brake direction, dan RT Data memakai sign electrical
+             * yang sama dengan phase=(360-raw)*ratio-offset. */
+            const int32_t dc_foc=m->m_conf.foc_encoder_inverted?-dc:dc;
+            const int64_t num=(int64_t)dc_foc*60LL*(int64_t)PWM_FREQ*(int64_t)m->m_encoder_ratio_q16;
             const int64_t den=(int64_t)counts*(int64_t)ticks;
             int64_t eq16=num/den;
             if(eq16>INT32_MAX)eq16=INT32_MAX; else if(eq16<INT32_MIN)eq16=INT32_MIN;
             m->m_encoder_erpm_q16=(int32_t)eq16;
-            const int64_t mnum=(int64_t)dc*60LL*(int64_t)PWM_FREQ*65536LL;
+            const int64_t mnum=(int64_t)dc_foc*60LL*(int64_t)PWM_FREQ*65536LL;
             int64_t mq16=mnum/((int64_t)counts*(int64_t)ticks);
             if(mq16>INT32_MAX)mq16=INT32_MAX; else if(mq16<INT32_MIN)mq16=INT32_MIN;
             m->m_encoder_mech_rpm_q16=(int32_t)mq16;
@@ -1870,15 +1959,19 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         const int16_t phase_err=(int16_t)(m->m_pos_pid_set_phase-pos_now);
         error_mdeg=(int32_t)(((int64_t)phase_err*360000LL)/65536LL);
         error_mdeg*=position_error_sign(m,second);
+        const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
+        const uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
+        const uint32_t ki_eff=((uint32_t)m->m_kip_q16*gain_scale+16384u)>>15;
+        const uint32_t kd_eff=((uint32_t)m->m_kdp_q11*gain_scale+16384u)>>15;
 
-        int64_t p64=(int64_t)error_mdeg*(int32_t)m->m_kpp_q11*32768LL;
+        int64_t p64=(int64_t)error_mdeg*(int32_t)kp_eff*32768LL;
         int32_t p_q15=(int32_t)(p64/1000000LL);
         p_q15=CLAMP(p_q15,-32768,32768);
 
-        if(m->m_kip_q16==0u){
+        if(ki_eff==0u){
             m->m_position_integrator=0;
         }else{
-            int64_t istep=(int64_t)error_mdeg*(int32_t)m->m_kip_q16*32768LL*65536LL*
+            int64_t istep=(int64_t)error_mdeg*(int32_t)ki_eff*32768LL*65536LL*
                           (int32_t)MCCONF_FOC_CONTROL_DIV;
             istep/=(1000000LL*(int32_t)PWM_FREQ);
             int64_t isum=(int64_t)m->m_position_integrator+istep;
@@ -1890,13 +1983,13 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         }
 
         int32_t d_raw_q15=0;
-        if(m->m_kdp_q11!=0u){
+        if(kd_eff!=0u){
             if(error_mdeg==m->m_position_prev_error_mdeg){
                 if(m->m_position_dt_ticks<65535u)m->m_position_dt_ticks++;
             }else{
                 const uint32_t dt_ticks=m->m_position_dt_ticks?m->m_position_dt_ticks:1u;
                 const int32_t de_mdeg=error_mdeg-m->m_position_prev_error_mdeg;
-                int64_t d64=(int64_t)de_mdeg*(int32_t)m->m_kdp_q11*32768LL*(int32_t)PWM_FREQ;
+                int64_t d64=(int64_t)de_mdeg*(int32_t)kd_eff*32768LL*(int32_t)PWM_FREQ;
                 d64/=(1000000LL*(int32_t)MCCONF_FOC_CONTROL_DIV*(int64_t)dt_ticks);
                 if(d64>32768)d64=32768; else if(d64<-32768)d64=-32768;
                 d_raw_q15=(int32_t)d64;
@@ -1924,7 +2017,7 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
             dp/=(int64_t)dt_ticks;
             dp>>=4;
             if(dp>32768)dp=32768; else if(dp<-32768)dp=-32768;
-            dproc_raw_q15=(int32_t)dp;
+            dproc_raw_q15=(int32_t)(((int64_t)dp*gain_scale)>>15);
             m->m_position_prev_proc_phase=proc_now;
             m->m_position_proc_dt_ticks=1u;
         }
@@ -1971,17 +2064,21 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         error_mdeg=count_error*mdeg_per_count;
     }
     m->m_position_prev_error=(int16_t)count_error;
+    const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
+    const uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
+    const uint32_t ki_eff=((uint32_t)m->m_kip_q16*gain_scale+16384u)>>15;
+    const uint32_t kd_eff=((uint32_t)m->m_kdp_q11*gain_scale+16384u)>>15;
 
     /* PID posisi ternormalisasi seperti VESC. Hasilnya berada pada Q15 dan
      * selanjutnya diskalakan ke batas arus Iq yang aman untuk hardware. */
-    int64_t p64=(int64_t)error_mdeg*(int32_t)m->m_kpp_q11*32768LL;
+    int64_t p64=(int64_t)error_mdeg*(int32_t)kp_eff*32768LL;
     int32_t p_q15=(int32_t)(p64/1000000LL);
     p_q15=CLAMP(p_q15,-32768,32768);
 
-    if(m->m_kip_q16==0u){
+    if(ki_eff==0u){
         m->m_position_integrator=0;
     }else{
-        int64_t istep=(int64_t)error_mdeg*(int32_t)m->m_kip_q16*32768LL*65536LL*
+        int64_t istep=(int64_t)error_mdeg*(int32_t)ki_eff*32768LL*65536LL*
                       (int32_t)MCCONF_FOC_CONTROL_DIV;
         istep/=(1000000LL*(int32_t)PWM_FREQ);
         int64_t isum=(int64_t)m->m_position_integrator+istep;
@@ -1992,14 +2089,14 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         m->m_position_integrator=(int32_t)isum;
     }
 
-    if(m->m_kdp_q11!=0u){
+    if(kd_eff!=0u){
         int32_t d_raw_q15=0;
         if(error_mdeg==m->m_position_prev_error_mdeg){
             if(m->m_position_dt_ticks<65535u)m->m_position_dt_ticks++;
         }else{
             const uint32_t dt_ticks=m->m_position_dt_ticks?m->m_position_dt_ticks:1u;
             const int32_t de_mdeg=error_mdeg-m->m_position_prev_error_mdeg;
-            int64_t d64=(int64_t)de_mdeg*(int32_t)m->m_kdp_q11*32768LL*(int32_t)PWM_FREQ;
+            int64_t d64=(int64_t)de_mdeg*(int32_t)kd_eff*32768LL*(int32_t)PWM_FREQ;
             d64/=(1000000LL*(int32_t)MCCONF_FOC_CONTROL_DIV*(int64_t)dt_ticks);
             if(d64>32768)d64=32768; else if(d64<-32768)d64=-32768;
             d_raw_q15=(int32_t)d64;
@@ -2022,7 +2119,7 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     if(encoder_count_mode && m->m_conf.foc_encoder_inverted)dproc64=-dproc64;
     dproc64 >>= 16;
     if(dproc64>32768)dproc64=32768; else if(dproc64<-32768)dproc64=-32768;
-    const int32_t dproc_raw_q15=(int32_t)dproc64;
+    const int32_t dproc_raw_q15=(int32_t)((dproc64*(int64_t)gain_scale)>>15);
     const int32_t dpdiff=dproc_raw_q15-m->m_position_d_proc_filter_q15;
     m->m_position_d_proc_filter_q15 +=
         (int32_t)(((int64_t)dpdiff*m->m_position_kd_filter_q16)>>16);
@@ -2278,10 +2375,16 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
             (m->m_control_mode==CONTROL_MODE_OPENLOOP || m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
         if(openloop_phase) m->m_phase=m->m_phase_openloop;
         else if(encoder_feedback_selected(m,second) && m->m_encoder_synced) m->m_phase=m->m_phase_encoder;
-        else if(encoder_port_active(m,second)) m->m_phase=m->m_phase_encoder; /* telemetry only until sync */
-        else m->m_phase=m->m_phase_hall;
+        else if(!encoder_port_active(m,second)) m->m_phase=m->m_phase_hall;
+        /* ABI yang belum sync tidak boleh menjadi active FOC phase. Raw
+         * mechanical/electrical encoder tetap tersedia lewat diagnostic getter,
+         * sedangkan m_phase mempertahankan phase aktif terakhir sampai alignment. */
+        const uint16_t pos_raw=(!second && encoder_port_active(m,false) && m->m_encoder_configured)?
+            m->m_encoder_mech_phase:m->m_phase;
+        position_feedback_update(m,pos_raw);
+        if(!encoder_port_active(m,second) || m->m_encoder_synced || openloop_phase)
+            vesc_tachometer_update(m);
     }
-    vesc_tachometer_update(m);
 
     /* Control-current offset is calibrated once in the original EFeru
      * startup ADC window. Do not pause/reset a new command to re-learn offset:
@@ -2319,7 +2422,9 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     }
 
     const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
-    if (!source_enabled || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
+    const bool feedback_ready = !encoder_feedback_selected(m,second) || m->m_encoder_synced ||
+        m->m_control_mode==CONTROL_MODE_OPENLOOP || m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
+    if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
         m->m_state=MC_STATE_OFF;
         reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0;
         m->m_speed_sat_hold=0; reset_position_pid(m);

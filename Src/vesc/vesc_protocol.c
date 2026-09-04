@@ -400,14 +400,16 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
             mcpwm_foc_get_encoder_position_motor(false) : phase;
         return true;
     case DISP_POS_MODE_PID_POS:
-        *out = mcpwm_foc_get_pid_pos_now_motor(second);
+        /* Upstream main.c memakai mc_interface_get_pid_pos_now(): sudah
+         * dikembalikan ke koordinat user (encoder inversion, direction, offset). */
+        *out = mc_interface_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
         if(m->m_pos_pid_phase_mode){
-            const float target=mcpwm_foc_get_pid_pos_set_motor(second);
-            const float now=mcpwm_foc_get_pid_pos_now_motor(second);
+            const float target=mc_interface_get_pid_pos_set_motor(second);
+            const float now=mc_interface_get_pid_pos_now_motor(second);
             float err=wrap_angle_diff_deg(target,now);
-            if(!second && m->m_encoder_configured && m->m_conf.foc_encoder_inverted)err=-err;
+            if(second)err=-err; /* normalisasi virtual motor kanan */
             *out=err;
         }else{
             const int32_t dc=m->m_position_target_counts-m->m_position_counts;
@@ -512,6 +514,15 @@ static void reply_fw_version(bool second) {
 
 static void get_values_normalized(bool second, mc_values *v) {
     mc_interface_get_values_motor(v, second);
+    const mc_configuration *conf=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+    /* COMM_GET_VALUES upstream melewati mc_interface: direction inversion
+     * berlaku pada RPM/duty/Iq/Vq/tachometer, sedangkan motor/input current dan
+     * d-axis tetap tidak dibalik. Position adalah user PID position. */
+    if(conf && conf->m_invert_direction){
+        v->rpm=-v->rpm; v->iq=-v->iq; v->duty_now=-v->duty_now; v->vq=-v->vq;
+        v->tachometer=-v->tachometer;
+    }
+    v->position=mc_interface_get_pid_pos_now_motor(second);
     /* Hoverboard temperature calibration is deci-degC (358 = 35.8C). */
     v->temp_mos = (float)board_temp_deg_c * 0.1f;
     v->temp_mos_1 = v->temp_mos;
@@ -739,8 +750,6 @@ static void reply_values_setup(bool second, bool selective, const uint8_t *data,
     send_values_setup_packet(second, selective, mask);
     /* GET_VALUES_SETUP is also one request -> one reply, matching upstream VESC. */
 }
-
-static float right_sign(bool second, float value) { return second ? -value : value; }
 
 /* Forward declaration: dipakai command config/current sebelum implementasi detector. */
 static bool hall_detect_motor_locked(bool second);

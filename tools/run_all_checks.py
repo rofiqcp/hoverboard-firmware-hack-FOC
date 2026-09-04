@@ -62,7 +62,7 @@ def check_static():
     assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'
     assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'current setpoint slew missing'
     assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
-    assert 'm_brake_current_q4' in mc and 'same_motion' in mc and 'm_hall_ticks<=fresh' in mc and 'm_brake_direction==0' in mc, 'VESC Hall-safe brake latch/freshness missing'
+    assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'feedback_motion_same_direction' in mc and 'm->m_hall_ticks>fresh' in mc and 'encoder_motion_fresh' in mc and 'm_brake_direction==0' in mc, 'VESC active-feedback brake latch/freshness missing'
     assert 'CONTROL_MODE_HANDBRAKE' in mc and 'm->m_phase=0u' in mc and 'mcpwm_foc_set_handbrake' in mc, 'VESC handbrake fixed-phase mode missing'
     assert 'leftDqFresh=m_motor_1.m_dq_sample_fresh' in mc and 'rightDqFresh=m_motor_2.m_dq_sample_fresh' in mc and 'leftDqFresh&&leftPhaseExceeded' in mc and 'rightDqFresh&&rightPhaseExceeded' in mc and 'leftDcTrip = leftCurrentSampleValid' in mc and 'rightDcTrip = rightCurrentSampleValid' in mc, 'D/Q ABS must use distinct fresh samples while raw DC trip remains active every driven ISR'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
@@ -122,7 +122,25 @@ def check_static():
     assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x601Du' in mci and 'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and 'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and 'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and 'EE_CFG_SIGNATURE_V24   0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'EE_L_CC_MIN_CURRENT_CA = 141' in mci and 'EE_R_CC_MIN_CURRENT_CA = 142' in mci and 'EE_L_EXT2_BAT_CUT_START_CV = 143' in mci and 'EE_R_EXT2_BAT_CUT_START_CV = 150' in mci and 'EE_L_EXT2_BAT_META = 157' in mci and 'EE_R_EXT2_BAT_META = 159' in mci and 'EE_L_EXT5_HALL_INTERP_ERPM = 179' in mci and 'EE_R_EXT5_HALL_INTERP_ERPM = 180' in mci and 'EE_L_EXT6_ENCODER_FLAGS = 181' in mci and 'EE_L_EXT6_ENCODER_RATIO_X10000_HI' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
+        'EE_CFG_SIGNATURE_VALUE 0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
+        'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and \
+        'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and \
+        'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and \
+        'EE_CFG_SIGNATURE_V24   0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and \
+        'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and \
+        'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and \
+        'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and \
+        'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and \
+        'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'EE_L_CC_MIN_CURRENT_CA = 141' in mci and \
+        'EE_R_CC_MIN_CURRENT_CA = 142' in mci and 'EE_L_EXT2_BAT_CUT_START_CV = 143' in mci and \
+        'EE_R_EXT2_BAT_CUT_START_CV = 150' in mci and 'EE_L_EXT2_BAT_META = 157' in mci and \
+        'EE_R_EXT2_BAT_META = 159' in mci and 'EE_L_EXT5_HALL_INTERP_ERPM = 179' in mci and \
+        'EE_R_EXT5_HALL_INTERP_ERPM = 180' in mci and 'EE_L_EXT6_ENCODER_FLAGS = 181' in mci and \
+        'EE_L_EXT6_ENCODER_RATIO_X10000_HI' in mci and 'EE_EXT7_DIRECTION_FLAGS = 186' in mci and \
+        'EE_L_EXT7_ENCODER_OFFSET_F32_LO' in mci and 'EE_L_EXT7_ENCODER_RATIO_F32_LO' in mci and \
+        'EE_L_EXT7_PID_KD_PROC_F32_LO' in mci and 'EE_L_EXT7_PID_GAIN_DEC_X10' in mci and \
+        'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
     assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
     assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
@@ -148,7 +166,7 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)186u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)205u\)', eeh), 'EEPROM virtual variable count mismatch'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()

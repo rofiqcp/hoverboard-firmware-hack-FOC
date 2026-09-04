@@ -29,6 +29,7 @@ void mc_interface_release_motor(void);
 float mc_interface_get_duty_cycle_now(void);
 float mc_interface_get_rpm(void); /* VESC standard: electrical RPM */
 float mc_interface_get_pid_pos_now(void);
+float mc_interface_get_pid_pos_set(void);
 float mc_interface_get_tot_current(void);
 float mc_interface_get_tot_current_in(void);
 float mc_interface_get_id(void);
@@ -43,6 +44,8 @@ void mc_interface_set_mode_command_motor(uint8_t mode, int16_t command,
                                          bool run_request, uint16_t openloop_rpm,
                                          bool is_second_motor);
 void mc_interface_get_values_motor(mc_values *values, bool is_second_motor);
+float mc_interface_get_pid_pos_now_motor(bool is_second_motor);
+float mc_interface_get_pid_pos_set_motor(bool is_second_motor);
 const volatile mc_configuration *mc_interface_get_configuration_motor(bool is_second_motor);
 mc_fault_code mc_interface_get_fault_motor(bool is_second_motor);
 mc_state mc_interface_get_state_motor(bool is_second_motor);

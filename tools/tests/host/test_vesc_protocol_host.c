@@ -66,6 +66,8 @@ void mc_interface_get_values_motor(mc_values *v, bool second) {
     v->duty_now=second?-0.22f:0.11f; v->fault_code=FAULT_CODE_NONE; v->vd=1.2f; v->vq=second?-5.0f:4.0f;
     v->position=second?342.0f:12.5f; v->tachometer=second?-45:31; v->tachometer_abs=second?45:31;
 }
+float mc_interface_get_pid_pos_now_motor(bool second) { return second?342.0f:12.5f; }
+float mc_interface_get_pid_pos_set_motor(bool second) { return set_pos[second?1:0]; }
 void mc_interface_set_current(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_brake_current(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c; }
@@ -100,6 +102,13 @@ void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
 float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
+float mcpwm_foc_get_phase_encoder_motor(bool second) { return second?0.0f:12.5f; }
+float mcpwm_foc_get_encoder_position_motor(bool second) { return second?0.0f:12.5f; }
+bool mcpwm_foc_encoder_is_synced(bool second) { return !second && diag_motors[0].m_encoder_synced!=0u; }
+bool mcpwm_foc_encoder_startup_align(bool second) { if(second)return false; diag_motors[0].m_encoder_synced=1u; return true; }
+bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *ratio,bool *inverted) {
+    (void)current; if(second)return false; if(offset)*offset=12.0f; if(ratio)*ratio=15.0f; if(inverted)*inverted=false; return true;
+}
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
 float mcpwm_foc_get_erpm_motor(bool second) { return second ? -50.0f : 50.0f; }
