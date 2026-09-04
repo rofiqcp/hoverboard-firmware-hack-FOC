@@ -159,6 +159,10 @@ int main(void) {
   HAL_ADC_Start(&hadc1);
   HAL_ADC_Start(&hadc2);
 
+  /* ABI A/B tanpa index membutuhkan electrical-zero setiap power cycle.
+   * Fungsi ini no-op pada default Hall dan tidak pernah menggerakkan RIGHT. */
+  (void)mcpwm_foc_encoder_startup_align(false);
+
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
 

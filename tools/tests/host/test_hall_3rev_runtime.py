@@ -6,7 +6,7 @@ for cc in [c for c in ('gcc','clang') if shutil.which(c)]:
     with tempfile.TemporaryDirectory(prefix='hall-3rev-') as td:
         exe=Path(td)/'t'
         cmd=[cc,'-std=c11','-O2','-Wall','-Wextra','-Werror',f'-I{R}',f'-I{R/"Src"}',f'-I{R/"tools/support/hall_detect_stubs"}',
-             str(R/'tools/tests/host/test_hall_3rev_runtime.c'),str(R/'Src/motor/mcpwm_foc.c'),str(R/'Src/motor/foc_math.c'),'-lm','-o',str(exe)]
+             str(R/'tools/tests/host/test_hall_3rev_runtime.c'),str(R/'Src/motor/mcpwm_foc.c'),str(R/'Src/motor/foc_math.c'),str(R/'Src/encoder/encoder.c'),str(R/'Src/encoder/enc_abi.c'),str(R/'Src/encoder/encoder_cfg.c'),'-lm','-o',str(exe)]
         x=subprocess.run(cmd,text=True,capture_output=True)
         if x.returncode:
             print(x.stdout+x.stderr);sys.exit(x.returncode)

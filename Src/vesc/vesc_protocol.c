@@ -394,10 +394,9 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         *out = phase;
         return true;
     case DISP_POS_MODE_ENCODER:
-        /* No separate ABI/SPI encoder peripheral exists on this hoverboard
-         * target. Keep VESC Tool's display alive with the measured rotor phase
-         * rather than inventing an independent encoder signal. */
-        *out = phase;
+        /* Standard VESC Encoder display. LEFT reports corrected TIM4 ABI
+         * electrical phase; RIGHT has no ABI peripheral and reports active phase. */
+        *out = (!second && m->m_encoder_configured) ? mcpwm_foc_get_phase_encoder_motor(false) : phase;
         return true;
     case DISP_POS_MODE_PID_POS:
         *out = phase;
@@ -416,9 +415,9 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         return true;
     }
     case DISP_POS_MODE_ENCODER_OBSERVER_ERROR:
-        /* Encoder and observer are the same physical Hall-derived phase on this
-         * board, therefore there is no independent encoder-observer error. */
-        *out = 0.0f;
+        if(!second && m->m_encoder_configured)
+            *out = wrap_angle_diff_deg(mcpwm_foc_get_phase_encoder_motor(false),phase);
+        else *out = 0.0f;
         return true;
     case DISP_POS_MODE_HALL_OBSERVER_ERROR: {
         const float hall = (float)m->m_phase_hall * (360.0f / 65536.0f);
@@ -773,13 +772,31 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
         if (!(c.l_in_current_max >= 0.1f) || c.l_in_current_max > (float)I_DC_MAX) c.l_in_current_max=MCCONF_L_IN_CURRENT_MAX;
         if (!(c.l_in_current_min <= -0.1f) || c.l_in_current_min < -(float)I_DC_MAX) c.l_in_current_min=MCCONF_L_IN_CURRENT_MIN;
         if (!(c.m_duty_ramp_step >= 0.0001f && c.m_duty_ramp_step <= 0.20f)) c.m_duty_ramp_step=MCCONF_DUTY_RAMP_STEP_DEFAULT;
-        /* Physical current sample/PI topology is fixed for this board. Motor
-         * poles and drivetrain ratio are standard VESC setup fields and are live. */
-        c.foc_sensor_mode = FOC_SENSOR_MODE_HALL;
+        /* LEFT supports the standard VESC ABI sensor-port mode on PB6/PB7.
+         * RIGHT has no ABI timer route and is intentionally Hall-only. */
+        if(second){
+            c.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+            c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+        }else if(c.m_sensor_port_mode==SENSOR_PORT_MODE_ABI){
+            if(c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER && c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER_AB)
+                c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+            if(c.m_encoder_counts<4 || c.m_encoder_counts>65536)c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+            if(!(c.foc_encoder_ratio>=0.01f && c.foc_encoder_ratio<=1000.0f))c.foc_encoder_ratio=15.0f;
+            while(c.foc_encoder_offset>=360.0f)c.foc_encoder_offset-=360.0f;
+            while(c.foc_encoder_offset<0.0f)c.foc_encoder_offset+=360.0f;
+        }else{
+            c.m_sensor_port_mode=SENSOR_PORT_MODE_HALL; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+        }
         if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;
         if (!(c.si_gear_ratio >= 0.01f && c.si_gear_ratio <= 1000.0f)) c.si_gear_ratio = 1.0f;
         mc_interface_select_motor_thread(second ? 2 : 1);
         mc_interface_set_configuration(&c);
+        /* Applying ABI calibration on A/B without index must immediately
+         * establish an electrical zero before any subsequent closed-loop command. */
+        if(!second && c.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
+           (c.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER || c.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB) &&
+           !mcpwm_foc_encoder_is_synced(false))
+            (void)mcpwm_foc_encoder_startup_align(false);
         applied = mc_interface_store_configuration_motor(second);
     }
     /* Stock VESC 6.00 acknowledges SET_MCCONF with the command byte only. */
@@ -1660,6 +1677,19 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
             app_vesc_disable_output(time_ms);
         }
         break;
+    case COMM_DETECT_ENCODER: {
+        float off=1001.0f, ratio=0.0f; bool inv=false;
+        float current=1.0f;
+        if(n>=4u) current=(float)buffer_get_int32(d,&k)/1000.0f;
+        app_vesc_disable_output(15000);
+        (void)mcpwm_foc_encoder_detect(current,second,&off,&ratio,&inv);
+        uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
+        buffer_append_float32(reply,off,1e6f,&ri);
+        buffer_append_float32(reply,ratio,1e6f,&ri);
+        reply[ri++]=inv?1u:0u;
+        uart_send_payload(reply,(uint16_t)ri);
+        break;
+    }
     case COMM_DETECT_HALL_FOC:
         hall_detect_begin(second, d, n);
         break;

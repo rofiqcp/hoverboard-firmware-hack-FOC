@@ -98,6 +98,8 @@ int main(void){
     cl.foc_duty_dowmramp_kp=23.4f; cl.foc_duty_dowmramp_ki=456.7f;
     cr.foc_duty_dowmramp_kp=17.8f; cr.foc_duty_dowmramp_ki=321.2f;
     cl.si_motor_poles=20u; cl.si_gear_ratio=5.25f; cl.foc_current_filter_const=0.0731f; cl.foc_hall_interp_erpm=620.0f;
+    cl.m_sensor_port_mode=SENSOR_PORT_MODE_ABI; cl.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    cl.m_encoder_counts=4096; cl.foc_encoder_offset=17.25f; cl.foc_encoder_ratio=10.0f; cl.foc_encoder_inverted=true;
     cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f; cr.foc_hall_interp_erpm=900.0f;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
@@ -182,6 +184,13 @@ int main(void){
     if(fabsf(m_motor_2.m_conf.foc_current_filter_const-0.2197f)>0.00011f) return fail("right telemetry filter persistence");
     if(fabsf(m_motor_1.m_conf.foc_hall_interp_erpm-620.0f)>0.5f || fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-900.0f)>0.5f)
         return fail("Hall interpolation ERPM persistence");
+    if(m_motor_1.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_ABI || m_motor_1.m_conf.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
+       m_motor_1.m_conf.m_encoder_counts!=4096 || !m_motor_1.m_conf.foc_encoder_inverted ||
+       fabsf(m_motor_1.m_conf.foc_encoder_offset-17.25f)>0.011f || fabsf(m_motor_1.m_conf.foc_encoder_ratio-10.0f)>0.0002f)
+        return fail("LEFT ABI encoder persistence");
+    if(!m_motor_1.m_encoder_configured || m_motor_1.m_encoder_synced) return fail("LEFT ABI runtime init/sync lifecycle");
+    if(m_motor_2.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_HALL || m_motor_2.m_conf.foc_sensor_mode!=FOC_SENSOR_MODE_HALL)
+        return fail("RIGHT must remain Hall-only");
     if(m_motor_1.m_hall_interp_erpm!=620u || m_motor_2.m_hall_interp_erpm!=900u ||
        m_motor_1.m_hall_interp_max_ticks==0u || m_motor_2.m_hall_interp_max_ticks==0u ||
        m_motor_1.m_hall_rate_min_step==0u || m_motor_2.m_hall_rate_min_step==0u)
@@ -190,6 +199,20 @@ int main(void){
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
     if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
     if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_rpm!=8u) return fail("right speed persistence");
+
+    /* V30 (0x601C) sudah punya Hall interpolation, tetapi belum menyimpan ABI.
+     * Migrasi tidak boleh merusak nilai Hall interpolation lama. */
+    ee_value[43]=0x601Cu; ee_value[44]=0x601Cu;
+    for(unsigned i=181u;i<=185u;i++)ee_valid[i]=0u;
+    mcpwm_foc_init();
+    if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+        return fail("V30 migration load");
+    if(fabsf(m_motor_1.m_conf.foc_hall_interp_erpm-620.0f)>0.5f || fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-900.0f)>0.5f)
+        return fail("V30 Hall interpolation preservation");
+    if(m_motor_1.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_HALL || m_motor_1.m_conf.m_encoder_counts!=4096)
+        return fail("V30 encoder default migration");
+    if(ee_value[43]!=0x601Du || ee_value[44]!=0x601Du || !ee_valid[181] || !ee_valid[185])
+        return fail("V30 encoder schema rewrite");
 
     /* V29 (0x601B) sudah punya seluruh safety persistence tetapi belum punya
      * slot foc_hall_interp_erpm. Migrasi harus memakai default upstream 500
@@ -203,14 +226,15 @@ int main(void){
        fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-500.0f)>0.5f ||
        m_motor_1.m_hall_interp_erpm!=500u || m_motor_2.m_hall_interp_erpm!=500u)
         return fail("V29 Hall interpolation migration default/runtime");
-    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu || !ee_valid[179] || !ee_valid[180] ||
-       ee_value[179]!=500u || ee_value[180]!=500u)
-        return fail("V29 migration Hall slots/signature");
+    if(ee_value[43]!=0x601Du || ee_value[44]!=0x601Du || !ee_valid[179] || !ee_valid[180] ||
+       ee_value[179]!=500u || ee_value[180]!=500u || !ee_valid[181] || !ee_valid[182] ||
+       !ee_valid[183] || !ee_valid[184] || !ee_valid[185])
+        return fail("V29 migration Hall/encoder slots/signature");
 
     /* Simulasikan upgrade image V28 (0x601A), yaitu firmware yang sudah punya
      * filter x10000 tetapi belum punya slot Vin/watt/temperatur. Field lama
      * harus tetap utuh, safety baru memakai default aman, lalu schema ditulis
-     * ulang atomik menjadi 0x601C. */
+     * ulang atomik menjadi 0x601D. */
     ee_value[43]=0x601Au; ee_value[44]=0x601Au;
     for(unsigned i=163u;i<179u;i++)ee_valid[i]=0u;
     mcpwm_foc_init();
@@ -224,11 +248,11 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.l_min_vin-MCCONF_L_MIN_VIN)>0.011f ||
        fabsf(m_motor_2.m_conf.l_temp_fet_end-MCCONF_L_TEMP_FET_END)>0.051f)
         return fail("V28 safety default migration");
-    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu)
+    if(ee_value[43]!=0x601Du || ee_value[44]!=0x601Du)
         return fail("V28 migration signature");
     for(unsigned i=163u;i<179u;i++)if(!ee_valid[i])return fail("V28 migration safety slots");
-    if(!ee_valid[179] || !ee_valid[180] || ee_value[179]!=500u || ee_value[180]!=500u)
-        return fail("V28 migration Hall interpolation slots");
+    if(!ee_valid[179] || !ee_valid[180] || ee_value[179]!=500u || ee_value[180]!=500u ||
+       !ee_valid[181] || !ee_valid[185]) return fail("V28 migration Hall/encoder slots");
 
     /* V27 (0x6019) juga harus tetap diterima. Hilangkan slot filter dan safety
      * untuk meniru image lama, lalu pastikan keduanya dibuat kembali. */
@@ -238,8 +262,8 @@ int main(void){
     mcpwm_foc_init();
     if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
         return fail("V27 migration load");
-    if(ee_value[43]!=0x601Cu || ee_value[44]!=0x601Cu || !ee_valid[161] || !ee_valid[162] ||
-       !ee_valid[179] || !ee_valid[180])
+    if(ee_value[43]!=0x601Du || ee_value[44]!=0x601Du || !ee_valid[161] || !ee_valid[162] ||
+       !ee_valid[179] || !ee_valid[180] || !ee_valid[181] || !ee_valid[185])
         return fail("V27 migration rewrite/signature");
 
     /* Independent signatures: corrupt only right signature; left remains valid. */

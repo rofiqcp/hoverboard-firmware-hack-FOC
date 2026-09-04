@@ -12,6 +12,25 @@ typedef struct { DMA_Channel_TypeDef *Instance; } DMA_HandleTypeDef;
 typedef struct { DMA_HandleTypeDef *hdmatx; DMA_HandleTypeDef *hdmarx; USART_TypeDef *Instance; uint32_t gState; } UART_HandleTypeDef;
 typedef struct { int dummy; } ADC_HandleTypeDef;
 typedef int GPIO_PinState;
+typedef struct { uint32_t Pin, Mode, Pull, Speed; } GPIO_InitTypeDef;
+#define GPIO_MODE_INPUT 0u
+#define GPIO_PULLUP 1u
+#define GPIO_NOPULL 0u
+#define GPIO_SPEED_FREQ_LOW 0u
+#define GPIO_SPEED_FREQ_HIGH 3u
+#define TIM_CCMR1_CC1S_0 (1u<<0)
+#define TIM_CCMR1_CC2S_0 (1u<<8)
+#define TIM_CCMR1_IC1F_Pos 4u
+#define TIM_CCMR1_IC2F_Pos 12u
+#define TIM_SMCR_SMS_0 (1u<<0)
+#define TIM_SMCR_SMS_1 (1u<<1)
+#define TIM_CCER_CC1P (1u<<1)
+#define TIM_CCER_CC2P (1u<<5)
+#define TIM_EGR_UG (1u<<0)
+#define TIM_CR1_CEN (1u<<0)
+#define __HAL_RCC_GPIOB_CLK_ENABLE() ((void)0)
+#define __HAL_RCC_TIM4_CLK_ENABLE() ((void)0)
+#define __NOP() ((void)0)
 #define GPIO_PIN_RESET 0
 #define GPIO_PIN_SET 1
 extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern DMA_TypeDef _DMA1; extern DWT_Type _DWT;
@@ -102,6 +121,7 @@ static inline int HAL_ADC_Start(ADC_HandleTypeDef *h){(void)h;return HAL_OK;}
 static inline uint32_t HAL_GetTick(void){return 0u;}
 static inline void __disable_irq(void){}
 static inline void __enable_irq(void){}
+static inline void HAL_GPIO_Init(GPIO_TypeDef *p, GPIO_InitTypeDef *i){(void)p;(void)i;}
 static inline void HAL_GPIO_TogglePin(GPIO_TypeDef *p, uint16_t pin){(void)p;(void)pin;}
 static inline void HAL_GPIO_WritePin(GPIO_TypeDef *p, uint16_t pin, GPIO_PinState s){(void)p;(void)pin;(void)s;}
 static inline GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p,uint16_t pin){(void)p;(void)pin;return GPIO_PIN_RESET;}

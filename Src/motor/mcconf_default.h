@@ -36,6 +36,17 @@
 #define MCCONF_CC_MIN_CURRENT                     0.05f /* VESC-style release threshold */
 #define MCCONF_DUTY_PI_BUS_NOMINAL_V            42.5f
 #define MCCONF_FOC_SENSOR_MODE      FOC_SENSOR_MODE_HALL
+/* ABI incremental encoder LEFT, VESC m_encoder_counts semantics.
+ * 1024 PPR quadrature = 4096 counts/rev. PB6/PB7 are shared with LEFT Hall V/W,
+ * therefore Hall and ABI are mutually exclusive sensor-port modes. */
+#define MCCONF_ENCODER_COUNTS_DEFAULT             4096u
+#define MCCONF_ENCODER_RATIO_DEFAULT              ((float)MCCONF_POLE_PAIRS_LEFT)
+#define MCCONF_ENCODER_OFFSET_DEFAULT             0.0f
+#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.80f
+#define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       250u
+#define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       500u
+#define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */
+#define MCCONF_ENCODER_SPEED_TIMEOUT_TICKS         8000u /* 0.5 s -> zero */
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u
 #define MCCONF_FOC_CURRENT_KI_Q16           1229u
 #define MCCONF_FOC_ID_KP_Q11                 819u

@@ -46,8 +46,16 @@ typedef struct {
     uint32_t m_speed_ki_coeff_q16;
     uint32_t m_speed_kd_coeff_q8;
     volatile uint16_t m_kpp_q11, m_kip_q16, m_kdp_q11;
+    /* Extension posisi multi-putaran proyek. Pada Hall satu count = satu edge
+     * Hall; pada ABI satu count = satu quadrature count. Jangan gunakan field
+     * ini sebagai tachometer wire VESC. */
     volatile int32_t m_position_counts;
-    volatile uint32_t m_position_abs_counts; /* total edge Hall absolut sejak reset */
+    volatile uint32_t m_position_abs_counts;
+    /* Tachometer standar VESC: selalu resolusi 60 derajat elektrik, terlepas
+     * dari sumber rotor Hall atau encoder dan terlepas dari CPR encoder. */
+    volatile int32_t m_tachometer;
+    volatile uint32_t m_tachometer_abs;
+    uint8_t m_tacho_step_last;
     volatile int32_t m_position_target_counts;
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
@@ -128,8 +136,25 @@ typedef struct {
     volatile uint16_t m_phase;
     volatile uint16_t m_phase_hall;
     volatile uint16_t m_phase_hall_target;
+    volatile uint16_t m_phase_encoder;      /* corrected electrical ABI phase */
+    volatile uint16_t m_encoder_mech_phase; /* raw mechanical ABI angle 0..360 */
     volatile uint16_t m_phase_openloop;
     volatile uint8_t m_phase_override;
+
+    /* VESC ABI encoder runtime state. Only motor LEFT can own TIM4/PB6/PB7. */
+    volatile uint32_t m_encoder_raw_count;
+    uint32_t m_encoder_prev_count;
+    uint32_t m_encoder_counts;
+    uint32_t m_encoder_count_to_phase_q16;
+    uint32_t m_encoder_ratio_q16;
+    uint16_t m_encoder_offset_phase;
+    int32_t m_encoder_delta_accum;
+    uint16_t m_encoder_speed_ticks;
+    uint16_t m_encoder_idle_ticks;
+    volatile int32_t m_encoder_erpm_q16;
+    volatile int32_t m_encoder_mech_rpm_q16;
+    volatile uint8_t m_encoder_configured;
+    volatile uint8_t m_encoder_synced;
 
     /* Hall estimator and fixed point regulators. */
     uint8_t m_hall_state;              /* debounced Hall state used by FOC */
@@ -267,6 +292,9 @@ void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
 void mcpwm_foc_set_handbrake(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
+bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
+bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
+bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
 void mcpwm_foc_release_motor(bool is_second_motor);
 void mcpwm_foc_vesc_timeout_configure(bool is_second_motor, uint32_t timeout_ms, float brake_current);
 void mcpwm_foc_vesc_override_touch(bool is_second_motor);
@@ -293,11 +321,13 @@ float mcpwm_foc_get_iq_motor(bool is_second_motor);
 float mcpwm_foc_get_vd_motor(bool is_second_motor);
 float mcpwm_foc_get_vq_motor(bool is_second_motor);
 float mcpwm_foc_get_phase_motor(bool is_second_motor);
+float mcpwm_foc_get_phase_encoder_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
 void mcpwm_foc_refresh_hall_interpolation(bool is_second_motor);
+void mcpwm_foc_refresh_encoder_configuration(bool is_second_motor, bool reinitialize);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
 bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);

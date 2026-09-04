@@ -16,6 +16,8 @@ def check_static():
         'platformio.ini','STM32F103RCTx_FLASH.ld',
         'Src/main.c','Src/setup.c','Src/util.c','Src/comms.c','Src/config.h',
         'Src/motor/foc_math.c','Src/motor/mc_interface.c','Src/motor/mcpwm_foc.c',
+        'Src/encoder/encoder.c','Src/encoder/encoder.h','Src/encoder/encoder_datatype.h',
+        'Src/encoder/enc_abi.c','Src/encoder/enc_abi.h','Src/encoder/encoder_cfg.c','Src/encoder/encoder_cfg.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c','Src/vesc/vesc_protocol.c',
         'Src/motor/mcpwm_foc.c','Src/motor/mcpwm_foc.h','Src/motor/mc_interface.c','Src/motor/mc_interface.h',
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
@@ -68,7 +70,7 @@ def check_static():
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
     assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)' in mc and 'motor_pole_pairs(second)' in mc, 'VESC mc_values.rpm must be atomic ERPM'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
-    assert 'm->m_phase_openloop : m->m_phase_hall' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
+    assert 'if(openloop_phase) m->m_phase=m->m_phase_openloop;' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
     assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'strict internal Hall detector/validation missing'
     assert 'gap < 18u || gap > 48u' in mc, 'Hall detect sector-gap rejection missing'
@@ -97,12 +99,19 @@ def check_static():
     assert re.search(r'#define\s+SVPWM_OPENLOOP_RPM_DEFAULT\s+10u',cfg), 'mode4 default open-loop speed must be 10 rpm'
     assert re.search(r'#define\s+SVPWM_ID_SLEW_A_PER_S\s+4u',cfg), 'mode4 Id slew must be 4 A/s'
     assert '(((i_sum >> 16) << 1) + (int32_t)p_term) >> 1' in mathc, 'PI equation no longer matches generated PI_clamp_fixdt'
+    enc=(ROOT/'Src/encoder/encoder.c').read_text(); abi=(ROOT/'Src/encoder/enc_abi.c').read_text(); ench=(ROOT/'Src/encoder/encoder.h').read_text()
+    assert 'SENSOR_PORT_MODE_ABI' in enc and 'enc_abi_init' in enc and 'encoder_read_deg' in enc, 'VESC ABI encoder dispatcher missing'
+    assert 'TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1' in abi and 'TIM4' in (ROOT/'Src/encoder/encoder_cfg.c').read_text(), 'TIM4 quadrature ABI driver missing'
+    assert 'encoder_feedback_update' in mc and 'm_phase_encoder' in mc and 'encoder_feedback_selected' in mc, 'ABI phase not integrated into FOC'
+    assert 'mcpwm_foc_encoder_startup_align' in mc and 'mcpwm_foc_encoder_detect' in mc, 'ABI lifecycle/detect missing'
+    assert 'PB6/PB7' in mc or 'PB6/PB7' in abi, 'shared Hall/ABI pin constraint not documented'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
     assert 'VESC_TX_QUEUE_DEPTH' in vp and 'vesc_tx_service' in vp and 'HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n)' in vp, 'VESC reply path must use nonblocking USART3 TX DMA FIFO'
     assert 'while (huart3.gState != HAL_UART_STATE_READY)' not in vp, 'VESC reply path must never busy-wait on UART TX'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
     assert 'COMM_DETECT_HALL_FOC' in vp and 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp, 'VESC-standard async Hall detect command missing'
+    assert 'case COMM_DETECT_ENCODER:' in vp and 'mcpwm_foc_encoder_detect' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
     assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'
@@ -113,7 +122,7 @@ def check_static():
     assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
-    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and 'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and 'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and 'EE_CFG_SIGNATURE_V24   0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'EE_L_CC_MIN_CURRENT_CA = 141' in mci and 'EE_R_CC_MIN_CURRENT_CA = 142' in mci and 'EE_L_EXT2_BAT_CUT_START_CV = 143' in mci and 'EE_R_EXT2_BAT_CUT_START_CV = 150' in mci and 'EE_L_EXT2_BAT_META = 157' in mci and 'EE_R_EXT2_BAT_META = 159' in mci and 'EE_L_EXT5_HALL_INTERP_ERPM = 179' in mci and 'EE_R_EXT5_HALL_INTERP_ERPM = 180' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+    assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and 'EE_CFG_SIGNATURE_VALUE 0x601Du' in mci and 'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and 'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and 'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and 'EE_CFG_SIGNATURE_V24   0x6016u' in mci and 'EE_CFG_SIGNATURE_V23   0x6015u' in mci and 'EE_CFG_SIGNATURE_V22   0x6014u' in mci and 'EE_CFG_SIGNATURE_V21   0x6013u' in mci and 'EE_CFG_SIGNATURE_V20   0x6012u' in mci and 'EE_CFG_SIGNATURE_V19   0x6011u' in mci and 'EE_CFG_SIGNATURE_V18   0x6010u' in mci and 'EE_CFG_SIGNATURE_V17   0x600Fu' in mci and 'EE_CFG_SIGNATURE_V16   0x600Eu' in mci and 'EE_L_EXT_CURRENT_MIN_CA = 123' in mci and 'EE_R_EXT_CURRENT_MIN_CA = 129' in mci and 'EE_L_CC_MIN_CURRENT_CA = 141' in mci and 'EE_R_CC_MIN_CURRENT_CA = 142' in mci and 'EE_L_EXT2_BAT_CUT_START_CV = 143' in mci and 'EE_R_EXT2_BAT_CUT_START_CV = 150' in mci and 'EE_L_EXT2_BAT_META = 157' in mci and 'EE_R_EXT2_BAT_META = 159' in mci and 'EE_L_EXT5_HALL_INTERP_ERPM = 179' in mci and 'EE_R_EXT5_HALL_INTERP_ERPM = 180' in mci and 'EE_L_EXT6_ENCODER_FLAGS = 181' in mci and 'EE_L_EXT6_ENCODER_RATIO_X10000_HI' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
     assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
     assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
@@ -139,7 +148,7 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)181u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)186u\)', eeh), 'EEPROM virtual variable count mismatch'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
