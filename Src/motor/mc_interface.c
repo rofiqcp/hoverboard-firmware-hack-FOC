@@ -798,6 +798,12 @@ bool mc_interface_load_configuration_motor(bool second) {
         }
         m->m_conf.foc_current_filter_const = tf;
     }
+    /* EEPROM ramp/release slots are stored in ERPM using whatever pole count
+     * was active when they were written. Decode those slots with that persisted
+     * pole count first, then canonicalize to the fixed physical motor identity
+     * so correcting stale/cross-motor metadata preserves mechanical speed. */
+    const uint16_t persisted_pp = mcpwm_foc_get_pole_pairs(second);
+    m->m_conf.si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
     const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
 
     if (ee_read_slot(cur_slot, &v) && v >= 10u && v <= I_MOT_MAX * 100u) {
@@ -1022,13 +1028,13 @@ bool mc_interface_load_configuration_motor(bool second) {
     }
     if (ee_read_slot(ramp_slot, &v) && v > 0u) {
         uint32_t erpm_s = (uint32_t)v * 10u;
-        uint32_t mech = erpm_s / pp;
+        uint32_t mech = erpm_s / persisted_pp;
         if (mech < 1u) mech = 1u;
         if (mech > 5000u) mech = 5000u;
         m->m_speed_ramp_rpm_s = (uint16_t)mech;
     }
     if (ee_read_slot(rel_slot, &v) && v > 0u) {
-        uint32_t mech = v / pp;
+        uint32_t mech = v / persisted_pp;
         if (mech < 1u) mech = 1u;
         if (mech > 100u) mech = 100u;
         m->m_speed_release_rpm = (uint16_t)mech;

@@ -42,10 +42,12 @@ volatile int32_t encoder_detect_minus_mdeg = 0;
 volatile uint32_t encoder_detect_plus_count = 0u;
 volatile uint32_t encoder_detect_minus_count = 0u;
 volatile uint32_t encoder_detect_origin_count = 0u;
-volatile uint32_t encoder_gpio_edge_a = 0u;
-volatile uint32_t encoder_gpio_edge_b = 0u;
+volatile uint32_t encoder_gpio_edge_a = 0u; /* PB6 */
+volatile uint32_t encoder_gpio_edge_b = 0u; /* PB7 */
+volatile uint32_t encoder_gpio_edge_pb5 = 0u;
 volatile uint32_t encoder_gpio_samples = 0u;
 volatile uint8_t encoder_gpio_last_ab = 0u;
+volatile uint8_t encoder_gpio_last_pb5 = 0u;
 volatile int16_t encoder_detect_plus_id_q4 = 0;
 volatile int16_t encoder_detect_plus_iq_q4 = 0;
 volatile int16_t encoder_detect_minus_id_q4 = 0;
@@ -547,6 +549,14 @@ static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool re
     m->m_encoder_offset_phase=(uint16_t)(ofs*(65536.0f/360.0f)+0.5f);
     m->m_encoder_raw_count=encoder_read_raw_count();
     m->m_encoder_prev_count=m->m_encoder_raw_count;
+#ifdef STM32F103xE
+    if(!second && reinitialize){
+        const uint32_t idr=GPIOB->IDR;
+        encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_edge_pb5=0u; encoder_gpio_samples=0u;
+        encoder_gpio_last_ab=(uint8_t)(((idr & GPIO_PIN_6)?1u:0u) | ((idr & GPIO_PIN_7)?2u:0u));
+        encoder_gpio_last_pb5=(idr & GPIO_PIN_5)?1u:0u;
+    }
+#endif
     m->m_encoder_delta_accum=0; m->m_encoder_speed_ticks=0u; m->m_encoder_idle_ticks=0u;
     /* Rebase counter dan speed harus atomik secara semantik. Membawa RPM lama
      * ke config/sync baru akan masuk ke speed PID dan p_pid_kd_proc sebagai
@@ -1433,8 +1443,9 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     encoder_stage_set(1u);
     encoder_detect_plus_mdeg=0; encoder_detect_minus_mdeg=0;
     encoder_detect_plus_count=0u; encoder_detect_minus_count=0u; encoder_detect_origin_count=0u;
-    encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_samples=0u;
+    encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_edge_pb5=0u; encoder_gpio_samples=0u;
     encoder_gpio_last_ab=(uint8_t)(((GPIOB->IDR & GPIO_PIN_6)?1u:0u) | ((GPIOB->IDR & GPIO_PIN_7)?2u:0u));
+    encoder_gpio_last_pb5=(GPIOB->IDR & GPIO_PIN_5)?1u:0u;
     encoder_detect_plus_id_q4=encoder_detect_plus_iq_q4=0;
     encoder_detect_minus_id_q4=encoder_detect_minus_iq_q4=0;
     uint8_t fail_code=0u;
@@ -2051,11 +2062,14 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
     if (!encoder_port_active(m,second) || !m->m_encoder_configured || m->m_encoder_counts<4u) return;
 #ifdef STM32F103xE
     if(!second){
-        const uint8_t ab=(uint8_t)(((GPIOB->IDR & GPIO_PIN_6)?1u:0u) | ((GPIOB->IDR & GPIO_PIN_7)?2u:0u));
+        const uint32_t idr=GPIOB->IDR;
+        const uint8_t ab=(uint8_t)(((idr & GPIO_PIN_6)?1u:0u) | ((idr & GPIO_PIN_7)?2u:0u));
+        const uint8_t pb5=(idr & GPIO_PIN_5)?1u:0u;
         const uint8_t ch=(uint8_t)(ab ^ encoder_gpio_last_ab);
         if(ch & 1u) encoder_gpio_edge_a++;
         if(ch & 2u) encoder_gpio_edge_b++;
-        encoder_gpio_last_ab=ab; encoder_gpio_samples++;
+        if(pb5 != encoder_gpio_last_pb5) encoder_gpio_edge_pb5++;
+        encoder_gpio_last_ab=ab; encoder_gpio_last_pb5=pb5; encoder_gpio_samples++;
     }
 #endif
     const uint32_t cnt=encoder_read_raw_count();
