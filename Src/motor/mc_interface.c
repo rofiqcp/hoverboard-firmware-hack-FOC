@@ -399,9 +399,19 @@ bool mc_interface_steering_boot_home(void){
 bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,
                                             int32_t *raw_left, int32_t *raw_right, int32_t *span_out){
     float off=1001.0f, rat=0.0f; bool inv=false;
-    if(!mcpwm_foc_encoder_detect(current,false,&off,&rat,&inv))return false;
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
+    /* Encoder detect itself is fail-closed unless the ABI port is already
+     * configured. Put LEFT into the intended sensor mode before the bounded
+     * phase probe; otherwise a fresh/legacy Hall configuration returns the
+     * VESC failure sentinel (offset=1001, ratio=0) without moving at all. */
     mc_configuration c=m->m_conf;
+    c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+    c.sensor_mode=SENSOR_MODE_SENSORED;
+    c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    mcpwm_foc_set_configuration(&c,false);
+    if(!mcpwm_foc_encoder_detect(current,false,&off,&rat,&inv))return false;
+    c=m->m_conf;
     c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI; c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
     c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
     c.foc_encoder_offset=off; c.foc_encoder_ratio=rat; c.foc_encoder_inverted=inv;
