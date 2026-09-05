@@ -28,8 +28,10 @@ void encoder_update_config(volatile mc_configuration *conf) {
     if (counts > 65536u) counts = 65536u;
     if (encoder_cfg_ABI.counts != counts) {
         encoder_cfg_ABI.counts = counts;
-        encoder_cfg_ABI.timer->ARR = counts - 1u;
-        if (encoder_cfg_ABI.timer->CNT >= counts) encoder_cfg_ABI.timer->CNT = 0u;
+        /* Keep TIM4 as the legacy full-width 16-bit quadrature counter.
+         * Encoder reads are normalized modulo CPR by enc_abi_read_cnt(). */
+        encoder_cfg_ABI.timer->ARR = 0xffffu;
+        encoder_cfg_ABI.timer->CNT %= counts;
         /* VESC invalidates ABI sync whenever CPR changes. */
         memset(&encoder_cfg_ABI.state, 0, sizeof(encoder_cfg_ABI.state));
     }

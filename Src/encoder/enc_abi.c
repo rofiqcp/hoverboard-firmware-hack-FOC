@@ -16,9 +16,13 @@ bool enc_abi_init(ABI_config_t *cfg) {
     __HAL_RCC_TIM4_CLK_ENABLE();
 
     GPIO_InitTypeDef io = {0};
+    /* Match the proven pre-VESC steering firmware electrical interface.
+     * The board already has external 2.2 kOhm pull-ups on ENC_A/ENC_B, so
+     * adding the STM32 weak pull-up is unnecessary and changes the exact
+     * input bias that was validated on hardware. */
     io.Mode = GPIO_MODE_INPUT;
-    io.Pull = GPIO_PULLUP;
-    io.Speed = GPIO_SPEED_FREQ_HIGH;
+    io.Pull = GPIO_NOPULL;
+    io.Speed = GPIO_SPEED_FREQ_LOW;
     io.Pin = cfg->A_pin;
     HAL_GPIO_Init(cfg->A_gpio, &io);
     io.Pin = cfg->B_pin;
@@ -32,13 +36,16 @@ bool enc_abi_init(ABI_config_t *cfg) {
     cfg->timer->CCMR1 = 0u;
     cfg->timer->CCMR2 = 0u;
     cfg->timer->PSC = 0u;
-    cfg->timer->ARR = cfg->counts - 1u;
+    /* Legacy working firmware used the full 16-bit TIM4 counter. Keep that
+     * hardware behaviour and normalize to configured CPR in the read path. */
+    cfg->timer->ARR = 0xffffu;
     cfg->timer->CNT = 0u;
 
-    /* VESC enc_abi.c: TIM encoder mode TI12, rising/rising, IC filter=6. */
+    /* Match the proven pre-VESC TIM4 setup: TI12, rising/rising, filter=3.
+     * VESC semantics are preserved above this hardware capture layer. */
     cfg->timer->CCMR1 = TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0 |
-                        (6u << TIM_CCMR1_IC1F_Pos) |
-                        (6u << TIM_CCMR1_IC2F_Pos);
+                        (3u << TIM_CCMR1_IC1F_Pos) |
+                        (3u << TIM_CCMR1_IC2F_Pos);
     cfg->timer->SMCR = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1;
     cfg->timer->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC2P);
     cfg->timer->EGR = TIM_EGR_UG;
@@ -54,11 +61,11 @@ void enc_abi_deinit(ABI_config_t *cfg) {
     if (!cfg || !cfg->timer) return;
     cfg->timer->CR1 &= ~TIM_CR1_CEN;
     GPIO_InitTypeDef io = {0};
-    /* Upstream VESC mengembalikan pin ABI ke INPUT_PULLUP saat deinit.
-     * PB6/PB7 berbagi fungsi dengan Hall LEFT, jadi NOPULL di sini dapat
-     * merusak pembacaan Hall setelah mode sensor diganti lewat VESC Tool. */
+    /* Restore the same floating-input electrical state used by the known-good
+     * steering firmware. LEFT ABI owns PB6/PB7 in this project; Hall mode is
+     * not allowed to share those two lines while ABI is selected. */
     io.Mode = GPIO_MODE_INPUT;
-    io.Pull = GPIO_PULLUP;
+    io.Pull = GPIO_NOPULL;
     io.Speed = GPIO_SPEED_FREQ_LOW;
     io.Pin = cfg->A_pin;
     HAL_GPIO_Init(cfg->A_gpio, &io);
@@ -67,13 +74,13 @@ void enc_abi_deinit(ABI_config_t *cfg) {
 }
 
 uint32_t enc_abi_read_cnt(ABI_config_t *cfg) {
-    if (!cfg || !cfg->timer) return 0u;
-    return cfg->timer->CNT;
+    if (!cfg || !cfg->timer || cfg->counts < 1u) return 0u;
+    return cfg->timer->CNT % cfg->counts;
 }
 
 float enc_abi_read_deg(ABI_config_t *cfg) {
     if (!cfg || !cfg->timer || cfg->counts < 1u) return 0.0f;
-    return ((float)cfg->timer->CNT * 360.0f) / (float)cfg->counts;
+    return ((float)enc_abi_read_cnt(cfg) * 360.0f) / (float)cfg->counts;
 }
 
 void enc_abi_set_deg(ABI_config_t *cfg, float deg) {
