@@ -12,8 +12,9 @@ GAIN_TOOL='/tmp/mc_speed_gain_tool'
 def get_mc(link,right):
     req=bytes([COMM_GET_MCCONF]); p=link.transact(link.fwd(req) if right else req,COMM_GET_MCCONF,1.2); return p[1:]
 def set_mc(link,right,raw):
-    req=bytes([COMM_SET_MCCONF])+raw; p=link.transact(link.fwd(req) if right else req,COMM_SET_MCCONF,1.2)
-    if p!=bytes([COMM_SET_MCCONF]): raise RuntimeError(f'bad SET_MCCONF ack {p.hex()}')
+    # SET_MCCONF stores to flash. Use the same persistent-write timeout path as
+    # VescDual/VESC Tool button-matrix instead of the old 1.2 s read timeout.
+    link.set_mcconf_raw(raw, right)
 def patch_gain(raw,kp,ki,kd):
     with tempfile.TemporaryDirectory() as td:
         a=Path(td)/'a.bin'; b=Path(td)/'b.bin'; a.write_bytes(raw)

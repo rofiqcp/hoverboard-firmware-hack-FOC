@@ -81,8 +81,7 @@ int main(void){
     mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
     for(int i=0;i<180;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_duty_ramp_permille!=1000)return fail("15A duty ramp must reach normalized 1.0 target");
-    if(m_motor_1.m_duty_ramp_step_permille!=20u)return fail("VESC 0.02 duty ramp scaling");
+    if(m_motor_1.m_duty_set_permille!=1000)return fail("15A duty command must reach normalized 1.0 target");
     if(m_motor_1.m_current_limit_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production duty current authority must be 15A");
     if(m_motor_1.m_input_current_max_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production input current limit must be 15A");
     if(abs(m_motor_1.m_iq_set_q4)>15*FOC_CURRENT_Q4_PER_A)return fail("95pct duty exceeds 15A motor current envelope");
@@ -136,11 +135,12 @@ int main(void){
     for(int i=0;i<3500;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
     for(int i=0;i<5000;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode2 STOP must release near zero");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain VESC speed zero-vector");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
-        return fail("mode2 release must reset all PI integrators");
-    if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0)
-        return fail("mode2 release must zero speed states");
+        return fail("mode2 zero-vector must reset PI integrators");
+    if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0 ||
+       m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)
+        return fail("mode2 zero-vector state");
 
     /* VESC boundary: 750 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
@@ -156,7 +156,7 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
     for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("VESC zero ERPM release");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)return fail("VESC zero ERPM zero-vector");
     mcpwm_foc_set_pid_speed(750.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_rpm=50;
@@ -223,6 +223,26 @@ int main(void){
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_openloop_id_target_q4!=SVPWM_MAX_ID_A*FOC_CURRENT_Q4_PER_A)return fail("mode4 Id safety clamp");
 
+    /* Standard VESC open-loop APIs are distinct from the legacy SVPWM utility:
+     * OPENLOOP_CURRENT rotates signed Iq at electrical RPM; OPENLOOP_PHASE applies
+     * signed Id at a fixed electrical phase. No pole-pair multiplication here. */
+    mcpwm_foc_init(); enable=0u; set_halls(3u,3u);
+    m_motor_1.m_openloop_phase_acc_q32=0u; m_motor_1.m_phase_openloop=0u;
+    mcpwm_foc_set_openloop_current(1.0f,600.0f,false); mcpwm_foc_vesc_override_touch(false);
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_OPENLOOP ||
+       m_motor_1.m_iq_target_q4!=FOC_CURRENT_Q4_PER_A || m_motor_1.m_id_set_q4!=0 ||
+       m_motor_1.m_openloop_speed_q16!=(600<<16)) return fail("VESC openloop current set semantics");
+    for(int i=0;i<160;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_phase_openloop<6500u || m_motor_1.m_phase_openloop>6610u)
+        return fail("VESC openloop electrical RPM integration");
+    if(m_motor_1.m_iq_set_q4!=FOC_CURRENT_Q4_PER_A || m_motor_1.m_id_set_q4!=0)
+        return fail("VESC openloop current axis changed in control loop");
+    mcpwm_foc_set_openloop_phase(-1.0f,90.0f,false); mcpwm_foc_vesc_override_touch(false);
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE ||
+       m_motor_1.m_id_set_q4!=-FOC_CURRENT_Q4_PER_A || m_motor_1.m_iq_set_q4!=0 ||
+       m_motor_1.m_phase_openloop<16380u || m_motor_1.m_phase_openloop>16388u)
+        return fail("VESC openloop fixed-phase signed Id semantics");
+
     /* Reverse Hall convention remains the generated-controller pos+1 rule. */
     mcpwm_foc_init(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
     for(int i=0;i<100;i++)mcpwm_foc_adc_int_handler();
@@ -258,11 +278,13 @@ int main(void){
      * A bogus OFF measurement must never seed the next torque reference. */
     m_motor_1.m_iq_q4=(int16_t)(-5*FOC_CURRENT_Q4_PER_A);
     mcpwm_foc_set_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
-    if(m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_iq_set_ramp_q16!=0)return fail("SET_CURRENT seeded from OFF measured Iq");
+    if(m_motor_1.m_iq_set_q4!=FOC_CURRENT_Q4_PER_A ||
+       m_motor_1.m_iq_set_ramp_q16!=((int32_t)FOC_CURRENT_Q4_PER_A<<16))
+        return fail("SET_CURRENT must use command directly, never OFF measured Iq");
     if(m_motor_1.m_iq_target_q4!=FOC_CURRENT_Q4_PER_A)return fail("VESC SET_CURRENT 1A exact Q4 scaling");
     curL_phaA=curL_phaB=curL_DC=0;
     for(int i=0;i<18000;i++)mcpwm_foc_adc_int_handler();
-    if(abs(m_motor_1.m_vq)<=MCCONF_FOC_CLOSED_LOOP_VOLTAGE_MAX)return fail("1A current PI still hard-capped at 80pct modulation");
+    if(abs(m_motor_1.m_vq)<=((MCCONF_FOC_VOLTAGE_MAX*8)/10))return fail("1A current PI still hard-capped at 80pct modulation");
     if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("1A current PI exceeds EFeru full-safe modulation");
 
     /* EFeru hoverboard current-sense contract: one ampere is exactly 50 ADC
@@ -374,8 +396,8 @@ int main(void){
     if(m_motor_1.m_position_target_counts!=-5)return fail("position PMIN clamp");
 
     /* Standard VESC COMM_SET_POS stays single-turn electrical degrees and never
-     * aliases the project's long-range Hall-count coordinate. It follows the
-     * upstream normalized position PID -> Iq architecture with a Hall deadband. */
+     * aliases the project's long-range count coordinate. Its normalized PID
+     * output scales to the configured motor-current envelope exactly upstream. */
     mcpwm_foc_init(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
     {
@@ -385,14 +407,15 @@ int main(void){
         for(int i=0;i<12;i++)mcpwm_foc_adc_int_handler();
         if(!m_motor_1.m_pos_pid_phase_mode || m_motor_1.m_control_mode!=CONTROL_MODE_POS)return fail("VESC position Hall phase mode");
         if(m_motor_1.m_iq_target_q4<=0)return fail("VESC position positive phase error must request positive Iq");
-        { const int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
-          const int32_t abs_iq=m_motor_1.m_iq_target_q4<0?-m_motor_1.m_iq_target_q4:m_motor_1.m_iq_target_q4;
+        { const int32_t abs_iq=m_motor_1.m_iq_target_q4<0?-m_motor_1.m_iq_target_q4:m_motor_1.m_iq_target_q4;
           const int32_t abs_ref=m_motor_1.m_iq_set_q4<0?-m_motor_1.m_iq_set_q4:m_motor_1.m_iq_set_q4;
-          if(abs_iq>pos_lim_q4)return fail("VESC position current ceiling");
-          if(abs_ref>pos_lim_q4)return fail("VESC position slew reference overflow/cap"); }
+          const int32_t count_cap=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+          if(abs_iq>m_motor_1.m_current_limit_q4 || abs_ref>m_motor_1.m_current_limit_q4)
+              return fail("VESC position configured current envelope");
+          if(abs_iq<=count_cap)return fail("standard VESC position must not use custom count cap"); }
         mcpwm_foc_set_pid_pos(mcpwm_foc_get_phase_motor(false),false);
         for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
-        if(m_motor_1.m_iq_target_q4!=0)return fail("VESC position Hall deadband must release torque");
+        if(m_motor_1.m_iq_target_q4!=0)return fail("VESC position zero error must produce zero torque");
     }
     mcpwm_foc_release_motor(false);
     m_motor_1.m_phase=0u; m_motor_1.m_position_counts=0;

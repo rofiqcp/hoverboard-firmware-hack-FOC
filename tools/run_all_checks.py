@@ -54,15 +54,15 @@ def check_static():
     assert 'speed_pid_iq_target_step' in mc and 'error_q16' in mc, 'VESC speed PID fixed-point ERPM path missing'
     assert 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc, 'mode2 speed PID must command Iq'
     assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
-    assert 'v.q=pi_run_state(eq,m->m_kpq_q11,m->m_kiq_q16' in mc, 'mode2 must close inner Iq PI before Vq'
+    assert 'current_pi_vesc_state' in mc and 'm_current_kpq_v_q16' in mc, 'mode2 must close upstream-style physical current PI before Vq'
     assert 'speed_setpoint_slew_step' in mc and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp missing'
-    assert 'stop_zone' in mc and 'iq_setpoint_slew_step(m)' in mc, 'mode2 STOP must slew Iq to zero before release'
-    assert 'mcpwm_foc_release_motor(second)' in mc and 'm->m_iq_set_q4==0' in mc, 'mode2 low-speed release must wait for zero Iq'
+    assert 'stop_zone' in mc and 'zero-vector' in mc and 'm->m_iq_set_q4=0' in mc, 'mode2 STOP must enter VESC zero-vector below s_pid_min_erpm'
+    assert 'CONTROL_MODE_SPEED' in mc and 'goto control_done' in mc, 'mode2 low-speed VESC zero-vector path missing'
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'
-    assert 'iq_setpoint_slew_step' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' in mc, 'current setpoint slew missing'
+    assert 'm->m_iq_set_q4=m->m_iq_target_q4' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' not in mcc, 'SET_CURRENT must be direct VESC reference without legacy slew'
     assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
-    assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'feedback_motion_same_direction' in mc and 'm->m_hall_ticks>fresh' in mc and 'encoder_motion_fresh' in mc and 'm_brake_direction==0' in mc, 'VESC active-feedback brake latch/freshness missing'
+    assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc and 'm->m_hall_ticks>fresh' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc, 'VESC live-direction current brake path missing'
     assert 'CONTROL_MODE_HANDBRAKE' in mc and 'm->m_phase=0u' in mc and 'mcpwm_foc_set_handbrake' in mc, 'VESC handbrake fixed-phase mode missing'
     assert 'leftDqFresh=m_motor_1.m_dq_sample_fresh' in mc and 'rightDqFresh=m_motor_2.m_dq_sample_fresh' in mc and 'leftDqFresh&&leftPhaseExceeded' in mc and 'rightDqFresh&&rightPhaseExceeded' in mc and 'leftDcTrip = leftCurrentSampleValid' in mc and 'rightDcTrip = rightCurrentSampleValid' in mc, 'D/Q ABS must use distinct fresh samples while raw DC trip remains active every driven ISR'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
@@ -82,7 +82,7 @@ def check_static():
     assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 EFeru full-safe modulation ceiling missing'
     assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+1\.00f',mcc), 'VESC normalized duty max must be 1.00'
     assert re.search(r'#define\s+MCCONF_L_IN_CURRENT_MAX\s+15\.0f',mcc) and re.search(r'#define\s+MCCONF_L_IN_CURRENT_MIN\s+-15\.0f',mcc), 'DC-link soft limit must be +/-15A'
-    assert 'MCCONF_DUTY_RAMP_STEP_DEFAULT' in mcc and 'm_duty_ramp_permille' in mc and 'duty_setpoint_slew_step' in mc, 'VESC duty ramp path missing'
+    assert 'MCCONF_DUTY_RAMP_STEP_DEFAULT' in mcc and 'm_duty_ramp_permille' not in mc and 'duty_setpoint_slew_step' not in mc and 'm_duty_set_permille' in mc, 'FOC duty must use direct VESC target; m_duty_ramp_step is wire-compatible BLDC config only'
     assert re.search(r'#define\s+VESC_DUTY_PHYSICAL_SCALE_PERMILLE\s+960',cfg), 'board VESC duty scale must be 0.960'
     assert re.search(r'#define\s+FOC_SVPWM_VECTOR_FULL_SAFE\s+14238',cfg), 'EFeru full-safe SVPWM reference vector must be 14238'
     assert re.search(r'#define\s+FOC_PWM_MARGIN_COUNTS\s+110',cfg), 'EFeru FOC PWM margin must be 110 counts'
@@ -98,7 +98,7 @@ def check_static():
     assert re.search(r'#define\s+SVPWM_DC_LIMIT_A\s+8u',cfg), 'mode4 DC-link trip must be 8A'
     assert re.search(r'#define\s+SVPWM_OPENLOOP_RPM_DEFAULT\s+10u',cfg), 'mode4 default open-loop speed must be 10 rpm'
     assert re.search(r'#define\s+SVPWM_ID_SLEW_A_PER_S\s+4u',cfg), 'mode4 Id slew must be 4 A/s'
-    assert '(((i_sum >> 16) << 1) + (int32_t)p_term) >> 1' in mathc, 'PI equation no longer matches generated PI_clamp_fixdt'
+    assert 'm->m_iq_q4=raw.q; m->m_id_q4=raw.d;' in mc and 'integrator += Ierr * Ki * dt' in mc, 'VESC raw-current PI equation missing'
     enc=(ROOT/'Src/encoder/encoder.c').read_text(); abi=(ROOT/'Src/encoder/enc_abi.c').read_text(); ench=(ROOT/'Src/encoder/encoder.h').read_text()
     assert 'SENSOR_PORT_MODE_ABI' in enc and 'enc_abi_init' in enc and 'encoder_read_deg' in enc, 'VESC ABI encoder dispatcher missing'
     assert 'TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1' in abi and 'TIM4' in (ROOT/'Src/encoder/encoder_cfg.c').read_text(), 'TIM4 quadrature ABI driver missing'
@@ -123,7 +123,7 @@ def check_static():
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
-        'EE_CFG_SIGNATURE_VALUE 0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
+        'EE_CFG_SIGNATURE_VALUE 0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
         'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and \
         'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and \
         'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and \
@@ -147,17 +147,21 @@ def check_static():
     appv=(ROOT/'Src/vesc/app_vesc.c').read_text()
     assert 'adc_buffer.adc2_spare4' in appv and 'adc_buffer.adc2_spare5' in appv, 'PA2/PA3 ADC2 app mapping missing'
     assert 'APP_ADC_UART' in appv and 'app_vesc_process' in appv, 'APP_ADC/UART runtime missing'
+    assert 'second ? -amp : amp' not in appv and 'second ? -duty : duty' not in appv and 'second ? -erpm : erpm' not in appv, 'App ADC must use mc_interface DIR_MULT, not endpoint-specific sign hacks'
     assert 'ADC_CTRL_TYPE_NONE is telemetry-only' in appv and 'if (c->ctrl_type == ADC_CTRL_TYPE_NONE)' in appv, 'ADC NONE must not energize/touch motor'
     assert 'a->timeout_msec = 1000u;' in appv, 'VESC App Config default timeout must be 1000 ms'
     assert 'mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current)' in appv, 'App Config timeout/brake must drive motor watchdog'
-    for setter in ('mc_interface_set_duty', 'mc_interface_set_current', 'mc_interface_set_brake_current', 'mc_interface_set_pid_speed'):
+    assert 'mc_interface_set_current_rel(rel)' in appv and 'mc_interface_set_brake_current_rel(rel)' in appv, 'App ADC current modes must use upstream VESC relative-current helpers'
+    assert 'void mc_interface_set_current_rel(float val)' in mci and 'void mc_interface_set_brake_current_rel(float val)' in mci, 'VESC current-rel helpers missing from mc_interface'
+    for setter in ('mc_interface_set_duty(', 'mc_interface_set_current(', 'mc_interface_set_brake_current(', 'mc_interface_set_pid_speed('):
         pos=vp.find(setter)
-        assert pos >= 0 and vp.rfind('touch_motor(second)', max(0,pos-100), pos) >= 0, f'VESC ownership must be claimed before {setter}'
+        assert pos >= 0 and vp.rfind('touch_motor(second)', max(0,pos-140), pos) >= 0, f'VESC ownership must be claimed before {setter}'
     assert 'alive_local' in vp and 'alive_right' in vp and 'mcpwm_foc_vesc_override_touch(alive_right)' in vp, 'COMM_ALIVE must bypass RX FIFO after CRC validation'
     assert 's_vesc_owned[2]' in mc and 's_vesc_timeout_ticks[2]' in mc, 'VESC ownership and timeout must be separate state'
     assert 'POWER_OFF_ENABLE          0' in cfg and 'POWER_BUTTON_BYPASS       1' in cfg, 'development power latch bypass missing'
     assert 'm_fault_recovery_ticks' in mc and 'm_fault_stop_time_ms' in mc, 'fault recovery timer missing'
     assert 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp, 'virtual CAN routing missing'
+    assert 'right_sign' not in vp and 'mc_interface_set_duty(duty)' in vp and 'mc_interface_set_pid_speed(rpm)' in vp, 'VESC protocol must forward motor-local coordinates unchanged'
     assert re.search(r'#define\s+VESC_SECOND_MOTOR_ID\s+2u',vp), 'virtual right ID must be 2'
     dual=(ROOT/'tools/vesc_dual.py').read_text()
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'

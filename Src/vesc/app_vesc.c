@@ -294,7 +294,19 @@ static void select_motor(bool second) {
 static void set_current_user(bool second, float amp) {
     select_motor(second);
     touch(second);
-    mc_interface_set_current(second ? -amp : amp);
+    mc_interface_set_current(amp);
+}
+
+static void set_current_rel_user(bool second, float rel) {
+    select_motor(second);
+    touch(second);
+    mc_interface_set_current_rel(rel);
+}
+
+static void set_brake_rel_user(bool second, float rel) {
+    select_motor(second);
+    touch(second);
+    mc_interface_set_brake_current_rel(rel);
 }
 
 static void set_brake_user(bool second, float amp) {
@@ -307,13 +319,13 @@ static void set_brake_user(bool second, float amp) {
 static void set_duty_user(bool second, float duty) {
     select_motor(second);
     touch(second);
-    mc_interface_set_duty(second ? -duty : duty);
+    mc_interface_set_duty(duty);
 }
 
 static void set_rpm_user(bool second, float erpm) {
     select_motor(second);
     touch(second);
-    mc_interface_set_pid_speed(second ? -erpm : erpm);
+    mc_interface_set_pid_speed(erpm);
 }
 
 static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, float raw_v1, float raw_v2) {
@@ -412,15 +424,15 @@ static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, 
     case ADC_CTRL_TYPE_CURRENT:
     case ADC_CTRL_TYPE_CURRENT_REV_CENTER:
     case ADC_CTRL_TYPE_CURRENT_REV_BUTTON:
-        set_current_user(second, pwr >= 0.0f ? pwr * mc->l_current_max : (-pwr) * mc->l_current_min);
+        set_current_rel_user(second, pwr);
         break;
     case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_CENTER:
     case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_CENTER:
     case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_BUTTON:
     case ADC_CTRL_TYPE_CURRENT_NOREV_BRAKE_ADC:
     case ADC_CTRL_TYPE_CURRENT_REV_BUTTON_BRAKE_ADC:
-        if (pwr >= 0.0f) set_current_user(second, pwr * mc->l_current_max);
-        else set_brake_user(second, (-pwr) * fabsf(mc->l_current_min));
+        if (pwr >= 0.0f) set_current_rel_user(second, pwr);
+        else set_brake_rel_user(second, -pwr);
         break;
     case ADC_CTRL_TYPE_DUTY:
     case ADC_CTRL_TYPE_DUTY_REV_CENTER:

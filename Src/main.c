@@ -141,7 +141,7 @@ int main(void) {
   HAL_NVIC_SetPriority(SVCall_IRQn, 0, 0);
   HAL_NVIC_SetPriority(DebugMonitor_IRQn, 0, 0);
   HAL_NVIC_SetPriority(PendSV_IRQn, 0, 0);
-  HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
+  HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
 
   SystemClock_Config();
   cycleCounterInit();
@@ -362,5 +362,5 @@ void SystemClock_Config(void) {
   HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
 
   /* SysTick_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
+  HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
 }

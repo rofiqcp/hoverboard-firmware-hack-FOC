@@ -30,8 +30,6 @@ typedef struct {
     volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
     volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */
     volatile int16_t m_duty_set_permille;      /* requested VESC duty */
-    volatile int16_t m_duty_ramp_permille;     /* active/ramped duty target */
-    uint16_t m_duty_ramp_step_permille;        /* m_duty_ramp_step * 1000 */
     int32_t m_duty_i_q15;
     uint32_t m_duty_kp_q12_per_permille;
     uint32_t m_duty_ki_q12_per_permille;
@@ -39,6 +37,11 @@ typedef struct {
 
     volatile uint16_t m_kpq_q11, m_kiq_q16;
     volatile uint16_t m_kpd_q11, m_kid_q16;
+    /* VESC current PI coefficients in physical-voltage fixed point. Kp is
+     * V/A Q16; Ki_dt is V/A per regulator step Q16. These make the ISR
+     * implement vd_int += Ierr*Ki*dt; vd = vd_int + Ierr*Kp exactly. */
+    uint32_t m_current_kpq_v_q16, m_current_kiq_dt_v_q16;
+    uint32_t m_current_kpd_v_q16, m_current_kid_dt_v_q16;
     volatile uint16_t m_kps_q11, m_kis_q16, m_kds_q11;
     /* Precomputed speed-PID coefficients. Configuration may use float, but the
      * 16-kHz ISR executes multiply+shift only (no __aeabi_ldivmod). */
@@ -119,7 +122,6 @@ typedef struct {
     volatile uint8_t m_driven_offset_calibrating;
     volatile uint8_t m_driven_offset_valid;
     volatile uint16_t m_driven_offset_samples;
-    int32_t m_driven_offset_sum0, m_driven_offset_sum1, m_driven_offset_sumdc;
     volatile int16_t m_driven_offset0, m_driven_offset1, m_driven_offsetdc;
     /* Separate zero-current ADC offsets while the bridge is high-impedance.
      * The low-side current amplifiers shift operating point between bridge-OFF
@@ -237,7 +239,6 @@ typedef struct {
     /* Brake current is stored as a magnitude. CONTROL_MODE_CURRENT_BRAKE
      * recomputes its sign from fresh Hall speed every control update, matching
      * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */
-    int8_t m_brake_direction; /* diagnostic: current applied direction, 0 at stop/stale speed */
     int16_t m_brake_current_q4;
     int16_t m_handbrake_current_q4;
     int32_t m_current_lpf_q16[2];
@@ -270,6 +271,28 @@ typedef struct {
     volatile int16_t m_last_trip_dc_counts;
     volatile int16_t m_last_trip_duty_permille;
 } mcpwm_foc_motor_t;
+
+/* Snapshot telemetry sudah diskalakan persis ke unit wire COMM_GET_VALUES.
+ * Tujuannya menghindari puluhan operasi soft-float pada STM32F103 tanpa FPU
+ * saat VESC Tool melakukan polling realtime 50 Hz. */
+typedef struct {
+    int32_t current_motor_x100;
+    int32_t current_in_x100;
+    int32_t id_x100;
+    int32_t iq_x100;
+    int16_t duty_x1000;
+    int32_t erpm;
+    int16_t vin_x10;
+    int32_t ah_x10000;
+    int32_t ah_charged_x10000;
+    int32_t wh_x10000;
+    int32_t wh_charged_x10000;
+    int32_t tachometer;
+    int32_t tachometer_abs;
+    uint8_t fault;
+    int32_t vd_x1000;
+    int32_t vq_x1000;
+} mcpwm_foc_values_scaled_t;
 
 extern mcpwm_foc_motor_t m_motor_1;
 extern mcpwm_foc_motor_t m_motor_2;
@@ -335,6 +358,7 @@ float mcpwm_foc_get_pid_pos_set_motor(bool is_second_motor);
 mc_state mcpwm_foc_get_state_motor(bool is_second_motor);
 mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
+void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *values, bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
 void mcpwm_foc_refresh_hall_interpolation(bool is_second_motor);
 void mcpwm_foc_refresh_encoder_configuration(bool is_second_motor, bool reinitialize);

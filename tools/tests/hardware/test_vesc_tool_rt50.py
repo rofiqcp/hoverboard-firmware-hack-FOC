@@ -74,11 +74,12 @@ def parse_values(payload:bytes, selective=True)->RtValues:
 class Link:
     def __init__(self,port,baud=115200,timeout=.06):
         self.ser=serial.Serial(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
-        self.ser.reset_input_buffer()
+        self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
     def close(self): self.ser.close()
     @staticmethod
     def fwd(p): return bytes((COMM_FORWARD_CAN,RIGHT_ID))+p
-    def send(self,p,right=False): self.ser.write(frame(self.fwd(p) if right else p))
+    def send(self,p,right=False):
+        self.ser.write(frame(self.fwd(p) if right else p)); self.ser.flush()
     def recv(self,cmd,deadline):
         while time.monotonic()<deadline:
             d=self.ser.read(self.ser.in_waiting or 1)
@@ -107,18 +108,48 @@ def validate(v:RtValues,vid:int):
     if not -1.05<=v.duty<=1.05: raise ValueError(f'duty {v.duty}')
 
 def poll_one(link,right,count,hz):
-    period=1.0/hz; lat=[]; last=None; fail=[]
+    """Emulasikan polling realtime VESC Tool: QTimer mengirim tiap 20 ms secara
+    asynchronous, bukan request lalu menunggu reply sebelum tick berikutnya."""
+    period=1.0/hz; replies=[]; reply_times=[]; send_times=[]; fail=[]
+    # Diagnostic payload besar (~100 ms pada CH341) bukan bagian RT polling.
+    old_timeout=link.timeout; link.timeout=max(old_timeout,0.25)
     d0=link.diag(right)
-    started=time.monotonic(); next_t=started
-    for n in range(count):
-        next_t+=period; t0=time.monotonic()
-        try:
-            last=link.values(right); validate(last,RIGHT_ID if right else 1); lat.append((time.monotonic()-t0)*1000)
-        except Exception as e: fail.append(str(e))
-        delay=next_t-time.monotonic()
-        if delay>0: time.sleep(delay)
-    finished=time.monotonic(); d1=link.diag(right); elapsed=finished-started
-    return last,lat,fail,d0,d1,elapsed
+    link.timeout=old_timeout
+    req=bytes((COMM_GET_VALUES,))
+    wire=frame(link.fwd(req) if right else req)
+    started=time.monotonic(); next_send=started
+    sent=0; drain_deadline=None
+    while True:
+        now=time.monotonic()
+        while sent<count and now>=next_send:
+            link.ser.write(wire); link.ser.flush(); send_times.append(time.monotonic())
+            sent+=1; next_send=started+sent*period; now=time.monotonic()
+        chunk=link.ser.read(link.ser.in_waiting or 1)
+        if chunk:
+            for payload in link.dec.feed(chunk):
+                if payload and payload[0]==COMM_GET_VALUES:
+                    try:
+                        value=parse_values(payload,False); validate(value,RIGHT_ID if right else 1)
+                        replies.append(value); reply_times.append(time.monotonic())
+                    except Exception as exc:
+                        fail.append(str(exc))
+        if sent>=count:
+            if len(replies)>=count: break
+            if drain_deadline is None: drain_deadline=time.monotonic()+1.5
+            if time.monotonic()>=drain_deadline: break
+        else:
+            sleep_for=next_send-time.monotonic()
+            if sleep_for>0.001: time.sleep(min(0.001,sleep_for))
+    finished=time.monotonic()
+    link.timeout=max(old_timeout,0.25)
+    d1=link.diag(right)
+    link.timeout=old_timeout
+    # FIFO preserves order, sehingga request/reply dapat dipasangkan berdasarkan indeks.
+    paired=min(len(send_times),len(reply_times))
+    lat=[(reply_times[i]-send_times[i])*1000.0 for i in range(paired)]
+    send_rate=(count/((send_times[-1]-send_times[0])+period)) if len(send_times)>1 else 0.0
+    reply_rate=((len(reply_times)-1)/(reply_times[-1]-reply_times[0])) if len(reply_times)>1 else 0.0
+    return (replies[-1] if replies else None),lat,fail,d0,d1,finished-started,send_rate,reply_rate,len(replies)
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
@@ -126,13 +157,13 @@ def main():
     try:
         print('FW:',link.fw(False),'|',link.fw(True))
         for right in (False,True):
-            name='RIGHT-ID2' if right else 'LEFT-ID1'; last,lat,fail,d0,d1,elapsed=poll_one(link,right,count,a.hz)
-            rate=(len(lat)/elapsed); p99=sorted(lat)[max(0,int(len(lat)*.99)-1)] if lat else 0
-            print(f'{name}: {len(lat)}/{count} PASS, {rate:.2f}Hz, avg={statistics.mean(lat):.2f}ms p99={p99:.2f}ms, qdrop {d0.rx_queue_drops}->{d1.rx_queue_drops}, crc {d0.rx_crc_errors}->{d1.rx_crc_errors}')
+            name='RIGHT-ID2' if right else 'LEFT-ID1'; last,lat,fail,d0,d1,elapsed,send_rate,reply_rate,replies=poll_one(link,right,count,a.hz)
+            p99=sorted(lat)[max(0,int(len(lat)*.99)-1)] if lat else 0
+            print(f'{name}: {replies}/{count} PASS, send={send_rate:.2f}Hz reply={reply_rate:.2f}Hz, avgLat={statistics.mean(lat):.2f}ms p99={p99:.2f}ms, qdrop {d0.rx_queue_drops}->{d1.rx_queue_drops}, crc {d0.rx_crc_errors}->{d1.rx_crc_errors}')
             if last: print(f'  Imotor={last.current_motor:.2f}A Ibatt={last.current_in:.2f}A Id={last.id:.2f}A Iq={last.iq:.2f}A Vd={last.vd:.2f}V Vq={last.vq:.2f}V ERPM={last.rpm:.0f} duty={100*last.duty:.2f}% Vin={last.vin:.1f}V T={last.temp_mos:.1f}C rotor={last.position:.2f}deg hall={d1.hall} fault={last.fault} Ah={last.ah_used:.4f}/{last.ah_charged:.4f} Wh={last.wh_used:.4f}/{last.wh_charged:.4f}')
             if fail: print('  errors:',fail[:3])
-            if rate < a.hz * 0.98:
-                print(f'  ERROR actual polling rate too low: {rate:.2f}Hz < {a.hz*0.98:.2f}Hz')
+            if replies != count or send_rate < a.hz*0.98 or reply_rate < a.hz*0.98:
+                print(f'  ERROR RT throughput: replies={replies}/{count} send={send_rate:.2f}Hz reply={reply_rate:.2f}Hz')
                 return 1
             if fail or d1.rx_queue_drops!=d0.rx_queue_drops or d1.rx_crc_errors!=d0.rx_crc_errors: return 1
         print('VESC_TOOL_RT50_PASS')

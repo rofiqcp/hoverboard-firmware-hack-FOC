@@ -24,12 +24,12 @@ assert 'rate-limits corrected Hall phase' in mc
 assert 'm_hall_reject_counted_state' in mch and 'm->m_hall_reject_counted_state != h' in mc
 assert 'period_for_filter' in mc and 'floor_period' in mc and 'm->m_hall_period_reject_count++' in mc, 'Hall timing outlier slew-limit path missing'
 assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
-assert 'stop_zone' in mc and 'iq_setpoint_slew_step(m);' in mc and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in mc
-assert 'm->m_iq_set_q4==0 && m->m_iq_set_ramp_q16==0' in mc, 'speed STOP must release only after Iq reaches zero'
+assert 'stop_zone' in mc and 'zero-vector' in mc and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in mc
+assert 'm->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;' in mc, 'speed STOP must force VESC zero-vector reference'
 assert 'VESC speed PID -> Iq' in mc
 assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
 assert 'speed PI drives Vq directly' not in mc
-assert 'MCCONF_POSITION_PHASE_DEADBAND_MDEG' in mcc and 'MCCONF_POSITION_RUN_CURRENT_MAX_MA' in mcc and 'MCCONF_POSITION_BREAKAWAY_CURRENT_MA' in mcc
+assert 'MCCONF_POSITION_PHASE_DEADBAND_MDEG' not in mcc and 'MCCONF_POSITION_RUN_CURRENT_MAX_MA' not in mcc and 'MCCONF_POSITION_BREAKAWAY_CURRENT_MA' not in mcc
 assert 'm_position_prev_proc_phase' in mch and 'm_position_kd_proc_phase_coeff_q4' in mch
 # Standard COMM_SET_POS mengikuti foc_run_pid_control_pos VESC: shortest-path
 # angular PID -> Iq, lengkap dengan anti-windup dan D-on-measurement. State
@@ -86,16 +86,16 @@ assert 'rotor stream local value' in host and 'rotor stream right value' in host
 
 assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'
 assert 'MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES' in mcc and 'm_hall_direction_stable_edges' in mc, 'Hall reversal/acceleration warmup missing'
-assert 'm_brake_direction' in mch and 'm_brake_current_q4' in mch and 'feedback_motion_same_direction' in mc and 'encoder_motion_fresh' in mc
-assert 'm->m_hall_ticks>fresh' in mc and 'MCCONF_TRQ_STOP_RPM_DEADBAND' in mc and 'mcpwm_foc_release_motor(second)' in mc
+assert 'm_brake_direction' not in mch and 'm_brake_current_q4' in mch and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc
+assert 'm->m_hall_ticks>fresh' in mc and 'MCCONF_TRQ_STOP_RPM_DEADBAND' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc
 
 assert 'MCCONF_POSITION_CURRENT_MAX_MA' in mc or 'MCCONF_POSITION_CURRENT_MAX_MA' in mcc
-assert 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mc or 'MCCONF_POSITION_SETTLE_CURRENT_MA' in mcc
-assert 'MCCONF_POSITION_SETTLE_MS' in mc or 'MCCONF_POSITION_SETTLE_MS' in mcc
+assert 'MCCONF_POSITION_SETTLE_CURRENT_MA' not in mc and 'MCCONF_POSITION_SETTLE_CURRENT_MA' not in mcc
+assert 'MCCONF_POSITION_SETTLE_MS' not in mc and 'MCCONF_POSITION_SETTLE_MS' not in mcc
 
 assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not reject direction reversals'
 assert 'hall_table_runtime_sane' in mc and 'Preserve the last known-good table' in mc, 'runtime Hall-table validation missing'
-assert 'motor_pole_pairs(second)*4294967296ULL' in mc, 'right openloop must use per-motor pole pairs'
+assert 'Standard VESC OPENLOOP_CURRENT' in mc and 'm->m_iq_target_q4=amp_to_q4(m,current)' in mc and '60*(int64_t)PWM_FREQ' in mc, 'standard VESC openloop must rotate signed Iq at electrical RPM without pole-pair multiplication'
 assert 'hall-phase' in (R/'tools/vesc_debug.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_debug.py').read_text(), 'active Hall phase-check utility missing'
 
 
@@ -105,4 +105,4 @@ dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
 assert 'Jangan hapus nilai telemetry itu' in mc, 'idle live current telemetry path missing'
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 position_sector_brake=1 position_cap=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 std_pos=1 custom_count_cap=1 std_openloop=1')

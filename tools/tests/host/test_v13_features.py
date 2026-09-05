@@ -24,13 +24,13 @@ assert 'mcpwm_foc_set_position_user_limits(positionMinUser, positionMaxUser, tru
 assert 'user_position_to_internal' in mc and 'positionCommandR' in mc
 assert 'CONTROL_MODE_POS' in mc and 'm_position_target_counts' in mc
 assert 'position_pid_iq_target_step' in mc, 'position PID must feed Iq target'
-assert 'm->m_kpq_q11,m->m_kiq_q16' in mc and 'm->m_kpd_q11,m->m_kid_q16' in mc
+assert 'm_current_kpq_v_q16' in mc and 'm_current_kiq_dt_v_q16' in mc and 'm_current_kpd_v_q16' in mc and 'm_current_kid_dt_v_q16' in mc
 assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
 assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
 assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main, 'automatic 50 Hz legacy telemetry missing'
 assert 'no user-controlled live telemetry switch' in main, 'live-removal rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp
-assert 'v->tachometer = -v->tachometer;' in vp and 'v->position = 360.0f - v->position' in vp, 'right VESC position telemetry not normalized'
+assert 'Right power stage is physically mirrored' not in vp and 'right_sign' not in vp, 'virtual-right protocol must not rewrite VESC coordinates'
 assert 'op == "live"' not in hov.lower() and 'toggle custom live telemetry' not in hov.lower()
 assert 'reset pos' in hov and 'mode 5' in hov
 assert 'COMM_SET_POS = 9' in dual and 'def set_pos(' in dual and 'RIGHT_ID = 2' in dual

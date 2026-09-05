@@ -119,16 +119,16 @@ int main(void){
     pwml=0; pwmr=0;
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_speed_target_rpm!=0)return fail("mode2 STOP target zero");
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must ramp before release");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must ramp toward zero vector");
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
     for(int i=0;i<3500;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP left SPEED mode too early");
     for(int i=0;i<5000;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode2 STOP must release near zero");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain SPEED at zero vector");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
-        return fail("mode2 release must reset all PI integrators");
+        return fail("mode2 zero-vector must reset all PI integrators");
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0)
-        return fail("mode2 release must zero speed states");
+        return fail("mode2 zero-vector must zero speed states");
 
     /* VESC boundary: 750 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
@@ -144,7 +144,7 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
     for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("VESC zero ERPM release");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0)return fail("VESC zero ERPM zero-vector hold");
     mcpwm_foc_set_pid_speed(750.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_rpm=50;
@@ -152,8 +152,8 @@ int main(void){
     mcpwm_foc_get_values(&vals,false);
     if(fabsf(vals.rpm-750.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
 
-    /* Smooth speed STOP handoff: once the ramp enters the release zone,
-     * non-zero Iq must be slewed to zero before the bridge is released. */
+    /* VESC speed STOP: once the ramp enters s_pid_min_erpm, command duty=0 and
+     * zero the Iq reference while retaining SPEED mode. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
     mcpwm_foc_set_pid_speed(300.0f,false); mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_speed_set_ramp_q16=(int32_t)4<<16;
@@ -161,12 +161,12 @@ int main(void){
     m_motor_1.m_iq_set_q4=800; m_motor_1.m_iq_target_q4=800; m_motor_1.m_iq_set_ramp_q16=(int32_t)800<<16;
     for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("speed STOP must not release with nonzero Iq");
-    if(m_motor_1.m_iq_set_q4>=800)return fail("speed STOP must ramp Iq toward zero");
-    for(int i=0;i<4000 && m_motor_1.m_control_mode!=CONTROL_MODE_NONE;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zero-Iq release");
+    if(m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zone must force zero Iq like VESC");
+    for(int i=0;i<4000;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0)return fail("speed STOP must retain zero-vector SPEED mode");
 
-    /* VESC current brake: always oppose fresh rotor speed and never command a
-     * reverse rotation from a stale Hall sign. */
+    /* VESC current brake: recompute torque sign from live rotor speed. At zero/stale
+     * speed the zero-current zero-vector remains active until another command. */
     mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1; m_motor_1.m_hall_period=200u; m_motor_1.m_hall_ticks=20u; m_motor_1.m_rpm=53;
     mcpwm_foc_set_brake_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
@@ -175,8 +175,8 @@ int main(void){
     m_motor_1.m_hall_ticks=1200u;
     for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_iq_target_q4!=0)return fail("stale brake speed must command zero torque");
-    for(int i=0;i<1200 && m_motor_1.m_control_mode!=CONTROL_MODE_NONE;i++)mcpwm_foc_adc_int_handler();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_set_q4!=0)return fail("brake must release after zero-Iq handoff");
+    for(int i=0;i<1200;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT_BRAKE || m_motor_1.m_iq_set_q4!=0)return fail("brake must remain active at zero speed");
 
     /* VESC handbrake is not current-brake. It creates a stationary electrical
      * field at phase zero so the rotor is held rather than continuously driven. */
@@ -246,8 +246,8 @@ int main(void){
     for(int i=0;i<32000;i++){if((i%1000)==0)mcpwm_foc_vesc_override_touch(false);mcpwm_foc_adc_int_handler();}
     if(m_motor_1.m_duty_now_permille!=-1000)return fail("duty -1.0 telemetry scaling");
     mcpwm_foc_set_duty(0.0f,false);
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
-        return fail("VESC SET_DUTY zero must immediate free-run");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_DUTY || m_motor_1.m_duty_set_permille!=0)
+        return fail("VESC SET_DUTY zero must remain duty zero-vector");
     mcpwm_foc_set_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT)return fail("VESC SET_CURRENT 1A entry");
     mcpwm_foc_set_current(0.0f,false);

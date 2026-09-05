@@ -69,7 +69,22 @@ void mc_interface_get_values_motor(mc_values *v, bool second) {
 float mc_interface_get_pid_pos_now_motor(bool second) { return second?342.0f:12.5f; }
 float mc_interface_get_pid_pos_set_motor(bool second) { return set_pos[second?1:0]; }
 void mc_interface_set_current(float c) { set_current[selected_motor==2?1:0]=c; }
+void mc_interface_set_current_rel(float val) {
+    const int j=selected_motor==2?1:0;
+    const float duty=set_duty[j];
+    const float max_i=confs[j].l_current_max*confs[j].l_current_max_scale;
+    float min_i=confs[j].l_current_min*confs[j].l_current_min_scale;
+    if(min_i<0.0f)min_i=-min_i;
+    const bool same=(fabsf(duty)<0.02f)||((val>=0.0f)==(duty>=0.0f));
+    set_current[j]=val*(same?max_i:min_i);
+}
 void mc_interface_set_brake_current(float c) { set_current[selected_motor==2?1:0]=c; }
+void mc_interface_set_brake_current_rel(float val) {
+    const int j=selected_motor==2?1:0;
+    float min_i=confs[j].l_current_min*confs[j].l_current_min_scale;
+    if(min_i<0.0f)min_i=-min_i;
+    set_current[j]=val*min_i;
+}
 void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
@@ -218,7 +233,7 @@ static int check_values_reply(const uint8_t *r,uint16_t rn,bool second){
     if(!nearf32(erpm,second?321.0f:123.0f,0.5f)) return fail(second?"right ERPM normalize":"local ERPM");
     if(!nearf32(vin,48.1f,0.11f)) return fail("Vin");
     if(fault!=FAULT_CODE_NONE || idvesc!=(second?2u:1u)) return fail(second?"right fault/id":"local fault/id");
-    if(!nearf32(pos,second?18.0f:12.5f,0.001f)) return fail(second?"right position normalize":"local position");
+    if(!nearf32(pos,second?342.0f:12.5f,0.001f)) return fail(second?"right position normalize":"local position");
     if(!nearf32(vd,1.2f,0.002f)) return fail(second?"right Vd":"local Vd");
     if(!nearf32(vq,second?5.0f:4.0f,0.002f)) return fail(second?"right Vq normalize":"local Vq");
     return 0;
@@ -226,6 +241,8 @@ static int check_values_reply(const uint8_t *r,uint16_t rn,bool second){
 int main(void){
     memset(confs,0,sizeof(confs)); memset(diag_motors,0,sizeof(diag_motors));
     confs[0].motor_type=confs[1].motor_type=MOTOR_TYPE_FOC;
+    /* Real hardware default: right motor is mirrored through standard VESC DIR_MULT. */
+    confs[1].m_invert_direction=true;
     diag_motors[0].m_iq_target_q4=2400; diag_motors[0].m_iq_set_q4=1600; diag_motors[0].m_iq_q4=800;
     diag_motors[0].m_hall_state=5u; diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT; diag_motors[0].m_state=MC_STATE_RUNNING;
     diag_motors[1].m_iq_target_q4=-2400; diag_motors[1].m_iq_set_q4=-1600; diag_motors[1].m_iq_q4=-800;
@@ -343,19 +360,19 @@ int main(void){
     uint8_t duty[5]={COMM_SET_DUTY,0,0,0,0}; k=1; buffer_append_int32(duty,12500,&k);
     if(!transact(duty,sizeof(duty),r,&rn)||rn!=0u||!nearf32(set_duty[0],0.125f,0.0001f)) return fail("local duty");
     uint8_t dutyr[7]={COMM_FORWARD_CAN,2u,COMM_SET_DUTY,0,0,0,0}; k=3; buffer_append_int32(dutyr,12500,&k);
-    if(!transact(dutyr,sizeof(dutyr),r,&rn)||rn!=0u||!nearf32(set_duty[1],-0.125f,0.0001f)) return fail("right duty sign/forward");
+    if(!transact(dutyr,sizeof(dutyr),r,&rn)||rn!=0u||!nearf32(set_duty[1],0.125f,0.0001f)) return fail("right duty forward unchanged");
     uint8_t cur[7]={COMM_FORWARD_CAN,2u,COMM_SET_CURRENT,0,0,0,0}; k=3; buffer_append_int32(cur,2500,&k);
     if(!transact(cur,sizeof(cur),r,&rn)||rn!=0u)return fail("right current reply");
-    if(fabsf(set_current[1]+2.5f)>0.001f||touch_count[1]==0u)return fail("right current sign/ownership");
+    if(fabsf(set_current[1]-2.5f)>0.001f||touch_count[1]==0u)return fail("right current forward/ownership");
 
     /* VESC Tool Commands::setCurrentRel uses int32 x1e5. Verify both the
-     * percentage scaling and the virtual-right sign normalization. */
+     * percentage scaling and unchanged virtual-right VESC coordinate semantics. */
     {
         uint8_t rel[5]={COMM_SET_CURRENT_REL,0,0,0,0}; k=1; buffer_append_int32(rel,50000,&k);
         if(!transact(rel,sizeof(rel),r,&rn)||rn!=0u||!nearf32(set_current[0],7.5f,0.002f))
             return fail("set current relative local");
         uint8_t relr[7]={COMM_FORWARD_CAN,2u,COMM_SET_CURRENT_REL,0,0,0,0}; k=3; buffer_append_int32(relr,50000,&k);
-        if(!transact(relr,sizeof(relr),r,&rn)||rn!=0u||!nearf32(set_current[1],-7.5f,0.002f))
+        if(!transact(relr,sizeof(relr),r,&rn)||rn!=0u||!nearf32(set_current[1],7.5f,0.002f))
             return fail("set current relative right");
     }
 
@@ -445,7 +462,7 @@ int main(void){
     uint8_t posl[5]={COMM_SET_POS,0,0,0,0}; k=1;buffer_append_int32(posl,45000000,&k);
     if(!transact(posl,sizeof(posl),r,&rn)||fabsf(set_pos[0]-45.0f)>0.001f)return fail("local position");
     uint8_t posr[7]={COMM_FORWARD_CAN,2u,COMM_SET_POS,0,0,0,0}; k=3;buffer_append_int32(posr,30000000,&k);
-    if(!transact(posr,sizeof(posr),r,&rn)||fabsf(set_pos[1]+30.0f)>0.001f)return fail("right position sign/forward");
+    if(!transact(posr,sizeof(posr),r,&rn)||fabsf(set_pos[1]-30.0f)>0.001f)return fail("right position forward unchanged");
     uint8_t gmr[]={COMM_FORWARD_CAN,2u,COMM_GET_MCCONF};
     if(!transact(gmr,sizeof(gmr),r,&rn)||rn<10u||r[0]!=COMM_GET_MCCONF) return fail("get right mcconf");
     {int32_t mi=1; if(buffer_get_uint32(r,&mi)!=MCCONF_SIGNATURE) return fail("right mcconf signature");}

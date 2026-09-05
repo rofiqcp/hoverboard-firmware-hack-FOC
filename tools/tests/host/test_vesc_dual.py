@@ -27,4 +27,39 @@ payload += bytes([0])+struct.pack('>i',45000000)+bytes([2])
 payload += struct.pack('>i',1200)+struct.pack('>i',-5000)
 v=vd.parse_selective(bytes(payload))
 assert abs(v.current_motor-1.5)<1e-9 and v.vesc_id==2 and v.rpm==321 and abs(v.vq+5)<1e-9 and abs(v.position-45.0)<1e-9
-print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f}')
+
+# Exact VESC Tool commands.cpp packet-builder parity for motor commands.
+import threading
+class FakeSerial:
+    def __init__(self): self.frames=[]
+    def write(self,b): self.frames.append(bytes(b)); return len(b)
+    def flush(self): pass
+def decoded_payload(fr):
+    dec=vd.PacketDecoder(); out=dec.feed(fr); assert len(out)==1; return out[0]
+link=vd.VescDual.__new__(vd.VescDual); link.ser=FakeSerial(); link.io_lock=threading.Lock(); link.timeout=0.1; link.dec=vd.PacketDecoder()
+link.set_duty(-0.125,0.25); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_DUTY])+struct.pack('>i',-12500); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_DUTY])+struct.pack('>i',25000)
+link.set_current(-2.5,3.25); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_CURRENT])+struct.pack('>i',-2500); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_CURRENT])+struct.pack('>i',3250)
+link.brake(-1.25,2.0); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_CURRENT_BRAKE])+struct.pack('>i',-1250); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_CURRENT_BRAKE])+struct.pack('>i',2000)
+link.handbrake(-0.75,1.5); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_HANDBRAKE])+struct.pack('>i',-750); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_HANDBRAKE])+struct.pack('>i',1500)
+link.set_rpm(-1234,5678); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_RPM])+struct.pack('>i',-1234); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_RPM])+struct.pack('>i',5678)
+link.set_pos(-15.0,390.0); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_POS])+struct.pack('>i',-15000000); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_POS])+struct.pack('>i',390000000)
+link.set_current_rel(-1.25,1.10); p0,p1=map(decoded_payload,link.ser.frames[-2:]); assert p0==bytes([vd.COMM_SET_CURRENT_REL])+struct.pack('>i',-125000); assert p1==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_CURRENT_REL])+struct.pack('>i',110000)
+mt=vd.McconfTemp(0.5,0.6,-1000,2000,-0.1,0.9,-500,600,-12,13,30,1.0,0.1)
+link.set_mcconf_temp(mt,store=True,forward=False,ack=False,divide_by_controllers=True,right=False)
+pm=decoded_payload(link.ser.frames[-1]); assert pm[:5]==bytes([vd.COMM_SET_MCCONF_TEMP,1,0,0,1]) and len(pm)==37
+vals=struct.unpack('>8f',pm[5:]); exp=(0.5,0.6,-1000.0,2000.0,-0.1,0.9,-500.0,600.0); assert all(abs(a-b)<1e-5 for a,b in zip(vals,exp))
+
+# Remaining VESC Tool packet builders implemented by the firmware.
+link.alive(False); assert decoded_payload(link.ser.frames[-1])==bytes([vd.COMM_ALIVE])
+link.alive(True); assert decoded_payload(link.ser.frames[-1])==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_ALIVE])
+link.set_detect(2,True); assert decoded_payload(link.ser.frames[-1])==bytes([vd.COMM_FORWARD_CAN,2,vd.COMM_SET_DETECT,2])
+link.disable_app_output(-1,forward_can=True,right=False); pa=decoded_payload(link.ser.frames[-1]); assert pa==bytes([vd.COMM_APP_DISABLE_OUTPUT,1])+struct.pack('>i',-1)
+# detect_encoder request/reply framing. Override transact only for this unit case.
+cap=[]
+def fake_transact(req,expected,timeout=None):
+    cap.append((req,expected,timeout)); return bytes([vd.COMM_DETECT_ENCODER])+struct.pack('>iiB',17250000,15000000,1)
+link.transact=fake_transact
+off,ratio,inv=link.detect_encoder(1.25,False); assert cap[-1][0]==bytes([vd.COMM_DETECT_ENCODER])+struct.pack('>i',1250) and cap[-1][1]==vd.COMM_DETECT_ENCODER
+assert abs(off-17.25)<1e-9 and abs(ratio-15.0)<1e-9 and inv
+
+print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f} tool_builders=exact')

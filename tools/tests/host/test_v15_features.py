@@ -20,11 +20,12 @@ assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_ta
 assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 
-# Hall detect fixed phase must not be overwritten by rotating mode-4 updater.
+# VESC OPENLOOP_PHASE is fixed phase/direct Id. Hall/encoder detect performs
+# its own explicit current ramp and the rotating openloop updater must not run.
 assert 'm->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE' in mc
 phase_branch=mc[mc.index('if (m->m_control_mode==CONTROL_MODE_OPENLOOP)'):mc.index('/* Hall estimator needs')]
-assert 'openloop_update(m, second);' in phase_branch and 'openloop_current_ramp_update(m);' in phase_branch
-assert 'otherwise it overwrites m_phase_openloop' in phase_branch
+assert 'openloop_update(m, second);' in phase_branch and 'openloop_current_ramp_update(m);' not in phase_branch
+assert 'Fixed phase/current is set directly by the VESC setter' in phase_branch
 assert 'for (uint8_t pass = 0u; pass < 6u; ++pass)' in mc and ('const bool reverse = (pass & 1u) != 0u' in mc or 'const bool reverse = pass >= 3u' in mc)
 assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++)' in halltest and 'isr<16u' in halltest
 
@@ -53,10 +54,12 @@ assert 'mc_interface_release_motor()' in det and 'mcpwm_foc_vesc_override_clear(
 assert 'COMM_DETECT_APPLY_ALL_FOC' in det and 'detect_all_apply_motor' in det
 assert 'mc_interface_store_configuration_motor(second)' in det and 'uart_send_payload(reply,sizeof(reply))' in det
 
-# Standard VESC position stays single-turn; project multi-turn uses CUSTOM_APP_DATA signed int32.
+# Standard VESC Tool setPos is a signed degree x1e6 packet builder with no
+# client-side clamp; firmware normalizes its angular target. Project multi-turn
+# remains a distinct CUSTOM_APP_DATA signed-int32 API.
 assert 'case COMM_SET_POS:' in vp and 'COMM_CUSTOM_APP_DATA' in vp
 assert 'HB_CUSTOM_SET_POS_LIMITS' in vp and 'HB_CUSTOM_SET_POS_TARGET' in vp
-assert 'standard VESC position must be 0..360 degrees' in dual
+assert 'Commands::setPos VESC Tool: signed degree value x1e6, tanpa client clamp.' in dual
 assert 'def set_position_limits(' in dual and 'def set_position_counts(' in dual
 
 # Complete hardware diagnostic tool includes 3A, 50 ERPM, Hall, RT 50Hz and position tests.

@@ -28,6 +28,7 @@ COMM_SET_CURRENT_BRAKE = 7
 COMM_SET_RPM = 8
 COMM_SET_POS = 9
 COMM_SET_HANDBRAKE = 10
+COMM_SET_DETECT = 11
 COMM_SET_MCCONF = 13
 COMM_GET_MCCONF = 14
 COMM_GET_MCCONF_DEFAULT = 15
@@ -36,18 +37,22 @@ COMM_GET_APPCONF = 17
 COMM_GET_APPCONF_DEFAULT = 18
 COMM_TERMINAL_CMD = 20
 COMM_PRINT = 21
+COMM_ROTOR_POSITION = 22
+COMM_DETECT_ENCODER = 27
 COMM_REBOOT = 29
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
 COMM_GET_DECODED_ADC = 32
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
+COMM_GET_VALUES_SETUP = 47
 COMM_SET_MCCONF_TEMP = 48
 COMM_SET_MCCONF_TEMP_SETUP = 49
 COMM_GET_VALUES_SELECTIVE = 50
 COMM_GET_VALUES_SETUP_SELECTIVE = 51
 COMM_DETECT_APPLY_ALL_FOC = 58
 COMM_PING_CAN = 62
+COMM_APP_DISABLE_OUTPUT = 63
 COMM_TERMINAL_CMD_SYNC = 64
 COMM_SET_CURRENT_REL = 84
 COMM_SET_BATTERY_CUT = 86
@@ -59,6 +64,10 @@ COMM_SHUTDOWN = 156
 RIGHT_ID = 2
 POLE_PAIRS = 15
 STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
+# STM32F1 EEPROM emulation can compact a 205-variable page on persistent writes.
+# Keep normal request/reply deadlines short; only commands that explicitly store
+# configuration get this bounded hardware-aware deadline.
+PERSISTENT_WRITE_TIMEOUT = 8.0
 
 HB_MAGIC = b"HB"
 HB_VERSION = 1
@@ -475,6 +484,11 @@ class VescDual:
         if serial is None:
             raise RuntimeError("pyserial required: python -m pip install pyserial")
         self.ser = serial.Serial(port, baud, timeout=0.01)
+        # A software reboot can leave an incomplete pre-reset VESC frame in the
+        # USB-UART driver's RX queue. Start each new host session at a packet
+        # boundary; otherwise the fresh PacketDecoder can prepend stale bytes to
+        # the first FW_VERSION reply and report a false timeout.
+        self.ser.reset_input_buffer()
         self.timeout = timeout
         self.dec = PacketDecoder()
         self.io_lock = threading.Lock()
@@ -483,7 +497,14 @@ class VescDual:
         self.ser.close()
 
     def send(self, payload: bytes):
-        self.ser.write(frame(payload))
+        packet = frame(payload)
+        written = self.ser.write(packet)
+        if written != len(packet):
+            raise IOError(f"short serial write {written}/{len(packet)}")
+        # The reply timeout starts only after the full VESC frame has reached
+        # the OS/USB-UART transmit path. This matters especially immediately
+        # after COMM_REBOOT when a fresh tty session is opened.
+        self.ser.flush()
 
     def recv(self, expected_cmd: int, timeout: float | None = None) -> bytes:
         end = time.monotonic() + (self.timeout if timeout is None else timeout)
@@ -513,6 +534,28 @@ class VescDual:
         req = bytes((COMM_FW_VERSION,))
         return self.transact(self.fwd(req) if right else req, COMM_FW_VERSION, 0.5)
 
+    def alive(self, right: bool = False) -> None:
+        """Commands::sendAlive: refresh timeout without changing the setpoint."""
+        req=bytes((COMM_ALIVE,))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
+
+    def set_detect(self, mode: int, right: bool = False) -> None:
+        """Commands::setDetect: select VESC Tool rotor-position display mode."""
+        if not 0 <= int(mode) <= 7:
+            raise ValueError("display position mode harus 0..7")
+        req=bytes((COMM_SET_DETECT,int(mode)))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
+
+    def recv_rotor_position(self, timeout: float = 0.25) -> float:
+        p=self.recv(COMM_ROTOR_POSITION,timeout)
+        if len(p)!=5:
+            raise ValueError(f"unexpected rotor-position packet length {len(p)}")
+        return struct.unpack_from(">i",p,1)[0]/100000.0
+
     def set_current(self, left: float, right: float):
         l = bytes((COMM_SET_CURRENT,)) + struct.pack(">i", round(left * 1000))
         r = bytes((COMM_SET_CURRENT,)) + struct.pack(">i", round(right * 1000))
@@ -520,9 +563,7 @@ class VescDual:
             self.send(l); self.send(self.fwd(r))
 
     def set_current_rel(self, left: float, right: float):
-        """Kirim Commands::setCurrentRel VESC Tool, skala -1.0..+1.0 = -100..+100%."""
-        if not -1.0 <= left <= 1.0 or not -1.0 <= right <= 1.0:
-            raise ValueError("relative current harus -1..1")
+        """Commands::setCurrentRel VESC Tool: kirim signed value x1e5 apa adanya."""
         l = bytes((COMM_SET_CURRENT_REL,)) + struct.pack(">i", round(left * 100000.0))
         r = bytes((COMM_SET_CURRENT_REL,)) + struct.pack(">i", round(right * 100000.0))
         with self.io_lock:
@@ -541,7 +582,7 @@ class VescDual:
     def set_mcconf_raw(self, raw: bytes, right: bool = False) -> None:
         """Tulis kembali payload MC Config 6.00 persis seperti tombol Write VESC Tool."""
         req = bytes((COMM_SET_MCCONF,)) + bytes(raw)
-        p = self.transact(self.fwd(req) if right else req, COMM_SET_MCCONF, 1.2)
+        p = self.transact(self.fwd(req) if right else req, COMM_SET_MCCONF, PERSISTENT_WRITE_TIMEOUT)
         if p != bytes((COMM_SET_MCCONF,)):
             raise ValueError("invalid MC Config ACK")
 
@@ -558,7 +599,8 @@ class VescDual:
         """Tulis App Config dengan semantik SET_APPCONF atau SET_APPCONF_NO_STORE."""
         cmd = COMM_SET_APPCONF if store else COMM_SET_APPCONF_NO_STORE
         req = bytes((cmd,)) + bytes(raw)
-        p = self.transact(self.fwd(req) if right else req, cmd, 1.2)
+        p = self.transact(self.fwd(req) if right else req, cmd,
+                          PERSISTENT_WRITE_TIMEOUT if store else 1.2)
         if p != bytes((cmd,)):
             raise ValueError("invalid App Config ACK")
 
@@ -571,8 +613,8 @@ class VescDual:
 
     def setup_values(self, right: bool = False) -> SetupValues:
         """Baca COMM_GET_VALUES_SETUP dan parse dengan urutan Commands::getValuesSetup VESC 6.00."""
-        req = bytes((47,))
-        p = self.transact(self.fwd(req) if right else req, 47, 0.5)
+        req = bytes((COMM_GET_VALUES_SETUP,))
+        p = self.transact(self.fwd(req) if right else req, COMM_GET_VALUES_SETUP, 0.5)
         i = 1
         def i16(scale: float) -> float:
             nonlocal i
@@ -614,6 +656,24 @@ class VescDual:
             self.send(self.fwd(req) if right else req)
             self.ser.flush()
 
+    def disable_app_output(self, time_ms: int, forward_can: bool = False,
+                           right: bool = False) -> None:
+        """Commands::disableAppOutput: [fwd_can][signed time_ms]."""
+        req=bytes((COMM_APP_DISABLE_OUTPUT,1 if forward_can else 0))+struct.pack(">i",int(time_ms))
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            self.ser.flush()
+
+    def detect_encoder(self, current_a: float = 1.0, right: bool = False):
+        """Commands::measureEncoder packet/reply format from VESC Tool."""
+        req=bytes((COMM_DETECT_ENCODER,))+struct.pack(">i",round(current_a*1000.0))
+        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_ENCODER,30.0)
+        if len(p)!=10:
+            raise ValueError(f"unexpected encoder detect reply length {len(p)}")
+        off=struct.unpack_from(">i",p,1)[0]/1_000_000.0
+        ratio=struct.unpack_from(">i",p,5)[0]/1_000_000.0
+        return off,ratio,bool(p[9])
+
     def detect_all_foc(self, max_power_loss: float = 50.0, min_current_in: float = -8.0,
                        max_current_in: float = 8.0, openloop_rpm: float = 250.0,
                        sl_erpm: float = 2500.0, detect_can: bool = True) -> int:
@@ -642,7 +702,8 @@ class VescDual:
         req = (bytes((COMM_SET_BATTERY_CUT,)) +
                struct.pack(">iiBB", round(start_v * 1000.0), round(end_v * 1000.0),
                            1 if store else 0, 1 if forward else 0))
-        p = self.transact(self.fwd(req) if right else req, COMM_SET_BATTERY_CUT)
+        p = self.transact(self.fwd(req) if right else req, COMM_SET_BATTERY_CUT,
+                          PERSISTENT_WRITE_TIMEOUT if store else self.timeout)
         if p != bytes((COMM_SET_BATTERY_CUT,)):
             raise ValueError("invalid battery-cut ACK")
 
@@ -672,15 +733,17 @@ class VescDual:
         cmd = COMM_SET_MCCONF_TEMP_SETUP if setup_units else COMM_SET_MCCONF_TEMP
         out = bytearray((cmd, 1 if store else 0, 1 if forward else 0,
                          1 if ack else 0, 1 if divide_by_controllers else 0))
+        # commands.cpp VESC Tool mengirim tepat delapan float32_auto. Firmware
+        # VESC dapat menerima dua battery-current limit tambahan secara backward-
+        # compatible, tetapi GUI VESC Tool standar tidak mengirim field opsional itu.
         for value in (conf.current_min_scale, conf.current_max_scale, conf.min_erpm, conf.max_erpm,
-                      conf.min_duty, conf.max_duty, conf.watt_min, conf.watt_max,
-                      conf.input_current_min, conf.input_current_max):
+                      conf.min_duty, conf.max_duty, conf.watt_min, conf.watt_max):
             out += _pack_float32_auto(value)
         req = bytes(out)
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
             if ack:
-                p = self.recv(cmd)
+                p = self.recv(cmd, PERSISTENT_WRITE_TIMEOUT if store else self.timeout)
                 if p != bytes((cmd,)):
                     raise ValueError("invalid MC temp ACK")
 
@@ -715,29 +778,21 @@ class VescDual:
             self.send(l); self.send(self.fwd(r))
 
     def set_pos(self, left_deg: float, right_deg: float):
-        """Stock VESC single-turn position command, intentionally 0..360 deg.
-
-        Use set_position_counts()/set_position_limits() for this project's signed
-        int32 multi-turn Hall-count position API. Keeping the two APIs separate
-        prevents VESC Tool's rotor-angle command from being reinterpreted as a
-        long-range actuator position.
-        """
+        """Commands::setPos VESC Tool: signed degree value x1e6, tanpa client clamp."""
         def enc(deg: float) -> bytes:
-            if not 0.0 <= deg <= 360.0:
-                raise ValueError("standard VESC position must be 0..360 degrees")
             return bytes((COMM_SET_POS,)) + struct.pack(">i", round(deg * 1000000.0))
         with self.io_lock:
             self.send(enc(left_deg)); self.send(self.fwd(enc(right_deg)))
 
     def brake(self, left_a: float, right_a: float):
-        l = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(abs(left_a) * 1000))
-        r = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(abs(right_a) * 1000))
+        l = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(left_a * 1000))
+        r = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(right_a * 1000))
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
 
     def handbrake(self, left_a: float, right_a: float):
-        l = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(abs(left_a) * 1000))
-        r = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(abs(right_a) * 1000))
+        l = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(left_a * 1000))
+        r = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(right_a * 1000))
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
 

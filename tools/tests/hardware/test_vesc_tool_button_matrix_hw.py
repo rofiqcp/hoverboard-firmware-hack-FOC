@@ -4,7 +4,7 @@ import argparse, hashlib, sys, time
 from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOOLS))
-from vesc_dual import VescDual, parse_fw
+from vesc_dual import COMM_FW_VERSION, VescDual, parse_fw
 
 
 def sha(data: bytes) -> str:
@@ -105,8 +105,35 @@ def main() -> int:
     finally:
         link.close()
 
-    time.sleep(1.5)
-    link = VescDual(args.port, timeout=1.0)
+    # Reboot readiness is not a fixed sleep: STM32F1 startup includes the
+    # master-hoverFOC 900-ms melody plus EEPROM restore and 2000-sample ADC
+    # offset calibration. Probe the actual VESC endpoint until FW+setup are
+    # valid, while keeping a bounded failure deadline and reporting the latency.
+    ready_start = time.monotonic()
+    ready_deadline = ready_start + 6.0
+    link = None
+    last_error = None
+    while time.monotonic() < ready_deadline:
+        candidate = None
+        try:
+            candidate = VescDual(args.port, timeout=0.35)
+            fw = candidate.fw(False)
+            setup = candidate.setup_values(False)
+            if fw[0] == COMM_FW_VERSION and setup.vesc_id == 1:
+                link = candidate
+                break
+            candidate.close()
+        except Exception as exc:
+            last_error = exc
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except Exception:
+                    pass
+        time.sleep(0.10)
+    if link is None:
+        raise RuntimeError(f"VESC not ready within 6 s after reboot: {last_error}")
+    print(f"REBOOT_READY latency={time.monotonic()-ready_start:.3f}s")
     try:
         for right in (False, True):
             if link.get_mcconf_raw(right) != before[right]["mc"]:

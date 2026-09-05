@@ -93,6 +93,14 @@ static uint8_t s_tx_count = 0u;
 static uint8_t s_tx_active = 0u;
 static uint32_t s_tx_queue_drop = 0u;
 static uint32_t s_tx_start_fail = 0u;
+#ifdef STM32F103xE
+/* Wall-cycle profiler COMM_GET_VALUES. DWT elapsed sengaja termasuk preemption
+ * FOC karena yang harus dipenuhi VESC Tool adalah latency end-to-end <20 ms. */
+static uint32_t s_prof_values_snapshot_max_cycles = 0u;
+static uint32_t s_prof_values_position_max_cycles = 0u;
+static uint32_t s_prof_values_serialize_max_cycles = 0u;
+static uint32_t s_prof_values_tx_max_cycles = 0u;
+#endif
 static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
 
 /* Stock VESC handles COMM_DETECT_HALL_FOC as a blocking command in a dedicated
@@ -457,17 +465,9 @@ void vesc_protocol_periodic(uint32_t now_ms) {
     const bool second = s_display_second != 0u;
     float pos = 0.0f;
     if (!display_rotor_pos(second, mode, &pos)) return;
-    /* Keep COMM_ROTOR_POSITION in the same user-facing wheel convention as
-     * COMM_GET_VALUES. The right power stage is mirrored, so absolute display
-     * angles are exposed as 360-internal_angle. Error modes are signed
-     * differences and must not receive this absolute-angle transform. */
-    if (second && (mode == DISP_POS_MODE_OBSERVER || mode == DISP_POS_MODE_ENCODER ||
-                   mode == DISP_POS_MODE_PID_POS)) {
-        if (pos > 0.0f) {
-            pos = 360.0f - pos;
-            if (pos >= 360.0f) pos = 0.0f;
-        }
-    }
+    /* COMM_FORWARD_CAN on dual-motor VESC only selects motor thread 2.
+     * It never changes packet coordinates; direction is handled by the normal
+     * Motor Configuration DIR_MULT path in mc_interface. */
     uint8_t b[5];
     int32_t i = 0;
     b[i++] = COMM_ROTOR_POSITION;
@@ -530,25 +530,6 @@ static void get_values_normalized(bool second, mc_values *v) {
     v->temp_mos_3 = v->temp_mos;
     v->temp_motor = 0.0f;
     v->vesc_id = second ? VESC_SECOND_MOTOR_ID : VESC_LOCAL_ID;
-    if (second) {
-        /* Right power stage is physically mirrored. Expose the same positive-wheel
-         * convention to VESC Tool as the local left motor. */
-        v->rpm = -v->rpm;
-        /* current_motor is VESC's signed current-vector magnitude and already
-         * follows electrical power direction; unlike Iq it does not need the
-         * right-motor phase-orientation sign normalization. */
-        v->iq = -v->iq;
-        v->duty_now = -v->duty_now;
-        v->vq = -v->vq;
-        v->tachometer = -v->tachometer;
-        /* Stock VESC position is normalized to 0..360 deg. The right power
-         * stage is mirrored, so expose 360-internal_angle rather than a
-         * negative angle to VESC Tool. */
-        if (v->position > 0.0f) {
-            v->position = 360.0f - v->position;
-            if (v->position >= 360.0f) v->position = 0.0f;
-        }
-    }
 }
 
 static void append_values_fields(uint8_t *b, int32_t *i, const mc_values *v, uint32_t mask) {
@@ -585,6 +566,58 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
     int32_t i = 0;
     b[i++] = selective ? COMM_GET_VALUES_SELECTIVE : COMM_GET_VALUES;
     if (selective) buffer_append_uint32(b, mask, &i);
+
+#ifdef STM32F103xE
+    if (!selective && mask == 0xffffffffu) {
+        /* Fast path untuk halaman realtime VESC Tool. STM32F103 tidak punya FPU;
+         * mengubah seluruh snapshot ke float lalu kembali ke integer wire membatasi
+         * GET_VALUES ~25 Hz. Snapshot scaled menjaga layout VESC 6.00 identik dan
+         * membuat current/RPM/Vdq serialization murni integer. */
+        mcpwm_foc_values_scaled_t v;
+        uint32_t pv0=DWT->CYCCNT;
+        mcpwm_foc_get_values_scaled(&v, second);
+        uint32_t pv1=DWT->CYCCNT;
+        if((uint32_t)(pv1-pv0)>s_prof_values_snapshot_max_cycles)s_prof_values_snapshot_max_cycles=(uint32_t)(pv1-pv0);
+        const mc_configuration *conf=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+        const int32_t dir=(conf && conf->m_invert_direction)?-1:1;
+        buffer_append_int16(b, board_temp_deg_c, &i);
+        buffer_append_int16(b, 0, &i);
+        buffer_append_int32(b, v.current_motor_x100, &i);
+        buffer_append_int32(b, v.current_in_x100, &i);
+        buffer_append_int32(b, v.id_x100, &i);
+        buffer_append_int32(b, dir*v.iq_x100, &i);
+        buffer_append_int16(b, (int16_t)(dir*(int32_t)v.duty_x1000), &i);
+        buffer_append_int32(b, dir*v.erpm, &i);
+        buffer_append_int16(b, v.vin_x10, &i);
+        buffer_append_int32(b, v.ah_x10000, &i);
+        buffer_append_int32(b, v.ah_charged_x10000, &i);
+        buffer_append_int32(b, v.wh_x10000, &i);
+        buffer_append_int32(b, v.wh_charged_x10000, &i);
+        buffer_append_int32(b, dir*v.tachometer, &i);
+        buffer_append_int32(b, v.tachometer_abs, &i);
+        b[i++]=v.fault;
+        /* Posisi tetap memakai transformasi user VESC (encoder inversion,
+         * m_invert_direction, p_pid_offset). Ini satu-satunya float di fast path. */
+        uint32_t pv2=DWT->CYCCNT;
+        buffer_append_float32(b, mc_interface_get_pid_pos_now_motor(second), 1e6f, &i);
+        uint32_t pv3=DWT->CYCCNT;
+        if((uint32_t)(pv3-pv2)>s_prof_values_position_max_cycles)s_prof_values_position_max_cycles=(uint32_t)(pv3-pv2);
+        b[i++]=second?VESC_SECOND_MOTOR_ID:VESC_LOCAL_ID;
+        buffer_append_int16(b, board_temp_deg_c, &i);
+        buffer_append_int16(b, board_temp_deg_c, &i);
+        buffer_append_int16(b, board_temp_deg_c, &i);
+        buffer_append_int32(b, v.vd_x1000, &i);
+        buffer_append_int32(b, dir*v.vq_x1000, &i);
+        b[i++]=0u;
+        uint32_t pv4=DWT->CYCCNT;
+        if((uint32_t)(pv4-pv3)>s_prof_values_serialize_max_cycles)s_prof_values_serialize_max_cycles=(uint32_t)(pv4-pv3);
+        uart_send_payload(b,(uint16_t)i);
+        uint32_t pv5=DWT->CYCCNT;
+        if((uint32_t)(pv5-pv4)>s_prof_values_tx_max_cycles)s_prof_values_tx_max_cycles=(uint32_t)(pv5-pv4);
+        return;
+    }
+#endif
+
     mc_values v;
     get_values_normalized(second, &v);
     append_values_fields(b, &i, &v, mask);
@@ -772,7 +805,7 @@ static void reply_mcconf(bool second, COMM_PACKET_ID id) {
 
 static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
     static mc_configuration c;
-    bool applied = false;
+    bool decoded = false;
     c = *mc_interface_get_configuration_motor(second);
     const int32_t expected = confgenerator_serialize_mcconf(s_config_payload, &c);
     if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_mcconf(data, &c)) {
@@ -812,17 +845,18 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
         if (!(c.si_gear_ratio >= 0.01f && c.si_gear_ratio <= 1000.0f)) c.si_gear_ratio = 1.0f;
         mc_interface_select_motor_thread(second ? 2 : 1);
         mc_interface_set_configuration(&c);
-        /* Applying ABI calibration on A/B without index must immediately
-         * establish an electrical zero before any subsequent closed-loop command. */
-        if(!second && c.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
-           (c.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER || c.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB) &&
-           !mcpwm_foc_encoder_is_synced(false))
-            (void)mcpwm_foc_encoder_startup_align(false);
-        applied = mc_interface_store_configuration_motor(second);
+        /* VESC Tool SET_MCCONF is a configuration write, not a motor-detect
+         * command. ABI without index is intentionally left UNSYNCED here; the
+         * FOC bridge gate already prevents closed-loop drive until an explicit
+         * encoder alignment/detect procedure establishes electrical zero. This
+         * keeps SET_MCCONF deterministic and prevents unexpected rotor motion. */
+        (void)mc_interface_store_configuration_motor(second);
+        decoded = true;
     }
-    /* Stock VESC 6.00 acknowledges SET_MCCONF with the command byte only. */
-    (void)applied; /* ACK means the packet was handled; persistence is best-effort flash IO. */
-    { uint8_t ack = COMM_SET_MCCONF; uart_send_payload(&ack, 1u); }
+    /* Upstream VESC acknowledges only a successfully deserialized MC Config.
+     * Persistence is best-effort flash IO, but malformed/wrong-signature packets
+     * must not receive a misleading Write OK ACK. */
+    if (decoded) { uint8_t ack = COMM_SET_MCCONF; uart_send_payload(&ack, 1u); }
 }
 
 static void reply_appconf(bool second, COMM_PACKET_ID id) {
@@ -854,35 +888,19 @@ static void set_appconf(bool second, const uint8_t *data, uint16_t len,
         if (app_vesc_set_configuration(second, &tmp) && store_to_eeprom) {
             (void)app_vesc_store_configuration(second);
         }
+        uint8_t ack = (uint8_t)ack_id;
+        uart_send_payload(&ack, 1u);
     }
-    uint8_t ack = (uint8_t)ack_id;
-    uart_send_payload(&ack, 1u);
 }
 
-/**
- * Jalankan COMM_SET_CURRENT_REL dengan semantik VESC: nilai -1..+1 diskalakan
- * terhadap batas arus motor dan current-scale aktif. Motor kanan tetap melalui
- * normalisasi tanda yang sama dengan COMM_SET_CURRENT biasa.
- */
+/** COMM_SET_CURRENT_REL: persis Commands -> mc_interface_set_current_rel VESC. */
 static void set_current_relative(bool second, const uint8_t *data, uint16_t len) {
     if (len < 4u || hall_detect_motor_locked(second)) return;
     int32_t ind = 0;
-    float rel = (float)buffer_get_int32(data, &ind) / 100000.0f;
-    if (rel > 1.0f) rel = 1.0f;
-    if (rel < -1.0f) rel = -1.0f;
-    const mc_configuration *c = (const mc_configuration *)mc_interface_get_configuration_motor(second);
-    float current;
-    if (rel >= 0.0f) {
-        float scale = c->l_current_max_scale;
-        if (!(scale >= 0.0f && scale <= 1.0f)) scale = 1.0f;
-        current = rel * c->l_current_max * scale;
-    } else {
-        float scale = c->l_current_min_scale;
-        if (!(scale >= 0.0f && scale <= 1.0f)) scale = 1.0f;
-        current = (-rel) * c->l_current_min * scale;
-    }
+    const float rel = (float)buffer_get_int32(data, &ind) / 100000.0f;
+    mc_interface_select_motor_thread(second ? 2 : 1);
     touch_motor(second);
-    mc_interface_set_current(right_sign(second, current));
+    mc_interface_set_current_rel(rel);
 }
 
 /** Kirim dua ambang battery-cut sesuai format wire VESC 6.00. */
@@ -1352,7 +1370,9 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
-        uint8_t b[208];
+        /* Payload diagnostic bertambah lintas revisi. Sisakan headroom besar dan
+         * jangan lagi mengandalkan ukuran historis 208 byte yang sudah overflow. */
+        uint8_t b[256];
         int32_t i = 0;
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         struct {
@@ -1491,8 +1511,16 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint32(b,main_prof_vesc_max_cycles,&i);
             buffer_append_uint32(b,main_prof_house_max_cycles,&i);
             buffer_append_uint32(b,main_prof_tail_max_cycles,&i);
+#ifdef STM32F103xE
+            buffer_append_uint32(b,s_prof_values_snapshot_max_cycles,&i);
+            buffer_append_uint32(b,s_prof_values_position_max_cycles,&i);
+            buffer_append_uint32(b,s_prof_values_serialize_max_cycles,&i);
+            buffer_append_uint32(b,s_prof_values_tx_max_cycles,&i);
+#else
+            for(uint8_t pi=0u;pi<4u;++pi)buffer_append_uint32(b,0u,&i);
+#endif
         }
-        uart_send_payload(b, (uint16_t)i);
+        if ((uint32_t)i <= sizeof(b)) uart_send_payload(b, (uint16_t)i);
     }
 }
 
@@ -1597,14 +1625,14 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float duty = (float)buffer_get_int32(d, &k) / 100000.0f;
-            touch_motor(second); mc_interface_set_duty(right_sign(second, duty));
+            touch_motor(second); mc_interface_set_duty(duty);
         }
         break;
     case COMM_SET_CURRENT:
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float current = (float)buffer_get_int32(d, &k) / 1000.0f;
-            touch_motor(second); mc_interface_set_current(right_sign(second, current));
+            touch_motor(second); mc_interface_set_current(current);
         }
         break;
     case COMM_SET_CURRENT_REL:
@@ -1613,16 +1641,14 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_SET_CURRENT_BRAKE:
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
-            float current = (float)buffer_get_int32(d, &k) / 1000.0f;
-            if (current < 0.0f) current = -current;
+            const float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             touch_motor(second); mc_interface_set_brake_current(current);
         }
         break;
     case COMM_SET_HANDBRAKE:
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
-            float current = (float)buffer_get_int32(d, &k) / 1000.0f;
-            if (current < 0.0f) current = -current;
+            const float current = (float)buffer_get_int32(d, &k) / 1000.0f;
             touch_motor(second); mc_interface_set_handbrake(current);
         }
         break;
@@ -1630,12 +1656,12 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         if (hall_detect_motor_locked(second)) break;
         if (n >= 4u) {
             const float rpm = (float)buffer_get_int32(d, &k);
-            touch_motor(second); mc_interface_set_pid_speed(right_sign(second, rpm));
+            touch_motor(second); mc_interface_set_pid_speed(rpm);
         }
         break;
     case COMM_SET_POS:
         if (hall_detect_motor_locked(second)) break;
-        if(n>=4u){const float pos=(float)buffer_get_int32(d,&k)/1000000.0f;touch_motor(second);mc_interface_set_pid_pos(right_sign(second,pos));}
+        if(n>=4u){const float pos=(float)buffer_get_int32(d,&k)/1000000.0f;touch_motor(second);mc_interface_set_pid_pos(pos);}
         break;
     case COMM_ALIVE:
         touch_motor(second);

@@ -71,44 +71,6 @@ void foc_inv_park(const foc_dq_t *vdvq, uint16_t phase, foc_ab_t *ab) {
 }
 
 
-void foc_lpf2_run(foc_lpf2_fixed_t *f, uint16_t coef, const foc_dq_t *in, foc_dq_t *out) {
-    const int16_t u[2] = {in->q, in->d};
-    int16_t *o[2] = {&out->q, &out->d};
-    for (int i=0;i<2;i++) {
-        int32_t err = (int32_t)u[i] - (f->state_q16[i] >> 16);
-        if (err > 32767) err=32767; else if (err < -32768) err=-32768;
-        f->state_q16[i] += (int32_t)coef * err;
-        *o[i] = (int16_t)(f->state_q16[i] >> 16);
-    }
-}
-
-
-int16_t foc_pi_run(foc_pi_fixed_t *pi, int16_t err, uint16_t kp, uint16_t ki,
-                   int16_t sat_max, int16_t sat_min) {
-    /* Bit-faithful port of generated PI_clamp_fixdt with init=0/ext_lim=0.
-     * The old V8 implementation accidentally divided the integral term by two
-     * and ran the regulator three times too often. Keep the exact generated
-     * fixed-point equation here; scheduling is handled in mcpwm_foc.c. */
-    const int32_t i_add = (int32_t)err * (int32_t)ki;
-    const int32_t i_step = pi->sat_hold ? 0 : i_add;
-    const int32_t i_sum = pi->integrator + i_step;
-
-    const int16_t p_term = foc_sat_s16(((int32_t)err * (int32_t)kp) >> 11);
-    const int16_t raw = foc_sat_s16((((i_sum >> 16) << 1) + (int32_t)p_term) >> 1);
-
-    const bool sat_hi = raw > sat_max;
-    const bool sat_lo = raw < sat_min;
-    int16_t out = raw;
-    if (sat_hi) out = sat_max;
-    else if (sat_lo) out = sat_min;
-
-    const int8_t sign_i = (i_add > 0) ? 1 : ((i_add < 0) ? -1 : 0);
-    const int8_t sign_raw = (raw > 0) ? 1 : ((raw < 0) ? -1 : 0);
-    pi->sat_hold = (uint8_t)((sign_i == sign_raw) && (sat_hi || sat_lo));
-    pi->integrator = i_sum;
-    return out;
-}
-
 uint32_t foc_isqrt_u32(uint32_t x) {
     uint32_t op=x, res=0, one=1u<<30;
     while (one>op) one>>=2;
