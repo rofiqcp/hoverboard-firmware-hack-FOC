@@ -959,6 +959,30 @@ void mcpwm_foc_sync_tuning_to_conf(bool second) {
 }
 const volatile mc_configuration *mcpwm_foc_get_configuration(bool second) { return &mcpwm_foc_get_motor(second)->m_conf; }
 
+void mcpwm_foc_rl_capture_start(bool second) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    __disable_irq();
+    m->m_rl_capture_active=0u;
+    m->m_rl_capture_have_prev=0u;
+    m->m_rl_capture_prev_id_q4=0;
+    m->m_rl_capture_n=0u;
+    m->m_rl_sum_di2=0; m->m_rl_sum_div=0; m->m_rl_sum_dii=0; m->m_rl_sum_di=0;
+    m->m_rl_capture_active=1u;
+    __enable_irq();
+}
+void mcpwm_foc_rl_capture_stop(bool second) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    __disable_irq(); m->m_rl_capture_active=0u; __enable_irq();
+}
+void mcpwm_foc_rl_capture_get(bool second, mcpwm_foc_rl_capture_t *out) {
+    if(!out)return;
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    __disable_irq();
+    out->samples=m->m_rl_capture_n; out->sum_di2=m->m_rl_sum_di2;
+    out->sum_div=m->m_rl_sum_div; out->sum_dii=m->m_rl_sum_dii; out->sum_di=m->m_rl_sum_di;
+    __enable_irq();
+}
+
 static int16_t amp_to_q4(const mcpwm_foc_motor_t *m, float current) {
     float max_a = m ? m->m_conf.l_current_max * m->m_conf.l_current_max_scale : (float)I_MOT_MAX;
     float min_a = m ? m->m_conf.l_current_min * m->m_conf.l_current_min_scale : -(float)I_MOT_MAX;
@@ -2660,6 +2684,31 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     foc_dq_t v={m->m_vd,m->m_vq};
     m->m_state=MC_STATE_RUNNING;
         if (control_update) {
+            /* Plant-identification capture for Detect All. m_vd is the voltage
+             * held over the interval that produced the current delta below.
+             * Accumulate sufficient statistics only; no float/division in ISR. */
+            if(m->m_rl_capture_active && m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE){
+                const int16_t id_now=m->m_id_q4;
+                if(m->m_rl_capture_have_prev){
+                    const int32_t di=(int32_t)id_now-(int32_t)m->m_rl_capture_prev_id_q4;
+                    const int32_t imid=((int32_t)id_now+(int32_t)m->m_rl_capture_prev_id_q4)/2;
+                    const int32_t vv=(int32_t)m->m_vd;
+                    /* Cortex-M3 has a fast 32x32 multiply but no native 64x64.
+                     * Products are safely bounded by int32 here; widen only the
+                     * accumulator so Detect-All cannot blow the 16-kHz deadline. */
+                    if(m->m_rl_capture_n<2048u){
+                        const int32_t p_di2=di*di;
+                        const int32_t p_div=di*vv;
+                        const int32_t p_dii=di*imid;
+                        m->m_rl_sum_di2+=(int64_t)p_di2;
+                        m->m_rl_sum_div+=(int64_t)p_div;
+                        m->m_rl_sum_dii+=(int64_t)p_dii;
+                        m->m_rl_sum_di+=(int64_t)di;
+                        m->m_rl_capture_n++;
+                    }
+                }else m->m_rl_capture_have_prev=1u;
+                m->m_rl_capture_prev_id_q4=id_now;
+            }
             profRegStart=DWT->CYCCNT;
             /* The proven generated controller updates its regulators once every
              * three 16-kHz ADC frames (~5.333 kHz). */

@@ -143,7 +143,7 @@ int main(void){
      * invalid. Prove the detected center is the phase used by closed-loop FOC. */
     const uint8_t h0=left_raw_for_sector[2];
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,h0);
-    for(uint8_t n=0u;n<(uint8_t)(MCCONF_HALL_DEBOUNCE_SAMPLES+1u);++n)mcpwm_foc_adc_int_handler();
+    for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
     const uint16_t expected_phase=(uint16_t)(((uint32_t)tl[h0]*65536u)/200u);
     if(m_motor_1.m_phase_hall!=expected_phase)return fail("Hall table 0..199 electrical-angle mapping");
     mcpwm_foc_set_current(0.2f,false); mcpwm_foc_vesc_override_touch(false);
@@ -162,7 +162,7 @@ int main(void){
     /* A real adjacent code held for the debounce window must be accepted. */
     const uint8_t h1=left_raw_for_sector[3];
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,h1);
-    for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+    for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_hall_state!=h1)return fail("stable Hall transition acceptance");
     if(abs((int)(m_motor_1.m_position_counts-pos_before))!=1)return fail("stable Hall transition position count");
 
@@ -176,7 +176,7 @@ int main(void){
         const int32_t tach_valid=m_motor_1.m_tachometer;
         const uint32_t reject_valid=m_motor_1.m_hall_sequence_reject_count;
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,0u);
-        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_hall_state!=0u || m_motor_1.m_hall_initialized || m_motor_1.m_hall_direction!=0)
             return fail("invalid Hall must drop estimator lock");
         if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)
@@ -186,7 +186,7 @@ int main(void){
 
         const uint8_t reconnect=left_raw_for_sector[0]; /* deliberately non-adjacent to h1 */
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,reconnect);
-        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
         if(!m_motor_1.m_hall_initialized || m_motor_1.m_hall_state!=reconnect)
             return fail("valid Hall reconnect must re-sync estimator");
         if(m_motor_1.m_position_counts!=pos_valid || m_motor_1.m_tachometer!=tach_valid)
@@ -210,7 +210,7 @@ int main(void){
         const int32_t tach_before_reject=m_motor_1.m_tachometer;
         const uint32_t rejects_before=m_motor_1.m_hall_sequence_reject_count;
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,skipped);
-        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_hall_sequence_reject_count!=rejects_before+1u)
             return fail("stable skipped Hall state must count one sequence reject");
         if(m_motor_1.m_phase_hall!=phase_before_reject)
@@ -223,7 +223,7 @@ int main(void){
         /* Returning to the last accepted Hall state clears the feedback mismatch
          * but does not synthesize motion. A fresh command is required to drive. */
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,reconnect);
-        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_position_counts!=pos_before_reject || m_motor_1.m_tachometer!=tach_before_reject)
             return fail("Hall sequence recovery must not synthesize motion");
         if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)

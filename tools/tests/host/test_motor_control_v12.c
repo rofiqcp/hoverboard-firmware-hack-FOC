@@ -289,11 +289,14 @@ int main(void){
     if(m_motor_1.m_fault!=FAULT_CODE_ABS_OVER_CURRENT)return fail("DC-link OC must fault immediately");
     if(m_motor_1.m_dc_trip_count!=1u || m_motor_1.m_last_trip_source!=2u)return fail("DC OC diagnostic split");
 
-    /* Reverse Hall convention remains the generated-controller pos+1 rule. */
+    /* RIGHT Hall direction regression. Hall filtering now honors VESC
+     * m_hall_extra_samples (default window 7), so allow the majority filter
+     * plus debounce to settle before checking the accepted 3->2 edge. */
     mcpwm_foc_init(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
+    if(!m_motor_2.m_conf.m_invert_direction)return fail("right default direction mirror config");
     for(int i=0;i<100;i++)mcpwm_foc_adc_int_handler();
     set_halls(2u,2u);
-    for(uint8_t i=0u;i<MCCONF_HALL_DEBOUNCE_SAMPLES;i++)mcpwm_foc_adc_int_handler();
+    for(uint16_t i=0u;i<(uint16_t)m_motor_2.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_2.m_hall_direction!=-1)return fail("right reverse Hall direction");
     for(uint32_t i=0u;i<MCCONF_HALL_TIMEOUT_TICKS+100u;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_2.m_hall_interp_active!=0u)return fail("Hall interpolation low-speed disable");

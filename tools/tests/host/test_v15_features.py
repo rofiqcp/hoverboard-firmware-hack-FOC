@@ -51,8 +51,9 @@ det=vp[vp.index('static uint8_t hall_detect_angle200'):vp.index('static int32_t 
 assert 'hall_detect_begin' in det and 'hall_detect_periodic' in det and 'uint8_t reply[10]' in det
 assert 'reply[9]=success?0u:1u' in det and 'standalone detect is not a store' in det
 assert 'mc_interface_release_motor()' in det and 'mcpwm_foc_vesc_override_clear(second)' in det
-assert 'COMM_DETECT_APPLY_ALL_FOC' in det and 'detect_all_apply_motor' in det
-assert 'mc_interface_store_configuration_motor(second)' in det and 'uart_send_payload(reply,sizeof(reply))' in det
+assert 'COMM_DETECT_APPLY_ALL_FOC' in vp and 'detect_all_periodic' in det and 'detect_all_commit' in det
+assert 'mc_interface_store_configuration_motor(mi!=0u)' in det and 'uart_send_payload(reply,sizeof(reply))' in det
+assert 'detect_all_compute_rl' in det and 'DETECT_ALL_FLUX_SAMPLE' in det, 'Detect-All must identify motor model before transactional store'
 
 # Standard VESC Tool setPos is a signed degree x1e6 packet builder with no
 # client-side clamp; firmware normalizes its angular target. Project multi-turn

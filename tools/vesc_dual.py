@@ -682,10 +682,16 @@ class VescDual:
         out = bytearray((COMM_DETECT_APPLY_ALL_FOC, 1 if detect_can else 0))
         for value in (max_power_loss, min_current_in, max_current_in, openloop_rpm, sl_erpm):
             out += struct.pack(">i", round(value * 1000.0))
-        p = self.transact(bytes(out), COMM_DETECT_APPLY_ALL_FOC, 35.0)
-        if len(p) != 3:
-            raise ValueError(f"unexpected Detect All reply length {len(p)}")
-        return struct.unpack_from(">h", p, 1)[0]
+        # Utility::detectAllFoc VESC Tool: gate application output during the
+        # complete detection and always restore it afterwards, even on timeout.
+        self.disable_app_output(180000, forward_can=True)
+        try:
+            p = self.transact(bytes(out), COMM_DETECT_APPLY_ALL_FOC, 180.0)
+            if len(p) != 3:
+                raise ValueError(f"unexpected Detect All reply length {len(p)}")
+            return struct.unpack_from(">h", p, 1)[0]
+        finally:
+            self.disable_app_output(0, forward_can=True)
 
     def get_battery_cut(self, right: bool = False) -> tuple[float, float]:
         """Baca l_battery_cut_start/end dengan format persis VESC 6.00."""

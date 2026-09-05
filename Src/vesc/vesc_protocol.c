@@ -1,6 +1,7 @@
 #include <string.h>
 #include "stm32f1xx_hal.h"
 #include <stdio.h>
+#include <math.h>
 #include "config.h"
 #include "defines.h"
 #include "motor/mcpwm_foc.h"
@@ -142,18 +143,49 @@ typedef struct {
 
 static hall_detect_job_t s_hall_detect;
 
+typedef enum {
+    DETECT_ALL_IDLE = 0,
+    DETECT_ALL_HALL,
+    DETECT_ALL_RL_ALIGN,
+    DETECT_ALL_RL_LOW,
+    DETECT_ALL_RL_STEP,
+    DETECT_ALL_RL_HIGH,
+    DETECT_ALL_FLUX_RAMP,
+    DETECT_ALL_FLUX_SAMPLE
+} detect_all_stage_t;
+
 typedef struct {
     uint8_t active;
     uint8_t motor_index;
+    detect_all_stage_t stage;
+    uint32_t stage_start_ms;
+    uint32_t next_sample_ms;
+    uint32_t sample_n;
+    float max_power_loss;
     float min_current_in;
     float max_current_in;
     float openloop_rpm;
     float sl_erpm;
+    float current_low;
+    float current_high;
+    float flux_current;
+    float flux_target_erpm;
+    double sum_i;
+    double sum_v;
+    double sum_i_raw;
+    double sum_v_raw;
+    double sum_erpm;
+    mc_configuration backup[2];
+    mc_configuration result[2];
+    float r[2], l[2], ld_lq[2], flux[2], imax[2];
+    float low_i[2], low_v[2], high_i[2], high_v[2];
+    float low_i_raw[2], low_v_raw[2], high_i_raw[2], high_v_raw[2];
     uint8_t hall[2][8];
 } detect_all_job_t;
 
 static detect_all_job_t s_detect_all;
 static void hall_detect_periodic(uint32_t now_ms);
+static void detect_all_periodic(uint32_t now_ms);
 static void reply_mcconf(bool second, COMM_PACKET_ID id);
 /* VESC Tool rotor-position display stream. Upstream commands.c stores one
  * display_position_mode per VESC instance; this dual virtual target stores the
@@ -464,6 +496,7 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
 
 void vesc_protocol_periodic(uint32_t now_ms) {
     hall_detect_periodic(now_ms);
+    detect_all_periodic(now_ms);
     const disp_pos_mode mode = s_display_pos_mode;
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
@@ -1104,39 +1137,118 @@ static void detect_all_reply(int16_t result) {
     uart_send_payload(b,(uint16_t)i);
 }
 
-static bool detect_all_apply_motor(bool second, const uint8_t hall[8]) {
-    mc_configuration c=*mc_interface_get_configuration_motor(second);
-    memcpy(c.foc_hall_table,hall,8u);
-    c.motor_type=MOTOR_TYPE_FOC;
-    c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
-    if(s_detect_all.min_current_in < -0.001f &&
-       s_detect_all.min_current_in >= -(float)I_DC_MAX) c.l_in_current_min=s_detect_all.min_current_in;
-    if(s_detect_all.max_current_in > 0.001f &&
-       s_detect_all.max_current_in <= (float)I_DC_MAX) c.l_in_current_max=s_detect_all.max_current_in;
-    if(s_detect_all.openloop_rpm > 0.001f &&
-       s_detect_all.openloop_rpm <= (float)MCCONF_OPENLOOP_RPM_MAX) c.foc_openloop_rpm=s_detect_all.openloop_rpm;
-    if(s_detect_all.sl_erpm > 0.001f) c.foc_sl_erpm=s_detect_all.sl_erpm;
+static int16_t detect_all_fault_result(bool second) {
+    const mc_fault_code f=mc_interface_get_fault_motor(second);
+    return f==FAULT_CODE_NONE ? -10 : (int16_t)((int)f-100);
+}
 
-    mc_interface_select_motor_thread(second?2:1);
-    mc_interface_set_configuration(&c);
-    const bool ok=mc_interface_store_configuration_motor(second);
+static void detect_all_release_all(void) {
+    mcpwm_foc_rl_capture_stop(false); mcpwm_foc_rl_capture_stop(true);
+    mc_interface_select_motor_thread(1); mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(false);
+    mc_interface_select_motor_thread(2); mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(true);
     mc_interface_select_motor_thread(1);
-    s_last_hall_store_ok[second?1u:0u]=ok?1u:0u;
+}
+
+static void detect_all_restore_backups(void) {
+    for(uint8_t mi=0u;mi<2u;++mi){
+        mc_interface_select_motor_thread(mi?2:1);
+        mc_configuration c=s_detect_all.backup[mi];
+        mc_interface_set_configuration(&c);
+    }
+    mc_interface_select_motor_thread(1);
+}
+
+static void detect_all_reset_sample(void) {
+    s_detect_all.sample_n=0u;
+    s_detect_all.sum_i=0.0; s_detect_all.sum_v=0.0;
+    s_detect_all.sum_i_raw=0.0; s_detect_all.sum_v_raw=0.0;
+    s_detect_all.sum_erpm=0.0;
+}
+
+static void detect_all_apply_runtime(uint8_t mi) {
+    mc_interface_select_motor_thread(mi?2:1);
+    mc_configuration c=s_detect_all.result[mi];
+    mc_interface_set_configuration(&c);
+    mc_interface_select_motor_thread(1);
+}
+
+static void detect_all_prepare_common(uint8_t mi) {
+    mc_configuration *c=&s_detect_all.result[mi];
+    *c=s_detect_all.backup[mi];
+    memcpy(c->foc_hall_table,s_detect_all.hall[mi],8u);
+    c->motor_type=MOTOR_TYPE_FOC;
+    c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    if(s_detect_all.min_current_in < -0.001f && s_detect_all.min_current_in >= -(float)I_DC_MAX)
+        c->l_in_current_min=s_detect_all.min_current_in;
+    if(s_detect_all.max_current_in > 0.001f && s_detect_all.max_current_in <= (float)I_DC_MAX)
+        c->l_in_current_max=s_detect_all.max_current_in;
+    if(s_detect_all.openloop_rpm > 0.001f && s_detect_all.openloop_rpm <= (float)MCCONF_OPENLOOP_RPM_MAX)
+        c->foc_openloop_rpm=s_detect_all.openloop_rpm;
+    if(s_detect_all.sl_erpm > 0.001f && s_detect_all.sl_erpm <= MCCONF_L_MAX_ERPM)
+        c->foc_sl_erpm=s_detect_all.sl_erpm;
+}
+
+static bool detect_all_commit(void) {
+    bool ok=true;
+    for(uint8_t mi=0u;mi<2u;++mi){
+        mc_interface_select_motor_thread(mi?2:1);
+        mc_configuration c=s_detect_all.result[mi];
+        mc_interface_set_configuration(&c);
+        if(!mc_interface_store_configuration_motor(mi!=0u)){ok=false;break;}
+        s_last_hall_store_ok[mi]=1u;
+    }
+    if(!ok){
+        /* Best-effort atomic rollback: restore RAM and rewrite both old configs.
+         * The per-motor EEPROM signature is written last by store_configuration. */
+        detect_all_restore_backups();
+        for(uint8_t mi=0u;mi<2u;++mi){
+            mc_interface_select_motor_thread(mi?2:1);
+            (void)mc_interface_store_configuration_motor(mi!=0u);
+            s_last_hall_store_ok[mi]=0u;
+        }
+    }
+    mc_interface_select_motor_thread(1);
     return ok;
 }
 
 static void detect_all_finish(int16_t result) {
-    mc_interface_select_motor_thread(1);
-    mc_interface_release_motor();
-    mc_interface_select_motor_thread(2);
-    mc_interface_release_motor();
-    mc_interface_select_motor_thread(1);
+    detect_all_release_all();
     memset(&s_hall_detect,0,sizeof(s_hall_detect));
+    if(result>=0){
+        if(!detect_all_commit()) result=-1;
+    }else{
+        detect_all_restore_backups();
+    }
     s_detect_all.active=0u;
-    /* Upstream sends the freshly detected MC configuration before the final
-     * Detect-All result. VESC Tool relies on this to render the success page. */
+    s_detect_all.stage=DETECT_ALL_IDLE;
+    /* Utility::detectAllFoc brackets the command with APP_DISABLE_OUTPUT. We
+     * also clear our internal safety gate here so raw protocol clients cannot
+     * leave application output suppressed for the full 180-s guard window. */
+    app_vesc_disable_output(0);
+    /* Stock VESC sends fresh MC configuration before the final result. */
     if(result>=0) reply_mcconf(false,COMM_GET_MCCONF);
     detect_all_reply(result);
+}
+
+static void detect_all_start_rl(uint8_t mi, uint32_t now_ms) {
+    s_detect_all.motor_index=mi;
+    detect_all_apply_runtime(mi);
+    const bool second=mi!=0u;
+    const float max_i=s_detect_all.result[mi].l_current_max>0.5f ? s_detect_all.result[mi].l_current_max : (float)I_MOT_MAX;
+    float lo=0.60f, hi=2.00f;
+    if(hi>max_i*0.50f)hi=max_i*0.50f;
+    if(hi>(float)I_MOT_MAX*0.25f)hi=(float)I_MOT_MAX*0.25f;
+    if(hi<0.80f)hi=0.80f;
+    if(lo>hi*0.50f)lo=hi*0.50f;
+    if(lo<0.30f)lo=0.30f;
+    s_detect_all.current_low=lo; s_detect_all.current_high=hi;
+    mcpwm_foc_set_openloop_phase(lo,0.0f,second);
+    mcpwm_foc_vesc_override_touch(second);
+    s_detect_all.stage=DETECT_ALL_RL_ALIGN;
+    s_detect_all.stage_start_ms=now_ms;
+    s_detect_all.next_sample_ms=now_ms;
+    detect_all_reset_sample();
 }
 
 static void hall_detect_reply_and_stop(bool success) {
@@ -1157,24 +1269,22 @@ static void hall_detect_reply_and_stop(bool success) {
 
     if(s_detect_all.active){
         if(!success){
-            detect_all_finish(-10);
+            detect_all_finish(detect_all_fault_result(second));
             return;
         }
-        memcpy(s_detect_all.hall[second?1u:0u],table,8u);
-        if(!detect_all_apply_motor(second,table)){
-            detect_all_finish(-1);
-            return;
-        }
+        const uint8_t mi=second?1u:0u;
+        memcpy(s_detect_all.hall[mi],table,8u);
+        detect_all_prepare_common(mi);
+        detect_all_apply_runtime(mi); /* calibrate Hall coordinates now; do not store yet */
         memset(&s_hall_detect,0,sizeof(s_hall_detect));
         if(!second){
             s_detect_all.motor_index=1u;
-            /* 1 A is the validated Hall-detect operating point on this board.
-             * It is clamped to each motor's configured current limit. */
             hall_detect_start_current(true,1.0f);
             return;
         }
-        /* Non-negative result is success to VESC Tool; 2 denotes Hall sensing. */
-        detect_all_finish(2);
+        /* Both Hall maps are now known. Parameter identification is performed
+         * one motor at a time to keep bus/current stress bounded. */
+        detect_all_start_rl(0u,HAL_GetTick());
         return;
     }
 
@@ -1204,22 +1314,31 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     if(len<21u){ detect_all_reply(-1); return; }
     int32_t k=0;
     const uint8_t detect_can=data[k++];
-    (void)detect_can; /* virtual ID2 is the on-board second motor, always detect it */
+    (void)detect_can; /* virtual ID2 is the on-board second VESC */
     const float max_power_loss=buffer_get_float32(data,1e3f,&k);
-    (void)max_power_loss; /* board-specific current PI is pre-characterized; no sensorless R/L fit */
+    const float min_current_in=buffer_get_float32(data,1e3f,&k);
+    const float max_current_in=buffer_get_float32(data,1e3f,&k);
+    const float openloop_rpm=buffer_get_float32(data,1e3f,&k);
+    const float sl_erpm=buffer_get_float32(data,1e3f,&k);
+    if(!(max_power_loss>=0.5f && max_power_loss<=5000.0f)){detect_all_reply(-1);return;}
+
     memset(&s_detect_all,0,sizeof(s_detect_all));
     s_detect_all.active=1u;
-    s_detect_all.min_current_in=buffer_get_float32(data,1e3f,&k);
-    s_detect_all.max_current_in=buffer_get_float32(data,1e3f,&k);
-    s_detect_all.openloop_rpm=buffer_get_float32(data,1e3f,&k);
-    s_detect_all.sl_erpm=buffer_get_float32(data,1e3f,&k);
+    s_detect_all.stage=DETECT_ALL_HALL;
+    s_detect_all.max_power_loss=max_power_loss;
+    s_detect_all.min_current_in=min_current_in;
+    s_detect_all.max_current_in=max_current_in;
+    s_detect_all.openloop_rpm=openloop_rpm;
+    s_detect_all.sl_erpm=sl_erpm;
+    for(uint8_t mi=0u;mi<2u;++mi){
+        s_detect_all.backup[mi]=*mc_interface_get_configuration_motor(mi!=0u);
+        s_detect_all.result[mi]=s_detect_all.backup[mi];
+    }
 
-    /* Same safety semantics as upstream blocking Detect All: application output
-     * remains gated and command timeout is refreshed for the motor under test. */
     app_vesc_disable_output(180000);
-    mc_interface_select_motor_thread(1); mc_interface_release_motor();
-    mc_interface_select_motor_thread(2); mc_interface_release_motor();
-    mc_interface_select_motor_thread(1);
+    detect_all_release_all();
+    /* Hall comes first on this Hall-only board. It is independent of the old
+     * phase/Hall wiring and gives a trustworthy speed reference for flux tests. */
     hall_detect_start_current(false,1.0f);
 }
 
@@ -1294,6 +1413,176 @@ static void hall_detect_periodic(uint32_t now_ms) {
         }
     }
     s_hall_detect.next_ms = now_ms;
+}
+
+static bool detect_all_compute_rl(uint8_t mi) {
+    const double di_phys=(double)s_detect_all.high_i[mi]-(double)s_detect_all.low_i[mi];
+    const double dv_phys=(double)s_detect_all.high_v[mi]-(double)s_detect_all.low_v[mi];
+    const double di_raw=(double)s_detect_all.high_i_raw[mi]-(double)s_detect_all.low_i_raw[mi];
+    const double dv_raw=(double)s_detect_all.high_v_raw[mi]-(double)s_detect_all.low_v_raw[mi];
+    if(fabs(di_phys)<0.25 || fabs(di_raw)<100.0 || fabs(dv_raw)<20.0) return false;
+    const double r=fabs(dv_phys/di_phys);
+    if(!(r>=0.005 && r<=2.0)) return false;
+
+    mcpwm_foc_rl_capture_t cap;
+    mcpwm_foc_rl_capture_get(mi!=0u,&cap);
+    if(cap.samples<20u || cap.sum_di2==0) return false;
+    const double a=dv_raw/di_raw;
+    const double c=(double)s_detect_all.low_v_raw[mi]-a*(double)s_detect_all.low_i_raw[mi];
+    const double b=((double)cap.sum_div-a*(double)cap.sum_dii-c*(double)cap.sum_di)/(double)cap.sum_di2;
+    const double vscale=fabs(dv_phys/dv_raw);
+    const double dt=(double)MCCONF_FOC_CONTROL_DIV/(double)PWM_FREQ;
+    const double l=fabs(b)*vscale*(double)FOC_CURRENT_Q4_PER_A*dt;
+    if(!(l>=0.000005 && l<=0.020)) return false;
+
+    double im=sqrt((double)s_detect_all.max_power_loss/(r*1.5));
+    if(im<1.0)im=1.0;
+    if(im>(double)I_MOT_MAX)im=(double)I_MOT_MAX;
+    s_detect_all.r[mi]=(float)r;
+    s_detect_all.l[mi]=(float)l;
+    s_detect_all.ld_lq[mi]=0.0f; /* safe d-axis identification; non-salient default */
+    s_detect_all.imax[mi]=(float)im;
+    return true;
+}
+
+static void detect_all_finalize_motor(uint8_t mi) {
+    mc_configuration *c=&s_detect_all.result[mi];
+    c->foc_motor_r=s_detect_all.r[mi];
+    c->foc_motor_l=s_detect_all.l[mi];
+    c->foc_motor_ld_lq_diff=s_detect_all.ld_lq[mi];
+    c->foc_motor_flux_linkage=s_detect_all.flux[mi];
+    c->foc_current_kp=c->foc_motor_l*1000.0f; /* VESC tc=1000 us */
+    c->foc_current_ki=c->foc_motor_r*1000.0f;
+    if(c->foc_motor_flux_linkage>0.000001f)
+        c->foc_observer_gain=1000.0f/(c->foc_motor_flux_linkage*c->foc_motor_flux_linkage);
+    c->l_current_max=s_detect_all.imax[mi];
+    c->l_current_min=-s_detect_all.imax[mi];
+    float absmax=s_detect_all.imax[mi]*1.5f;
+    if(absmax>MCCONF_L_ABS_CURRENT_MAX)absmax=MCCONF_L_ABS_CURRENT_MAX;
+    if(absmax<s_detect_all.imax[mi])absmax=s_detect_all.imax[mi];
+    c->l_abs_current_max=absmax;
+    c->motor_type=MOTOR_TYPE_FOC;
+    c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+}
+
+static void detect_all_periodic(uint32_t now_ms) {
+    if(!s_detect_all.active || s_detect_all.stage==DETECT_ALL_IDLE ||
+       s_detect_all.stage==DETECT_ALL_HALL) return;
+    if((int32_t)(now_ms-s_detect_all.next_sample_ms)<0) return;
+    s_detect_all.next_sample_ms=now_ms+1u;
+    const uint8_t mi=s_detect_all.motor_index;
+    const bool second=mi!=0u;
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    const mc_fault_code fault=mc_interface_get_fault_motor(second);
+    if(fault!=FAULT_CODE_NONE){detect_all_finish((int16_t)((int)fault-100));return;}
+    mcpwm_foc_vesc_override_touch(second);
+    const uint32_t elapsed=(uint32_t)(now_ms-s_detect_all.stage_start_ms);
+
+    switch(s_detect_all.stage){
+    case DETECT_ALL_RL_ALIGN:
+        if(elapsed>=400u){
+            detect_all_reset_sample();
+            s_detect_all.stage=DETECT_ALL_RL_LOW;
+            s_detect_all.stage_start_ms=now_ms;
+        }
+        break;
+    case DETECT_ALL_RL_LOW:
+        s_detect_all.sum_i+=mcpwm_foc_get_id_motor(second);
+        s_detect_all.sum_v+=mcpwm_foc_get_vd_motor(second);
+        s_detect_all.sum_i_raw+=m->m_id_q4;
+        s_detect_all.sum_v_raw+=m->m_vd;
+        s_detect_all.sample_n++;
+        if(elapsed>=250u){
+            if(s_detect_all.sample_n<40u){detect_all_finish(-10);return;}
+            const double n=(double)s_detect_all.sample_n;
+            s_detect_all.low_i[mi]=(float)(s_detect_all.sum_i/n);
+            s_detect_all.low_v[mi]=(float)(s_detect_all.sum_v/n);
+            s_detect_all.low_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
+            s_detect_all.low_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
+            if(fabsf(s_detect_all.low_i[mi])<0.20f){detect_all_finish(-10);return;}
+            mcpwm_foc_rl_capture_start(second);
+            mcpwm_foc_set_openloop_phase(s_detect_all.current_high,0.0f,second);
+            mcpwm_foc_vesc_override_touch(second);
+            s_detect_all.stage=DETECT_ALL_RL_STEP;
+            s_detect_all.stage_start_ms=now_ms;
+        }
+        break;
+    case DETECT_ALL_RL_STEP:
+        if(elapsed>=350u){
+            mcpwm_foc_rl_capture_stop(second);
+            detect_all_reset_sample();
+            s_detect_all.stage=DETECT_ALL_RL_HIGH;
+            s_detect_all.stage_start_ms=now_ms;
+        }
+        break;
+    case DETECT_ALL_RL_HIGH:
+        s_detect_all.sum_i+=mcpwm_foc_get_id_motor(second);
+        s_detect_all.sum_v+=mcpwm_foc_get_vd_motor(second);
+        s_detect_all.sum_i_raw+=m->m_id_q4;
+        s_detect_all.sum_v_raw+=m->m_vd;
+        s_detect_all.sample_n++;
+        if(elapsed>=250u){
+            if(s_detect_all.sample_n<40u){detect_all_finish(-10);return;}
+            const double n=(double)s_detect_all.sample_n;
+            s_detect_all.high_i[mi]=(float)(s_detect_all.sum_i/n);
+            s_detect_all.high_v[mi]=(float)(s_detect_all.sum_v/n);
+            s_detect_all.high_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
+            s_detect_all.high_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
+            if(!detect_all_compute_rl(mi)){detect_all_finish(-10);return;}
+            s_detect_all.flux_current=0.70f;
+            if(s_detect_all.flux_current>s_detect_all.imax[mi]*0.25f)
+                s_detect_all.flux_current=s_detect_all.imax[mi]*0.25f;
+            if(s_detect_all.flux_current<0.30f)s_detect_all.flux_current=0.30f;
+            s_detect_all.flux_target_erpm=600.0f;
+            detect_all_reset_sample();
+            s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
+            s_detect_all.stage_start_ms=now_ms;
+        }
+        break;
+    case DETECT_ALL_FLUX_RAMP: {
+        float f=(float)elapsed/1200.0f; if(f>1.0f)f=1.0f;
+        const float erpm=80.0f+(s_detect_all.flux_target_erpm-80.0f)*f;
+        mcpwm_foc_set_openloop_current(s_detect_all.flux_current,erpm,second);
+        mcpwm_foc_vesc_override_touch(second);
+        if(elapsed>=1200u){
+            detect_all_reset_sample();
+            s_detect_all.stage=DETECT_ALL_FLUX_SAMPLE;
+            s_detect_all.stage_start_ms=now_ms;
+        }
+        break;
+    }
+    case DETECT_ALL_FLUX_SAMPLE:
+        mcpwm_foc_set_openloop_current(s_detect_all.flux_current,s_detect_all.flux_target_erpm,second);
+        mcpwm_foc_vesc_override_touch(second);
+        s_detect_all.sum_i+=fabs((double)mcpwm_foc_get_iq_motor(second));
+        s_detect_all.sum_v+=fabs((double)mcpwm_foc_get_vq_motor(second));
+        s_detect_all.sum_erpm+=fabs((double)mcpwm_foc_get_erpm_motor(second));
+        s_detect_all.sample_n++;
+        if(elapsed>=800u){
+            if(s_detect_all.sample_n<100u){detect_all_finish(-10);return;}
+            const double n=(double)s_detect_all.sample_n;
+            const double iq=s_detect_all.sum_i/n;
+            const double vq=s_detect_all.sum_v/n;
+            const double erpm=s_detect_all.sum_erpm/n;
+            if(erpm<(double)s_detect_all.flux_target_erpm*0.50 ||
+               erpm>(double)s_detect_all.flux_target_erpm*1.60){detect_all_finish(-10);return;}
+            const double omega=erpm*6.28318530717958647692/60.0;
+            const double bemf=vq-(double)s_detect_all.r[mi]*iq;
+            if(bemf<=0.02 || omega<=1.0){detect_all_finish(-10);return;}
+            const double flux=bemf/omega;
+            if(!(flux>=0.0001 && flux<=1.0)){detect_all_finish(-10);return;}
+            s_detect_all.flux[mi]=(float)flux;
+            detect_all_finalize_motor(mi);
+            mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor();
+            mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
+            if(mi==0u){detect_all_start_rl(1u,now_ms);}
+            else detect_all_finish(2);
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static int32_t q4_to_milliamps_normalized(int16_t q4, bool second) {

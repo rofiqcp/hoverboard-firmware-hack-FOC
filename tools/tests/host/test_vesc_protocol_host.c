@@ -32,6 +32,14 @@ static unsigned store_count[2];
 static bool store_ok=true, load_ok=true;
 static mc_configuration confs[2];
 static mcpwm_foc_motor_t diag_motors[2];
+/* Deterministic motor plant used to prove Detect-All actually identifies
+ * parameters rather than returning success after Hall-only setup. */
+static const float plant_r[2]={0.180f,0.220f};
+static const float plant_l[2]={0.000350f,0.000420f};
+static const float plant_flux[2]={0.0180f,0.0200f};
+static float plant_vd[2]={0.0f,0.0f}, plant_vq[2]={0.0f,0.0f};
+static bool rl_capture_on[2]={false,false};
+static bool plant_fail_rl=false;
 static int32_t pos_user[2] = {0,0};
 static int32_t pos_target_user[2] = {0,0};
 static int32_t pos_min_user[2] = {INT32_MIN,INT32_MIN};
@@ -106,14 +114,43 @@ mcpwm_foc_motor_t *mcpwm_foc_get_motor(bool second) { return &diag_motors[second
 const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool second) { return &diag_motors[second?1:0]; }
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     const int j=second?1:0;
-    diag_motors[j].m_openloop_id_target_q4=(int16_t)lroundf(fabsf(current)*800.0f);
+    const float ia=plant_fail_rl?0.0f:fabsf(current);
+    diag_motors[j].m_openloop_id_target_q4=(int16_t)lroundf(ia*800.0f);
+    diag_motors[j].m_id_q4=diag_motors[j].m_openloop_id_target_q4;
+    diag_motors[j].m_id_telem_q4=diag_motors[j].m_id_q4;
+    plant_vd[j]=plant_r[j]*ia;
+    diag_motors[j].m_vd=(int16_t)lroundf(plant_vd[j]/0.001f);
     diag_motors[j].m_control_mode=CONTROL_MODE_OPENLOOP_PHASE;
     while(phase>=360.0f) phase-=360.0f;
     while(phase<0.0f) phase+=360.0f;
-    /* Deterministic 6-sector Hall plant. Sector centers become
-     * 30,90,150,210,270,330 electrical degrees => 17,50,83,117,150,183/200. */
+    /* Different raw Hall permutations model swapped phase/Hall wiring. */
+    static const uint8_t seq0[6]={1u,2u,3u,4u,5u,6u};
+    static const uint8_t seq1[6]={6u,4u,5u,1u,3u,2u};
     int sec=(int)(phase/60.0f); if(sec<0)sec=0; if(sec>5)sec=5;
-    diag_motors[j].m_hall_state=(uint8_t)(sec+1);
+    diag_motors[j].m_hall_state=j?seq1[sec]:seq0[sec];
+}
+void mcpwm_foc_set_openloop_current(float current,float rpm,bool second){
+    const int j=second?1:0; const float ia=fabsf(current);
+    diag_motors[j].m_control_mode=CONTROL_MODE_OPENLOOP;
+    diag_motors[j].m_iq_q4=(int16_t)lroundf(ia*800.0f);
+    diag_motors[j].m_iq_telem_q4=diag_motors[j].m_iq_q4;
+    diag_motors[j].m_rpm=(int16_t)lroundf(rpm);
+    const float omega=fabsf(rpm)*6.28318530717958647692f/60.0f;
+    plant_vq[j]=plant_r[j]*ia+plant_flux[j]*omega;
+    diag_motors[j].m_vq=(int16_t)lroundf(plant_vq[j]/0.001f);
+}
+float mcpwm_foc_get_id_motor(bool second){return (float)diag_motors[second?1:0].m_id_telem_q4/800.0f;}
+float mcpwm_foc_get_iq_motor(bool second){return (float)diag_motors[second?1:0].m_iq_telem_q4/800.0f;}
+float mcpwm_foc_get_vd_motor(bool second){return plant_vd[second?1:0];}
+float mcpwm_foc_get_vq_motor(bool second){return plant_vq[second?1:0];}
+void mcpwm_foc_rl_capture_start(bool second){rl_capture_on[second?1:0]=true;}
+void mcpwm_foc_rl_capture_stop(bool second){rl_capture_on[second?1:0]=false;}
+void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
+    const int j=second?1:0; if(!o)return; memset(o,0,sizeof(*o));
+    o->samples=200u; o->sum_di2=1000000LL;
+    /* vscale=1 mV/internal count, q4_per_A=800, dt=3/16000. */
+    const double b=(double)plant_l[j]/(0.001*800.0*(3.0/16000.0));
+    o->sum_div=(int64_t)llround(b*(double)o->sum_di2);
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
 float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
@@ -126,7 +163,7 @@ bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *rat
 }
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
-float mcpwm_foc_get_erpm_motor(bool second) { return second ? -50.0f : 50.0f; }
+float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}
 float mcpwm_foc_get_gear_ratio(bool second){float g=confs[second?1:0].si_gear_ratio;return g>0.0f?g:1.0f;}
@@ -254,6 +291,7 @@ int main(void){
     diag_motors[0].m_iq_target_q4=2400; diag_motors[0].m_iq_set_q4=1600; diag_motors[0].m_iq_q4=800;
     diag_motors[0].m_hall_state=5u; diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT; diag_motors[0].m_state=MC_STATE_RUNNING;
     diag_motors[1].m_iq_target_q4=-2400; diag_motors[1].m_iq_set_q4=-1600; diag_motors[1].m_iq_q4=-800;
+    diag_motors[0].m_rpm=50; diag_motors[1].m_rpm=-50;
     diag_motors[1].m_hall_state=3u; diag_motors[1].m_control_mode=CONTROL_MODE_CURRENT; diag_motors[1].m_state=MC_STATE_RUNNING;
     confs[0].l_current_max=confs[1].l_current_max=15.0f;
     confs[0].l_current_min=confs[1].l_current_min=-15.0f;
@@ -602,7 +640,7 @@ int main(void){
         if(ai!=22 || !transact(da,(uint16_t)ai,r,&rn) || rn!=0u)return fail("detect all must start asynchronously");
         for(int z=0;z<100;z++){tick_ms++;vesc_protocol_periodic(tick_ms);}
         { uint8_t qv[1]={COMM_GET_VALUES}; if(!transact(qv,1u,r,&rn)||rn==0u||r[0]!=COMM_GET_VALUES)return fail("request/reply stalled during detect all"); }
-        if(!pump_until_cmd(28000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all result timeout");
+        if(!pump_until_cmd(45000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all result timeout");
         { int32_t ri=1; if(buffer_get_int16(r,&ri)<0)return fail("detect all returned failure"); }
         if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
         for(int m=0;m<2;m++){
@@ -612,8 +650,38 @@ int main(void){
         }
         if(!nearf32(confs[0].l_in_current_min,-8.0f,0.01f)||!nearf32(confs[1].l_in_current_max,8.0f,0.01f))return fail("detect all input-current apply");
         if(!nearf32(confs[0].foc_openloop_rpm,250.0f,0.01f)||!nearf32(confs[1].foc_sl_erpm,2500.0f,0.01f))return fail("detect all FOC setup fields");
+        for(int m=0;m<2;m++){
+            if(fabsf(confs[m].foc_motor_r-plant_r[m])>0.003f)return fail("detect all R identification");
+            if(fabsf(confs[m].foc_motor_l-plant_l[m])>0.00003f)return fail("detect all L identification");
+            if(fabsf(confs[m].foc_motor_flux_linkage-plant_flux[m])>0.0015f)return fail("detect all flux identification");
+            if(fabsf(confs[m].foc_current_kp-confs[m].foc_motor_l*1000.0f)>0.002f)return fail("detect all VESC Kp=L/tc");
+            if(fabsf(confs[m].foc_current_ki-confs[m].foc_motor_r*1000.0f)>0.2f)return fail("detect all VESC Ki=R/tc");
+        }
         uint8_t ena[6]={COMM_APP_DISABLE_OUTPUT,0u,0u,0u,0u,0u};
         if(!transact(ena,sizeof(ena),r,&rn))return fail("re-enable app output");
+    }
+    /* Detect-All failure must be transactional. A motor that does not build
+     * d-axis current still allows Hall sweep visibility, but R/L identification
+     * must reject it and preserve the last-known-good stored configuration. */
+    {
+        const mc_configuration keep0=confs[0], keep1=confs[1];
+        const unsigned sb0=store_count[0], sb1=store_count[1];
+        plant_fail_rl=true;
+        uint8_t da[22]={0}; int32_t ai=0;
+        da[ai++]=COMM_DETECT_APPLY_ALL_FOC; da[ai++]=1u;
+        buffer_append_float32(da,50.0f,1e3f,&ai);
+        buffer_append_float32(da,-8.0f,1e3f,&ai); buffer_append_float32(da,8.0f,1e3f,&ai);
+        buffer_append_float32(da,250.0f,1e3f,&ai); buffer_append_float32(da,2500.0f,1e3f,&ai);
+        if(!transact(da,(uint16_t)ai,r,&rn)||rn!=0u)return fail("detect all failure start");
+        if(!pump_until_cmd(40000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all failure result timeout");
+        {int32_t ri=1;if(buffer_get_int16(r,&ri)>=0)return fail("detect all false success on dead current plant");}
+        plant_fail_rl=false;
+        if(store_count[0]!=sb0||store_count[1]!=sb1)return fail("detect all failure must not store");
+        if(fabsf(confs[0].foc_motor_r-keep0.foc_motor_r)>1e-7f||
+           fabsf(confs[1].foc_motor_flux_linkage-keep1.foc_motor_flux_linkage)>1e-7f||
+           memcmp(confs[0].foc_hall_table,keep0.foc_hall_table,8)!=0||
+           memcmp(confs[1].foc_hall_table,keep1.foc_hall_table,8)!=0)
+            return fail("detect all failure rollback");
     }
     {
         uint8_t th[]={COMM_TERMINAL_CMD,'h','e','l','p'};

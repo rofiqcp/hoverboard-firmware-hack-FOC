@@ -216,6 +216,18 @@ typedef struct {
     uint8_t m_hall_last_reject_from;
     uint8_t m_hall_last_reject_to;
 
+    /* Detect-All R/L capture. Updated only on the motor's 5.333-kHz current
+     * regulator slot. The main loop starts/stops and snapshots it with IRQs
+     * masked, so no 64-bit accumulator can tear on Cortex-M3. */
+    volatile uint8_t m_rl_capture_active;
+    uint8_t m_rl_capture_have_prev;
+    int16_t m_rl_capture_prev_id_q4;
+    uint32_t m_rl_capture_n;
+    int64_t m_rl_sum_di2;
+    int64_t m_rl_sum_div;
+    int64_t m_rl_sum_dii;
+    int64_t m_rl_sum_di;
+
     int32_t m_iq_integrator;
     int32_t m_iq_set_ramp_q16;
     int32_t m_id_integrator;
@@ -382,6 +394,17 @@ void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
 bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);
 bool mcpwm_foc_hall_table_sane(const uint8_t table[8]);
+
+typedef struct {
+    uint32_t samples;
+    int64_t sum_di2;
+    int64_t sum_div;
+    int64_t sum_dii;
+    int64_t sum_di;
+} mcpwm_foc_rl_capture_t;
+void mcpwm_foc_rl_capture_start(bool is_second_motor);
+void mcpwm_foc_rl_capture_stop(bool is_second_motor);
+void mcpwm_foc_rl_capture_get(bool is_second_motor, mcpwm_foc_rl_capture_t *out);
 
 /* Hardware calibration / ISR diagnostics. */
 bool mcpwm_foc_dc_cal_done(void);

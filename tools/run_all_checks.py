@@ -123,7 +123,7 @@ def check_static():
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
-        'EE_CFG_SIGNATURE_VALUE 0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
+        'EE_CFG_SIGNATURE_VALUE 0x6021u' in mci and 'EE_CFG_SIGNATURE_V34   0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
         'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and \
         'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and \
         'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and \
@@ -140,7 +140,7 @@ def check_static():
         'EE_L_EXT6_ENCODER_RATIO_X10000_HI' in mci and 'EE_EXT7_DIRECTION_FLAGS = 186' in mci and \
         'EE_L_EXT7_ENCODER_OFFSET_F32_LO' in mci and 'EE_L_EXT7_ENCODER_RATIO_F32_LO' in mci and \
         'EE_L_EXT7_PID_KD_PROC_F32_LO' in mci and 'EE_L_EXT7_PID_GAIN_DEC_X10' in mci and \
-        'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
+        'EE_L_EXT9_R_LO' in mci and 'EE_R_EXT9_FLUX_HI' in mci and 'foc_hall_table' in mci, 'VESC 6.00 dual EEPROM persistence/migration missing'
     assert 'COMM_GET_DECODED_ADC' in vp and 'reply_decoded_adc' in vp, 'VESC decoded ADC command missing'
     assert 'board_temp_deg_c * 0.1f' in vp, 'VESC temperature telemetry must convert deci-C to C'
     assert 'mcpwm_foc_energy_update' in mc and 'v->amp_hours=m->m_amp_seconds/3600.0f' in mc and 'v->watt_hours=m->m_watt_seconds/3600.0f' in mc, 'VESC Ah/Wh live counters missing'
@@ -173,8 +173,8 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)207u\)', eeh), 'EEPROM virtual variable count mismatch'
-    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==207 and addrs[0]==1000 and addrs[-1]==1206 and addrs==list(range(1000,1207)), 'EEPROM VirtAddVarTab must exactly cover all 207 append-only variables'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)223u\)', eeh), 'EEPROM virtual variable count mismatch'
+    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==223 and addrs[0]==1000 and addrs[-1]==1222 and addrs==list(range(1000,1223)), 'EEPROM VirtAddVarTab must exactly cover all 223 append-only variables'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
