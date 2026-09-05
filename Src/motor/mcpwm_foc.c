@@ -1517,7 +1517,7 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
          * a synchronously switched zero vector. After the legacy command ramp
          * reaches zero, release the bridge. */
         if (!run_request || command == 0) {
-            mcpwm_foc_release_motor(second);
+            if(m->m_control_mode!=CONTROL_MODE_NONE) mcpwm_foc_release_motor(second);
         } else {
             /* Integer equivalent of the VESC duty setter for the legacy ISR
              * source. Do not execute software floating-point at 16 kHz. */
@@ -1527,7 +1527,7 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
         }
     } else if(mode==5u){
         if (!run_request) {
-            mcpwm_foc_release_motor(second);
+            if(m->m_control_mode!=CONTROL_MODE_NONE) mcpwm_foc_release_motor(second);
         } else {
             const int32_t user_target = second ? positionCommandR : positionCommandL;
             mcpwm_foc_set_position_counts(user_position_to_internal(user_target, second), second);
@@ -1541,7 +1541,7 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
         m->m_speed_set_rpm=(command<0)?-(int16_t)rpm:(command>0?(int16_t)rpm:0);
         m->m_phase_override=1;
     } else {
-        mcpwm_foc_release_motor(second);
+        if(m->m_control_mode!=CONTROL_MODE_NONE) mcpwm_foc_release_motor(second);
     }
 }
 
@@ -1652,7 +1652,7 @@ static uint8_t hall_midpoint200(uint8_t previous_center, int16_t center_delta) {
     return (uint8_t)edge;
 }
 
-static void hall_update(mcpwm_foc_motor_t *m, bool second) {
+static uint8_t hall_sample_state(mcpwm_foc_motor_t *m, bool second) {
     const uint8_t raw_h = hall_read(m,second);
 
     /* GPIO Hall inputs are asynchronous to the 16-kHz ADC ISR. One transient
@@ -1678,8 +1678,10 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
             m->m_hall_candidate_count = 0u;
         }
     }
+    return m->m_hall_state;
+}
 
-    const uint8_t h = m->m_hall_state;
+static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
     const uint8_t angle = hall_table_angle(m, h);
     const bool valid = (h != 0u && h != 7u && angle < 200u);
     if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
@@ -1928,6 +1930,11 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
     else if (pd < -(int16_t)max_step) m->m_phase_hall = (uint16_t)(m->m_phase_hall - (uint16_t)max_step);
     else m->m_phase_hall = desired;
 }
+
+static void hall_update(mcpwm_foc_motor_t *m, bool second) {
+    hall_process_state(m,second,hall_sample_state(m,second));
+}
+
 
 static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
     if (!encoder_port_active(m,second) || !m->m_encoder_configured || m->m_encoder_counts<4u) return;
@@ -2551,7 +2558,25 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     /* PB6/PB7 are mutually exclusive: once LEFT ABI owns TIM4, never sample
      * those lines as Hall V/W. Encoder raw/count/phase remains live even OFF. */
     if (encoder_port_active(m,second)) encoder_feedback_update(m,second);
-    else hall_update(m, second);
+    else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
+        /* Fixed-phase Hall detection only needs the debounced physical code. */
+        (void)hall_sample_state(m,second);
+    } else if (m->m_control_mode==CONTROL_MODE_NONE) {
+        /* Released motor: one Hall GPIO snapshot every ADC frame, but run the
+         * heavier edge estimator only when the debounced sector actually changes.
+         * Between edges only age the last period so passive/manual-spin telemetry
+         * remains real without paying closed-loop interpolation cost at 16 kHz. */
+        const uint8_t before=m->m_hall_state;
+        const uint8_t hs=hall_sample_state(m,second);
+        if(!m->m_hall_initialized || hs!=before){
+            hall_process_state(m,second,hs);
+        }else{
+            if(m->m_hall_ticks<0xffffu)m->m_hall_ticks++;
+            if(m->m_hall_ticks>MCCONF_HALL_TIMEOUT_TICKS){
+                m->m_rpm=0; m->m_hall_direction=0; m->m_hall_interp_active=0u;
+            }
+        }
+    } else hall_update(m, second);
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP) {
         openloop_update(m, second);
     } else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
@@ -2596,12 +2621,47 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         (encoder_feedback_selected(m,second) ? m->m_encoder_synced : hall_feedback_valid(m));
     const bool inactive = !source_enabled || !feedback_ready ||
         m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE;
-    /* On the two non-regulator slots an already inactive motor has no current
-     * transform or control state to update. Hall/encoder position and tacho above
-     * remain 16 kHz; OFF current telemetry is still refreshed on this motor's
-     * 5.33-kHz regulator slot. */
+    /* A released motor keeps Hall/encoder and passive-current telemetry live,
+     * but no closed-loop state needs to be reset on every 16-kHz frame. Release
+     * setters already reset PI/PID once on the mode transition. */
+    if (inactive && m->m_control_mode==CONTROL_MODE_NONE) {
+        m->m_state=MC_STATE_OFF;
+        m->m_current_in_counts=idc_counts; m->m_dq_sample_fresh=0u;
+        const bool passive_motion = (m->m_hall_direction != 0 && m->m_hall_ticks < MCCONF_HALL_TIMEOUT_TICKS) ||
+            (encoder_feedback_selected(m,second) && m->m_encoder_erpm_q16 != 0);
+        if(control_update){
+            const uint16_t ta=m->m_telem_current_filter_q16?m->m_telem_current_filter_q16:6553u;
+            int16_t td=0,tq=0;
+            if(passive_motion){
+                const int16_t i0_q4=phase_current_counts_to_q4(m,i0_counts);
+                const int16_t i1_q4=phase_current_counts_to_q4(m,i1_counts);
+                foc_ab_t ab; if(second)foc_clarke_bc_q4(i0_q4,i1_q4,&ab); else foc_clarke_ab_q4(i0_q4,i1_q4,&ab);
+                foc_dq_t raw; foc_park_q4(&ab,m->m_phase,&raw); td=raw.d; tq=raw.q;
+            }
+            m->m_id_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[0],ta,td);
+            m->m_iq_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[1],ta,tq);
+            m->m_current_in_telem_counts=telemetry_lpf_step(&m->m_telem_current_lpf_q16[2],ta,idc_counts);
+            telemetry_avg_push(m,m->m_id_telem_q4,m->m_iq_telem_q4,m->m_current_in_telem_counts);
+        }
+        m->m_i_alpha_q4=0; m->m_i_beta_q4=0; m->m_id_q4=0; m->m_iq_q4=0;
+        m->m_vd=0; m->m_vq=0; m->m_duty_now_permille=0;
+        m->m_ccr_a=pwm_res/2u; m->m_ccr_b=pwm_res/2u; m->m_ccr_c=pwm_res/2u;
+        m->m_isr_count++;
+        return;
+    }
+    /* On the two non-regulator slots an inactive non-NONE mode has no current
+     * transform or control state to update. */
     if (inactive && !control_update) {
         m->m_state=MC_STATE_OFF;
+        m->m_isr_count++;
+        return;
+    }
+    if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE && !control_update) {
+        /* Fixed electrical phase + held Vd/Vq means the two non-regulator PWM
+         * slots would reproduce identical SVPWM/CCRs. Keep hard DC protection
+         * in DMA1_Channel1, but skip redundant Clarke/Park/PI/SVPWM work here.
+         * The regulator slot remains PWM/3 = 5.333 kHz exactly as configured. */
+        m->m_state=MC_STATE_RUNNING;
         m->m_isr_count++;
         return;
     }
@@ -2974,7 +3034,6 @@ void DMA1_Channel1_IRQHandler(void) {
         filtLowPass32(adc_buffer.batt1, BAT_FILT_COEF, &batVoltageFixdt);
         batVoltage = (int16_t)(batVoltageFixdt >> 16);
     }
-
     /* VESC ownership is per motor. A right-motor forwarded command must not
      * accidentally energize a stale left control mode (and vice versa). */
     const uint8_t leftSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(false);

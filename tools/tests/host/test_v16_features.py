@@ -56,7 +56,7 @@ assert 'mc_interface_store_configuration_motor(second)' in vp and 'case COMM_SET
 assert 'm->m_iq_target_q4 != 0 || m->m_iq_set_q4 != 0' in mc and 'm->m_fault != FAULT_CODE_NONE' in mc
 assert (R/'tools/tests/hardware/test_hall_detect_repeat.py').exists()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
-assert 'COMM_DETECT_HALL_FOC, 60.0)' in dual
+assert 'COMM_DETECT_HALL_FOC, 90.0)' in dual
 
 # Upstream VESC reports zero public motor-current telemetry while released.
 # Keep the separately calibrated high-Z/raw ADC path diagnostic-only.

@@ -159,7 +159,7 @@ def check_static():
     assert 'alive_local' in vp and 'alive_right' in vp and 'mcpwm_foc_vesc_override_touch(alive_right)' in vp, 'COMM_ALIVE must bypass RX FIFO after CRC validation'
     assert 'vesc_protocol_link_active() ? 1u : 0u' in vp, 'diagnostic ARM must follow live VESC Tool/Python telemetry link'
     assert 'step>=64251u && step<=66873u' in mc and 'const float div=m->m_conf.p_pid_ang_div;' not in mc[mc.find('static void position_feedback_update'):mc.find('static void encoder_runtime_configure')], '16-kHz position feedback must not use soft-float comparisons'
-    assert 'elapsed_ms=(uint32_t)(now_ms-s_hall_detect.align_start_ms)' in vp and 'elapsed_ms < 1000u' in vp, 'Hall detect 1-s align ramp must use wall-clock time, not 1000 main-loop visits'
+    assert 'detect_time_now' in vp and 'return buzzerTimer;' in vp and 'PWM_FREQ / 1000u' in vp and 'detect_time_elapsed_ms(s_hall_detect.align_start_time, now_time)' in vp and 'elapsed_ms < 1000u' in vp, 'Hall/Detect-All timing must use DWT real elapsed time on hardware, not lossy SysTick/main-loop visits'
     assert 's_vesc_owned[2]' in mc and 's_vesc_timeout_ticks[2]' in mc, 'VESC ownership and timeout must be separate state'
     assert 'POWER_OFF_ENABLE          0' in cfg and 'POWER_BUTTON_BYPASS       1' in cfg, 'development power latch bypass missing'
     assert 'm_fault_recovery_ticks' in mc and 'm_fault_stop_time_ms' in mc, 'fault recovery timer missing'

@@ -493,6 +493,11 @@ int main(void){
         saf.l_min_vin=30.0f; saf.l_max_vin=50.0f;
         saf.l_temp_fet_start=60.0f; saf.l_temp_fet_end=65.0f;
         mcpwm_foc_set_configuration(&saf,false);
+        /* Isolate the VESC runtime-limit path from whatever legacy ctrlModReq
+         * a previous test case left behind. A real VESC SET_* command owns the
+         * motor before these limits are evaluated. */
+        mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
+        mcpwm_foc_vesc_override_touch(false);
         batVoltage=(int16_t)((4000L*BAT_CALIB_ADC)/BAT_CALIB_REAL_VOLTAGE); /* 40,00 V */
         m_motor_1.m_control_mode=CONTROL_MODE_CURRENT;
         m_motor_1.m_duty_now_permille=500;
@@ -500,13 +505,13 @@ int main(void){
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         mcpwm_foc_set_board_temperature_x10(250);
-        mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_iq_set_q4>5*FOC_CURRENT_Q4_PER_A+4)return fail("VESC watt max 100W @40V duty0.5");
         m_motor_1.m_duty_now_permille=500;
         m_motor_1.m_iq_target_q4=-10*FOC_CURRENT_Q4_PER_A;
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
-        mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_iq_set_q4<-(4*FOC_CURRENT_Q4_PER_A+4))return fail("VESC watt min -80W @40V duty0.5");
 
         /* Pada 62,5 C (tengah 60..65 C) batas arus harus sekitar 50%. */
@@ -515,7 +520,7 @@ int main(void){
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         mcpwm_foc_set_board_temperature_x10(625);
-        mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_iq_set_q4>7500*FOC_CURRENT_Q4_PER_A/1000+8)return fail("VESC FET temperature current derating");
 
         /* Fault temperatur menggunakan jalur DMA safety yang sama dengan board. */

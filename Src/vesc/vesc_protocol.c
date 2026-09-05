@@ -42,6 +42,7 @@
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
 extern volatile adc_buf_t adc_buffer;
+extern volatile uint32_t buzzerTimer;
 #ifdef STM32F103xE
 extern volatile uint32_t main_prof_vesc_max_cycles;
 extern volatile uint32_t main_prof_house_max_cycles;
@@ -133,8 +134,8 @@ typedef struct {
     uint8_t waiting_sample;
     uint16_t align_step;
     int16_t degree;
-    uint32_t align_start_ms;
-    uint32_t next_ms;
+    uint32_t align_start_time;
+    uint32_t next_time;
     float current_a;
     int64_t sum_s[8];
     int64_t sum_c[8];
@@ -158,8 +159,8 @@ typedef struct {
     uint8_t active;
     uint8_t motor_index;
     detect_all_stage_t stage;
-    uint32_t stage_start_ms;
-    uint32_t next_sample_ms;
+    uint32_t stage_start_time;
+    uint32_t next_sample_time;
     uint32_t sample_n;
     float max_power_loss;
     float min_current_in;
@@ -184,6 +185,8 @@ typedef struct {
 } detect_all_job_t;
 
 static detect_all_job_t s_detect_all;
+static int16_t s_detect_all_last_detail = 0;
+static uint32_t detect_time_now(void);
 static void hall_detect_periodic(uint32_t now_ms);
 static void detect_all_periodic(uint32_t now_ms);
 static void reply_mcconf(bool second, COMM_PACKET_ID id);
@@ -495,8 +498,9 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
 }
 
 void vesc_protocol_periodic(uint32_t now_ms) {
-    hall_detect_periodic(now_ms);
-    detect_all_periodic(now_ms);
+    const uint32_t detector_now = detect_time_now();
+    hall_detect_periodic(detector_now);
+    detect_all_periodic(detector_now);
     const disp_pos_mode mode = s_display_pos_mode;
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
@@ -1090,6 +1094,40 @@ static void reply_decoded_adc(void) {
     uart_send_payload(b, (uint16_t)i);
 }
 
+/* Detect timing is derived from the same 16-kHz ADC/PWM interrupt that
+ * drives FOC. This counter cannot lose ticks when the high-priority FOC ISR
+ * saturates the CPU, unlike SysTick/HAL_GetTick. Using PWM ticks also preserves
+ * the proven master hardware sampling cadence and adds no extra interrupt. */
+static uint32_t detect_time_now(void) {
+#ifdef STM32F103xE
+    return buzzerTimer;
+#else
+    return HAL_GetTick();
+#endif
+}
+
+static uint32_t detect_time_after_ms(uint32_t now, uint32_t ms) {
+#ifdef STM32F103xE
+    const uint32_t ticks_per_ms = (uint32_t)PWM_FREQ / 1000u;
+    return now + ticks_per_ms * ms;
+#else
+    return now + ms;
+#endif
+}
+
+static uint32_t detect_time_elapsed_ms(uint32_t start, uint32_t now) {
+#ifdef STM32F103xE
+    const uint32_t ticks_per_ms = (uint32_t)PWM_FREQ / 1000u;
+    return ticks_per_ms ? (uint32_t)(now - start) / ticks_per_ms : 0u;
+#else
+    return (uint32_t)(now - start);
+#endif
+}
+
+static bool detect_time_due(uint32_t now, uint32_t deadline) {
+    return (int32_t)(now - deadline) >= 0;
+}
+
 static uint8_t hall_detect_angle200(int64_t sum_s, int64_t sum_c, uint16_t n) {
     if (n <= 30u) return 255u;
     int64_t best_dot = INT64_MIN;
@@ -1121,8 +1159,8 @@ static void hall_detect_start_current(bool second, float current) {
     s_hall_detect.second = second ? 1u : 0u;
     s_hall_detect.stage = HALL_DETECT_ALIGN;
     s_hall_detect.current_a = current;
-    s_hall_detect.align_start_ms = HAL_GetTick();
-    s_hall_detect.next_ms = s_hall_detect.align_start_ms;
+    s_hall_detect.align_start_time = detect_time_now();
+    s_hall_detect.next_time = s_hall_detect.align_start_time;
     mc_interface_select_motor_thread(second ? 2 : 1);
     mcpwm_foc_set_openloop_phase(0.0f, 0.0f, second);
     mcpwm_foc_vesc_override_touch(second);
@@ -1231,7 +1269,7 @@ static void detect_all_finish(int16_t result) {
     detect_all_reply(result);
 }
 
-static void detect_all_start_rl(uint8_t mi, uint32_t now_ms) {
+static void detect_all_start_rl(uint8_t mi, uint32_t now_time) {
     s_detect_all.motor_index=mi;
     detect_all_apply_runtime(mi);
     const bool second=mi!=0u;
@@ -1246,8 +1284,8 @@ static void detect_all_start_rl(uint8_t mi, uint32_t now_ms) {
     mcpwm_foc_set_openloop_phase(lo,0.0f,second);
     mcpwm_foc_vesc_override_touch(second);
     s_detect_all.stage=DETECT_ALL_RL_ALIGN;
-    s_detect_all.stage_start_ms=now_ms;
-    s_detect_all.next_sample_ms=now_ms;
+    s_detect_all.stage_start_time=now_time;
+    s_detect_all.next_sample_time=now_time;
     detect_all_reset_sample();
 }
 
@@ -1284,7 +1322,7 @@ static void hall_detect_reply_and_stop(bool success) {
         }
         /* Both Hall maps are now known. Parameter identification is performed
          * one motor at a time to keep bus/current stress bounded. */
-        detect_all_start_rl(0u,HAL_GetTick());
+        detect_all_start_rl(0u,detect_time_now());
         return;
     }
 
@@ -1323,6 +1361,7 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     if(!(max_power_loss>=0.5f && max_power_loss<=5000.0f)){detect_all_reply(-1);return;}
 
     memset(&s_detect_all,0,sizeof(s_detect_all));
+    s_detect_all_last_detail=0;
     s_detect_all.active=1u;
     s_detect_all.stage=DETECT_ALL_HALL;
     s_detect_all.max_power_loss=max_power_loss;
@@ -1342,9 +1381,9 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     hall_detect_start_current(false,1.0f);
 }
 
-static void hall_detect_periodic(uint32_t now_ms) {
+static void hall_detect_periodic(uint32_t now_time) {
     if (!s_hall_detect.active) return;
-    if ((int32_t)(now_ms - s_hall_detect.next_ms) < 0) return;
+    if (!detect_time_due(now_time, s_hall_detect.next_time)) return;
     const bool second = s_hall_detect.second != 0u;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     mcpwm_foc_vesc_override_touch(second);
@@ -1356,14 +1395,14 @@ static void hall_detect_periodic(uint32_t now_ms) {
          * ISR, so counting 1000 scheduler visits can stretch one second into
          * tens of seconds (especially on motor 2). Drive the ramp from wall time
          * instead; skipped visits simply advance to the correct current. */
-        const uint32_t elapsed_ms=(uint32_t)(now_ms-s_hall_detect.align_start_ms);
+        const uint32_t elapsed_ms=detect_time_elapsed_ms(s_hall_detect.align_start_time, now_time);
         if (elapsed_ms < 1000u) {
             const uint16_t step=(uint16_t)(elapsed_ms+1u);
             s_hall_detect.align_step=step;
             const float i=s_hall_detect.current_a*(float)step/1000.0f;
             mcpwm_foc_set_openloop_phase(i,0.0f,second);
             mcpwm_foc_vesc_override_touch(second);
-            s_hall_detect.next_ms=now_ms+1u;
+            s_hall_detect.next_time=detect_time_after_ms(now_time,1u);
             return;
         }
         s_hall_detect.align_step=1000u;
@@ -1379,7 +1418,7 @@ static void hall_detect_periodic(uint32_t now_ms) {
         mcpwm_foc_set_openloop_phase(s_hall_detect.current_a, (float)s_hall_detect.degree, second);
         mcpwm_foc_vesc_override_touch(second);
         s_hall_detect.waiting_sample = 1u;
-        s_hall_detect.next_ms = now_ms + 5u;
+        s_hall_detect.next_time = detect_time_after_ms(now_time,5u);
         return;
     }
 
@@ -1412,7 +1451,17 @@ static void hall_detect_periodic(uint32_t now_ms) {
             s_hall_detect.degree--;
         }
     }
-    s_hall_detect.next_ms = now_ms;
+
+    /* Upstream blocking mcpwm_foc_hall_detect() sets the next 1-degree phase
+     * immediately after sampling the previous one, then sleeps 5 ms. Mirror
+     * that exactly in the cooperative worker: do not spend a second main-loop
+     * visit just to arm the next phase, which doubles sweep time under the
+     * high-load 16-kHz FOC ISR. */
+    mcpwm_foc_set_openloop_phase(s_hall_detect.current_a,
+                                 (float)s_hall_detect.degree, second);
+    mcpwm_foc_vesc_override_touch(second);
+    s_hall_detect.waiting_sample = 1u;
+    s_hall_detect.next_time = detect_time_after_ms(now_time,5u);
 }
 
 static bool detect_all_compute_rl(uint8_t mi) {
@@ -1466,25 +1515,25 @@ static void detect_all_finalize_motor(uint8_t mi) {
     c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
 }
 
-static void detect_all_periodic(uint32_t now_ms) {
+static void detect_all_periodic(uint32_t now_time) {
     if(!s_detect_all.active || s_detect_all.stage==DETECT_ALL_IDLE ||
        s_detect_all.stage==DETECT_ALL_HALL) return;
-    if((int32_t)(now_ms-s_detect_all.next_sample_ms)<0) return;
-    s_detect_all.next_sample_ms=now_ms+1u;
+    if(!detect_time_due(now_time,s_detect_all.next_sample_time)) return;
+    s_detect_all.next_sample_time=detect_time_after_ms(now_time,1u);
     const uint8_t mi=s_detect_all.motor_index;
     const bool second=mi!=0u;
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     const mc_fault_code fault=mc_interface_get_fault_motor(second);
     if(fault!=FAULT_CODE_NONE){detect_all_finish((int16_t)((int)fault-100));return;}
     mcpwm_foc_vesc_override_touch(second);
-    const uint32_t elapsed=(uint32_t)(now_ms-s_detect_all.stage_start_ms);
+    const uint32_t elapsed=detect_time_elapsed_ms(s_detect_all.stage_start_time,now_time);
 
     switch(s_detect_all.stage){
     case DETECT_ALL_RL_ALIGN:
         if(elapsed>=400u){
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_RL_LOW;
-            s_detect_all.stage_start_ms=now_ms;
+            s_detect_all.stage_start_time=now_time;
         }
         break;
     case DETECT_ALL_RL_LOW:
@@ -1493,19 +1542,20 @@ static void detect_all_periodic(uint32_t now_ms) {
         s_detect_all.sum_i_raw+=m->m_id_q4;
         s_detect_all.sum_v_raw+=m->m_vd;
         s_detect_all.sample_n++;
-        if(elapsed>=250u){
-            if(s_detect_all.sample_n<40u){detect_all_finish(-10);return;}
+        if(elapsed>=250u && s_detect_all.sample_n>=20u){
             const double n=(double)s_detect_all.sample_n;
             s_detect_all.low_i[mi]=(float)(s_detect_all.sum_i/n);
             s_detect_all.low_v[mi]=(float)(s_detect_all.sum_v/n);
             s_detect_all.low_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.low_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
-            if(fabsf(s_detect_all.low_i[mi])<0.20f){detect_all_finish(-10);return;}
+            if(fabsf(s_detect_all.low_i[mi])<0.20f){s_detect_all_last_detail=2;detect_all_finish(-10);return;}
             mcpwm_foc_rl_capture_start(second);
             mcpwm_foc_set_openloop_phase(s_detect_all.current_high,0.0f,second);
             mcpwm_foc_vesc_override_touch(second);
             s_detect_all.stage=DETECT_ALL_RL_STEP;
-            s_detect_all.stage_start_ms=now_ms;
+            s_detect_all.stage_start_time=now_time;
+        } else if(elapsed>=2000u && s_detect_all.sample_n<20u){
+            s_detect_all_last_detail=1; detect_all_finish(-10); return;
         }
         break;
     case DETECT_ALL_RL_STEP:
@@ -1513,7 +1563,7 @@ static void detect_all_periodic(uint32_t now_ms) {
             mcpwm_foc_rl_capture_stop(second);
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_RL_HIGH;
-            s_detect_all.stage_start_ms=now_ms;
+            s_detect_all.stage_start_time=now_time;
         }
         break;
     case DETECT_ALL_RL_HIGH:
@@ -1522,14 +1572,13 @@ static void detect_all_periodic(uint32_t now_ms) {
         s_detect_all.sum_i_raw+=m->m_id_q4;
         s_detect_all.sum_v_raw+=m->m_vd;
         s_detect_all.sample_n++;
-        if(elapsed>=250u){
-            if(s_detect_all.sample_n<40u){detect_all_finish(-10);return;}
+        if(elapsed>=250u && s_detect_all.sample_n>=20u){
             const double n=(double)s_detect_all.sample_n;
             s_detect_all.high_i[mi]=(float)(s_detect_all.sum_i/n);
             s_detect_all.high_v[mi]=(float)(s_detect_all.sum_v/n);
             s_detect_all.high_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.high_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
-            if(!detect_all_compute_rl(mi)){detect_all_finish(-10);return;}
+            if(!detect_all_compute_rl(mi)){s_detect_all_last_detail=4;detect_all_finish(-10);return;}
             s_detect_all.flux_current=0.70f;
             if(s_detect_all.flux_current>s_detect_all.imax[mi]*0.25f)
                 s_detect_all.flux_current=s_detect_all.imax[mi]*0.25f;
@@ -1537,7 +1586,9 @@ static void detect_all_periodic(uint32_t now_ms) {
             s_detect_all.flux_target_erpm=600.0f;
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
-            s_detect_all.stage_start_ms=now_ms;
+            s_detect_all.stage_start_time=now_time;
+        } else if(elapsed>=2000u && s_detect_all.sample_n<20u){
+            s_detect_all_last_detail=3; detect_all_finish(-10); return;
         }
         break;
     case DETECT_ALL_FLUX_RAMP: {
@@ -1548,7 +1599,7 @@ static void detect_all_periodic(uint32_t now_ms) {
         if(elapsed>=1200u){
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_SAMPLE;
-            s_detect_all.stage_start_ms=now_ms;
+            s_detect_all.stage_start_time=now_time;
         }
         break;
     }
@@ -1559,25 +1610,26 @@ static void detect_all_periodic(uint32_t now_ms) {
         s_detect_all.sum_v+=fabs((double)mcpwm_foc_get_vq_motor(second));
         s_detect_all.sum_erpm+=fabs((double)mcpwm_foc_get_erpm_motor(second));
         s_detect_all.sample_n++;
-        if(elapsed>=800u){
-            if(s_detect_all.sample_n<100u){detect_all_finish(-10);return;}
+        if(elapsed>=800u && s_detect_all.sample_n>=40u){
             const double n=(double)s_detect_all.sample_n;
             const double iq=s_detect_all.sum_i/n;
             const double vq=s_detect_all.sum_v/n;
             const double erpm=s_detect_all.sum_erpm/n;
             if(erpm<(double)s_detect_all.flux_target_erpm*0.50 ||
-               erpm>(double)s_detect_all.flux_target_erpm*1.60){detect_all_finish(-10);return;}
+               erpm>(double)s_detect_all.flux_target_erpm*1.60){s_detect_all_last_detail=6;detect_all_finish(-10);return;}
             const double omega=erpm*6.28318530717958647692/60.0;
             const double bemf=vq-(double)s_detect_all.r[mi]*iq;
-            if(bemf<=0.02 || omega<=1.0){detect_all_finish(-10);return;}
+            if(bemf<=0.02 || omega<=1.0){s_detect_all_last_detail=7;detect_all_finish(-10);return;}
             const double flux=bemf/omega;
-            if(!(flux>=0.0001 && flux<=1.0)){detect_all_finish(-10);return;}
+            if(!(flux>=0.0001 && flux<=1.0)){s_detect_all_last_detail=8;detect_all_finish(-10);return;}
             s_detect_all.flux[mi]=(float)flux;
             detect_all_finalize_motor(mi);
             mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
-            if(mi==0u){detect_all_start_rl(1u,now_ms);}
+            if(mi==0u){detect_all_start_rl(1u,now_time);}
             else detect_all_finish(2);
+        } else if(elapsed>=3000u && s_detect_all.sample_n<40u){
+            s_detect_all_last_detail=5; detect_all_finish(-10); return;
         }
         break;
     default:
@@ -1887,7 +1939,25 @@ static void process_terminal_command(bool second, const uint8_t *data, uint16_t 
     }
 
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
-        terminal_send_text("Commands: help, status, faults, stop, fw\n");
+        terminal_send_text("Commands: help, status, detect, faults, stop, fw\n");
+        return;
+    }
+    if (strcmp(cmd, "detect") == 0) {
+        char out[220];
+        const uint8_t mi=s_detect_all.motor_index<2u?s_detect_all.motor_index:0u;
+        const int written=snprintf(out,sizeof(out),
+            "dall=%u st=%u mi=%u n=%lu det=%d hdet=%u:%u p=%u d=%d loI=%ld hiI=%ld loV=%ld hiV=%ld Rm=%ld Lu=%ld Fm=%ld fault=%u/%u\n",
+            (unsigned)s_detect_all.active,(unsigned)s_detect_all.stage,(unsigned)s_detect_all.motor_index,
+            (unsigned long)s_detect_all.sample_n,(int)s_detect_all_last_detail,
+            (unsigned)s_hall_detect.active,(unsigned)s_hall_detect.second,
+            (unsigned)s_hall_detect.pass,(int)s_hall_detect.degree,
+            (long)(s_detect_all.low_i[mi]*1000.0f),(long)(s_detect_all.high_i[mi]*1000.0f),
+            (long)(s_detect_all.low_v[mi]*1000.0f),(long)(s_detect_all.high_v[mi]*1000.0f),
+            (long)(s_detect_all.r[mi]*1000.0f),(long)(s_detect_all.l[mi]*1000000.0f),
+            (long)(s_detect_all.flux[mi]*1000.0f),
+            (unsigned)mcpwm_foc_get_motor_const(false)->m_fault,
+            (unsigned)mcpwm_foc_get_motor_const(true)->m_fault);
+        if(written>0)terminal_send_text(out);
         return;
     }
     if (strcmp(cmd, "stop") == 0) {
@@ -1905,10 +1975,13 @@ static void process_terminal_command(bool second, const uint8_t *data, uint16_t 
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
         char out[180];
         const int written = snprintf(out, sizeof(out),
-            "id=%u fault=%u hall=%u erpm=%ld duty=%ld/1000 Vin=%ldmV Iq=%ldmA Id=%ldmA\n",
+            "id=%u fault=%u hall=%u erpm=%ld duty=%ld/1000 Vin=%ldmV Iq=%ldmA Id=%ldmA hdet=%u:%u p=%u d=%d w=%u\n",
             (unsigned)v.vesc_id, (unsigned)v.fault_code, (unsigned)m->m_hall_state,
             (long)v.rpm, (long)(v.duty_now * 1000.0f), (long)(v.v_in * 1000.0f),
-            (long)(v.iq * 1000.0f), (long)(v.id * 1000.0f));
+            (long)(v.iq * 1000.0f), (long)(v.id * 1000.0f),
+            (unsigned)s_hall_detect.active, (unsigned)s_hall_detect.second,
+            (unsigned)s_hall_detect.pass, (int)s_hall_detect.degree,
+            (unsigned)s_hall_detect.waiting_sample);
         if (written > 0) terminal_send_text(out);
         return;
     }

@@ -825,7 +825,7 @@ class VescDual:
         # Bare-metal F103 runs the VESC-compatible 1-degree, 3F+3R Hall sweep
         # cooperatively while the 16-kHz FOC ISR stays live. Under load this can
         # legitimately exceed 20 s; VESC Tool waits for the asynchronous reply.
-        p = self.transact(self.fwd(req) if right else req, COMM_DETECT_HALL_FOC, 60.0)
+        p = self.transact(self.fwd(req) if right else req, COMM_DETECT_HALL_FOC, 90.0)
         if len(p) != 10:
             raise ValueError(f"unexpected Hall detect reply length {len(p)}")
         table = list(p[1:9])
@@ -885,13 +885,18 @@ class VescDual:
         return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
 
     def diag(self, right: bool = False) -> Diag:
-        # Diagnostic reply is now ~122 bytes. At 115200 baud it can overlap a
-        # 40-60 Hz command refresher, so allow one longer transaction/retry.
+        # Diagnostic reply can overlap a previous endpoint reply on the single
+        # UART transport. Filter by embedded VESC ID exactly like values().
+        expected_id = RIGHT_ID if right else 1
         last = None
-        for _ in range(2):
+        for _ in range(3):
             try:
-                return parse_diag(self.custom_transact(HB_GET_DIAG, right=right, timeout=max(self.timeout, 0.60)))
-            except TimeoutError as exc:
+                p = self.custom_transact(HB_GET_DIAG, right=right, timeout=max(self.timeout, 1.20))
+                d = parse_diag(p)
+                if d.vesc_id == expected_id:
+                    return d
+                last = RuntimeError(f"stale diagnostic endpoint id={d.vesc_id}, expected={expected_id}")
+            except (TimeoutError, RuntimeError) as exc:
                 last = exc
         raise last
 
