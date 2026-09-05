@@ -36,6 +36,14 @@ volatile int32_t positionCommandL = 0;
 volatile int32_t positionCommandR = 0;
 
 volatile uint32_t foc_isr_cycles = 0;
+volatile uint8_t encoder_detect_stage = 0u;
+static inline void encoder_stage_set(uint8_t stage) {
+    encoder_detect_stage = stage;
+#ifdef STM32F103xE
+    volatile uint32_t *const w = (volatile uint32_t *)0x2000BFFCu;
+    *w = (*w & 0xFFFFFF00u) | (uint32_t)stage;
+#endif
+}
 volatile uint32_t foc_isr_cycles_max = 0;
 volatile uint32_t foc_isr_pre_max_cycles = 0;
 volatile uint32_t foc_isr_control_max_cycles = 0;
@@ -296,6 +304,19 @@ static int16_t current_circle_iq_limit_q4(const mcpwm_foc_motor_t *m, int16_t iq
     return (int16_t)CLAMP((int32_t)iq_cmd_q4, -qmax, qmax);
 }
 
+
+static void foc_bounded_delay_ms(uint32_t ms) {
+    if (ms == 0u) return;
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0u) {
+        HAL_Delay(ms);
+        return;
+    }
+    const uint32_t cycles_per_ms = 64000u;
+    while (ms-- > 0u) {
+        const uint32_t start = DWT->CYCCNT;
+        while ((uint32_t)(DWT->CYCCNT - start) < cycles_per_ms) { (void)DWT->CYCCNT; }
+    }
+}
 
 static void foc_isr_monitor_end(uint32_t start) {
     uint32_t elapsed = DWT->CYCCNT - start;
@@ -1287,7 +1308,7 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     /* Incremental A/B has no absolute rotor zero after reset. Align electrical
      * phase 0 with low Id, then choose the ABI counter value that satisfies the
      * persisted VESC equation: phase=(inverted?360-raw:raw)*ratio-offset. */
-    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t) HAL_Delay(1u);
+    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t) foc_bounded_delay_ms(1u);
     if(!mcpwm_foc_dc_cal_done()) return false;
 
     float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
@@ -1297,13 +1318,13 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
         const float i=current*(float)t/(float)MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;
         mcpwm_foc_set_openloop_phase(i,0.0f,false);
         mcpwm_foc_vesc_override_touch(false);
-        HAL_Delay(1u);
+        foc_bounded_delay_ms(1u);
         if(m->m_fault!=FAULT_CODE_NONE) goto align_fail;
     }
     for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS;++t){
         mcpwm_foc_set_openloop_phase(current,0.0f,false);
         mcpwm_foc_vesc_override_touch(false);
-        HAL_Delay(1u);
+        foc_bounded_delay_ms(1u);
         if(m->m_fault!=FAULT_CODE_NONE) goto align_fail;
     }
 
@@ -1323,10 +1344,10 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     const uint32_t before=encoder_read_raw_count();
     for(uint32_t t=1u;t<=100u;++t){
         mcpwm_foc_set_openloop_phase(current,30.0f*(float)t/100.0f,false);
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
+        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
         if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
     }
-    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);HAL_Delay(1u);}
+    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
     const uint32_t jog=encoder_read_raw_count();
     int32_t dj=(int32_t)jog-(int32_t)before;
     const int32_t half=(int32_t)(counts/2u);
@@ -1340,10 +1361,10 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
        (dj>0?1:-1)!=expected_sign)goto align_fail;
     for(int32_t t=99;t>=0;--t){
         mcpwm_foc_set_openloop_phase(current,30.0f*(float)t/100.0f,false);
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
+        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
         if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
     }
-    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);HAL_Delay(1u);}
+    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
     const uint32_t back=encoder_read_raw_count();
     int32_t db=(int32_t)back-(int32_t)before;
     if(db>half)db-=(int32_t)counts; else if(db<-half)db+=(int32_t)counts;
@@ -1370,6 +1391,7 @@ bool mcpwm_foc_encoder_is_synced(bool second) {
     return !second && m_motor_1.m_encoder_configured && m_motor_1.m_encoder_synced;
 }
 
+
 static float encoder_detect_angle_diff(float a, float b) {
     float d=a-b;
     while(d>180.0f)d-=360.0f;
@@ -1388,24 +1410,28 @@ static bool encoder_detect_move(mcpwm_foc_motor_t *m, float current,
            (dir<0.0f && *phase_cont<target_cont))*phase_cont=target_cont;
         mcpwm_foc_set_openloop_phase(current,encoder_norm_deg(*phase_cont),false);
         mcpwm_foc_vesc_override_touch(false);
-        HAL_Delay(2u);
+        foc_bounded_delay_ms(2u);
         if(m->m_fault!=FAULT_CODE_NONE)return false;
     }
     return true;
 }
 
 bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *ratio, bool *inverted) {
+    encoder_stage_set(1u);
+    uint8_t fail_code=0u;
     if(offset)*offset=1001.0f;
     if(ratio)*ratio=0.0f;
     if(inverted)*inverted=false;
-    if(second)return false;
+    if(second){encoder_stage_set(0xE1u);return false;}
     mcpwm_foc_motor_t *m=&m_motor_1;
-    if(!encoder_port_active(m,false) || !m->m_encoder_configured)return false;
+    if(!encoder_port_active(m,false) || !m->m_encoder_configured){encoder_stage_set(0xE2u);return false;}
+    encoder_stage_set(2u);
     if(current<0.20f)current=0.20f;
     if(current>1.0f)current=1.0f;
     if(current>m->m_conf.l_current_max)current=m->m_conf.l_current_max;
-    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
-    if(!mcpwm_foc_dc_cal_done())return false;
+    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)foc_bounded_delay_ms(1u);
+    if(!mcpwm_foc_dc_cal_done()){encoder_stage_set(0xE3u);return false;}
+    encoder_stage_set(3u);
 
     /* Steering-safe VESC ABI detection.
      *
@@ -1426,43 +1452,45 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     mcpwm_foc_release_motor(false);
     for(uint32_t t=1u;t<=250u;++t){
         mcpwm_foc_set_openloop_phase(current*(float)t/250.0f,0.0f,false);
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
-        if(m->m_fault!=FAULT_CODE_NONE)goto detect_fail;
+        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
+        if(m->m_fault!=FAULT_CODE_NONE){fail_code=1u; goto detect_fail;}
     }
     for(uint32_t t=0u;t<400u;++t){
         mcpwm_foc_set_openloop_phase(current,0.0f,false);
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
-        if(m->m_fault!=FAULT_CODE_NONE)goto detect_fail;
+        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
+        if(m->m_fault!=FAULT_CODE_NONE){fail_code=2u; goto detect_fail;}
     }
 
+    encoder_stage_set(4u);
     encoder_runtime_set_deg(m,0.0f);
     float phase_cont=0.0f;
     float plus_sum=0.0f, minus_sum=0.0f;
     const int samples=3;
     for(int pass=0;pass<samples;++pass){
-        if(!encoder_detect_move(m,current,&phase_cont,60.0f))goto detect_fail;
-        HAL_Delay(150u);
+        if(!encoder_detect_move(m,current,&phase_cont,60.0f)){fail_code=3u; goto detect_fail;}
+        foc_bounded_delay_ms(150u);
         plus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
-        if(!encoder_detect_move(m,current,&phase_cont,0.0f))goto detect_fail;
-        HAL_Delay(150u);
-        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f)goto detect_fail;
+        if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=4u; goto detect_fail;}
+        foc_bounded_delay_ms(150u);
+        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=5u; goto detect_fail;}
 
-        if(!encoder_detect_move(m,current,&phase_cont,-60.0f))goto detect_fail;
-        HAL_Delay(150u);
+        if(!encoder_detect_move(m,current,&phase_cont,-60.0f)){fail_code=6u; goto detect_fail;}
+        foc_bounded_delay_ms(150u);
         minus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
-        if(!encoder_detect_move(m,current,&phase_cont,0.0f))goto detect_fail;
-        HAL_Delay(150u);
-        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f)goto detect_fail;
+        if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=7u; goto detect_fail;}
+        foc_bounded_delay_ms(150u);
+        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=8u; goto detect_fail;}
     }
 
+    encoder_stage_set(5u);
     const float plus=plus_sum/(float)samples;
     const float minus=minus_sum/(float)samples;
     /* The two probes must move in opposite directions with similar magnitude. */
-    if(fabsf(plus)<0.5f || fabsf(minus)<0.5f || plus*minus>=0.0f)goto detect_fail;
+    if(fabsf(plus)<0.5f || fabsf(minus)<0.5f || plus*minus>=0.0f){fail_code=9u; goto detect_fail;}
     const float mag=0.5f*(fabsf(plus)+fabsf(minus));
-    if(fabsf(fabsf(plus)-fabsf(minus))>mag*0.35f)goto detect_fail;
+    if(fabsf(fabsf(plus)-fabsf(minus))>mag*0.35f){fail_code=10u; goto detect_fail;}
     float rat=roundf(60.0f/mag);
-    if(!(rat>=1.0f && rat<=100.0f))goto detect_fail;
+    if(!(rat>=1.0f && rat<=100.0f)){fail_code=11u; goto detect_fail;}
     /* Positive electrical command causing negative ABI motion means inversion. */
     const bool inv=plus<0.0f;
 
@@ -1470,7 +1498,7 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
      * poles. This catches phase/open-wire slip before closed-loop torque is
      * armed, while still allowing a fresh config to correct a stale value. */
     const float configured=(float)MCCONF_POLE_PAIRS_LEFT;
-    if(configured>=1.0f && fabsf(rat-configured)>2.0f)goto detect_fail;
+    if(configured>=1.0f && fabsf(rat-configured)>2.0f){fail_code=12u; goto detect_fail;}
 
     encoder_runtime_set_deg(m,0.0f);
     if(offset)*offset=0.0f;
@@ -1479,12 +1507,14 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
+    encoder_stage_set(6u);
     return true;
 
 detect_fail:
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
+    encoder_stage_set((uint8_t)(0xA0u | (fail_code & 0x1Fu)));
     return false;
 }
 

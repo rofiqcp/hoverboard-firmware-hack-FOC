@@ -1789,6 +1789,12 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,mcpwm_foc_get_position_user_counts(false),&j);
         buffer_append_int32(b,mcpwm_foc_get_position_target_user_counts(false),&j);
         buffer_append_int32(b,(int32_t)lroundf(mc_interface_get_steering_deg()*1000.0f),&j);
+        /* Project diagnostic extension after the stable steering prefix. */
+        b[j++]=(uint8_t)mcpwm_foc_get_motor_const(false)->m_conf.m_sensor_port_mode;
+        b[j++]=(uint8_t)mcpwm_foc_get_motor_const(false)->m_conf.foc_sensor_mode;
+        b[j++]=mcpwm_foc_get_motor_const(false)->m_encoder_configured?1u:0u;
+        b[j++]=(uint8_t)mcpwm_foc_get_motor_const(false)->m_fault;
+        buffer_append_uint32(b,mcpwm_foc_get_motor_const(false)->m_encoder_raw_count,&j);
         uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_SET_STEERING_DEG) {
@@ -2105,6 +2111,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     const uint16_t n = (uint16_t)(len - 1u);
     int32_t k = 0;
     mc_interface_select_motor_thread(second ? 2 : 1);
+#ifdef STM32F103xE
+    *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC0000000u | ((uint32_t)(second ? 1u : 0u) << 8) | ((uint32_t)id & 0xFFu);
+#endif
 
     switch (id) {
     case COMM_FW_VERSION:
@@ -2285,12 +2294,18 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         }
         break;
     case COMM_DETECT_ENCODER: {
+#ifdef STM32F103xE
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC100001Bu;
+#endif
         float off=1001.0f, ratio=0.0f; bool inv=false;
         float current=MCCONF_STEERING_HOME_CURRENT_A;
         if(n>=4u) current=(float)buffer_get_int32(d,&k)/1000.0f;
         if(current<0.30f)current=0.30f;
         if(current>MCCONF_STEERING_CAL_CURRENT_MAX_A)current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
         app_vesc_disable_output(60000);
+#ifdef STM32F103xE
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC200001Bu;
+#endif
         int32_t raw_left=0,raw_right=0,span=0;
         const bool ok=!second && mc_interface_steering_detect_calibrate(
             current,&off,&ratio,&inv,&raw_left,&raw_right,&span);
@@ -2329,6 +2344,8 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
          * sengaja tidak mengeksekusi register Cortex-M agar unit test aman. */
         mc_interface_release_motor();
 #ifdef STM32F103xE
+        *(volatile uint32_t *)F103_RESET_REASON_ADDR = F103_RESET_REASON_REBOOT;
+        __DSB();
         NVIC_SystemReset();
 #endif
         break;

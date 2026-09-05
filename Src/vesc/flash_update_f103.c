@@ -100,6 +100,7 @@ void f103_fw_reset_to_bootloader(void) {
     volatile uint32_t *const request = (volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
     request[0] = F103_BOOT_REQUEST_MAGIC;
     request[1] = F103_BOOT_REQUEST_MAGIC_INV;
+    *(volatile uint32_t *)F103_RESET_REASON_ADDR = F103_RESET_REASON_FW_UPDATE;
     __DSB();
     __ISB();
     NVIC_SystemReset();

@@ -83,6 +83,11 @@ void Input_Init(void) {
    * Defaults remain active when EEPROM is blank or incompatible. */
   (void)mc_interface_load_configuration_motor(false);
   (void)mc_interface_load_configuration_motor(true);
+  /* Blank/incompatible EEPROM leaves the safe compiled LEFT config active,
+   * but no set_configuration() call has necessarily initialized the shared
+   * PB6/PB7 ABI peripheral. Always materialize the selected LEFT sensor mode
+   * into hardware at boot; encoder sync itself remains false until alignment. */
+  mcpwm_foc_refresh_encoder_configuration(false, true);
   /* Steering span is project calibration, intentionally independent from
    * standard VESC MC configuration signature. */
   (void)mc_interface_load_steering_calibration();

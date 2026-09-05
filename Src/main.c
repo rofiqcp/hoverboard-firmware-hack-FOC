@@ -10,6 +10,7 @@
 #include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
 #include "vesc/vesc_protocol.h"
+#include "vesc/f103_boot_layout.h"
 #include "vesc/app_vesc.h"
 #include "comms.h"
 
@@ -37,6 +38,9 @@ extern volatile int16_t foc_idL_q4;
 extern volatile int16_t foc_idR_q4;
 
 volatile uint32_t main_loop_counter = 0;
+volatile uint32_t boot_reset_csr = 0u;
+volatile uint32_t boot_reset_reason = 0u;
+volatile uint32_t boot_reset_stage = 0u;
 volatile uint32_t main_prof_vesc_max_cycles = 0u;
 volatile uint32_t main_prof_house_max_cycles = 0u;
 volatile uint32_t main_prof_tail_max_cycles = 0u;
@@ -132,6 +136,15 @@ static uint8_t controllerFaultActive(void) {
 }
 
 int main(void) {
+  /* Capture the reset source before HAL/application code can obscure it, then
+   * clear sticky RCC reset flags so the next reboot has an unambiguous cause. */
+#ifdef STM32F103xE
+  boot_reset_csr = RCC->CSR;
+  boot_reset_reason = *(volatile uint32_t *)F103_RESET_REASON_ADDR;
+  boot_reset_stage = *(volatile uint32_t *)F103_RESET_STAGE_ADDR;
+  *(volatile uint32_t *)F103_RESET_REASON_ADDR = 0u;
+  RCC->CSR |= RCC_CSR_RMVF;
+#endif
   HAL_Init();
   __HAL_RCC_AFIO_CLK_ENABLE();
   HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);

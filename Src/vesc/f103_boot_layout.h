@@ -20,6 +20,13 @@
 #define F103_BOOT_REQUEST_MAGIC      0x46574F54u /* 'FWOT' */
 #define F103_BOOT_REQUEST_MAGIC_INV  ((uint32_t)~F103_BOOT_REQUEST_MAGIC)
 
+/* Remaining two reserved SRAM words form a reset black-box. They survive
+ * NVIC_SystemReset and are outside .bss/.data by linker reservation. */
+#define F103_RESET_REASON_ADDR       0x2000BFF8u
+#define F103_RESET_STAGE_ADDR        0x2000BFFCu
+#define F103_RESET_REASON_REBOOT     0x52454254u /* 'REBT' */
+#define F103_RESET_REASON_FW_UPDATE  0x46575550u /* 'FWUP' */
+
 #define F103_BOOT_BASE_ADDR       0x08000000u
 #define F103_BOOT_SIZE            0x00002800u /* 10 KiB / 5 pages */
 #define F103_APP_BASE_ADDR        0x08002800u
