@@ -7,6 +7,7 @@ if str(TOOLS_DIR) not in sys.path:
 import argparse,csv,struct,time
 from vesc_dual import VescDual
 COMM_SET_DUTY=5
+COMM_SET_CURRENT=6
 COMM_ALIVE=30
 
 def send(link,right,cmd,payload=b''):
@@ -14,10 +15,13 @@ def send(link,right,cmd,payload=b''):
     with link.io_lock: link.send(link.fwd(pkt) if right else pkt)
 
 def set_duty(link,right,d): send(link,right,COMM_SET_DUTY,struct.pack('>i',int(round(d*100000.0))))
+def release(link,right): send(link,right,COMM_SET_CURRENT,struct.pack('>i',0))
 def alive(link,right): send(link,right,COMM_ALIVE)
 def stop_all(link):
+    # COMM_SET_CURRENT(0) maps to mcpwm_foc_release_motor(). Do not use
+    # COMM_SET_DUTY(0): VESC defines zero duty as an actively driven zero-vector.
     for r in (False,True):
-        try: set_duty(link,r,0.0); alive(link,r)
+        try: release(link,r); alive(link,r)
         except Exception: pass
 
 def main():
@@ -31,7 +35,7 @@ def main():
     ap.add_argument('--max-erpm',type=float,default=15000.0)
     ap.add_argument('--out',default='tools/results_duty100.csv')
     a=ap.parse_args()
-    steps=[0.0,.05,.10,.15,.20,.25,.30,.35,.40,.45,.50,.55,.60,.65,.70,.75,.80,.85,.90,.95,1.00,0.0,-.05,-.10,-.15,-.20,-.25,-.30,-.35,-.40,-.45,-.50,-.55,-.60,-.65,-.70,-.75,-.80,-.85,-.90,-.95,-1.00,0.0]
+    steps=[0.0,.05,.10,.15,.20,.25,.30,.35,.40,.45,.50,.55,.60,.65,.70,.75,.80,.85,.90,.95,1.00,.95,.90,.85,.80,.75,.70,.65,.60,.55,.50,.45,.40,.35,.30,.25,.20,.15,.10,.05,0.0,-.05,-.10,-.15,-.20,-.25,-.30,-.35,-.40,-.45,-.50,-.55,-.60,-.65,-.70,-.75,-.80,-.85,-.90,-.95,-1.00,-.95,-.90,-.85,-.80,-.75,-.70,-.65,-.60,-.55,-.50,-.45,-.40,-.35,-.30,-.25,-.20,-.15,-.10,-.05,0.0]
     motors=[]
     if a.motor in ('left','both'): motors.append((False,'left'))
     if a.motor in ('right','both'): motors.append((True,'right'))
@@ -58,7 +62,7 @@ def main():
                     if peak_erpm>a.max_erpm: raise RuntimeError(f'{name}: ERPM guard {peak_erpm:.0f} at {duty*100:.0f}%')
                     time.sleep(max(0.0,1.0/a.hz))
                 print(f'{name} cmd={duty*100:5.1f}% actual={v.duty*100:6.2f}% erpm={v.rpm:8.1f} Im={v.current_motor:6.3f}A Ib={v.current_in:6.3f}A Id={v.id:6.3f}A Iq={v.iq:6.3f}A fault={v.fault} trips={dg.current_trips or 0}')
-            set_duty(link,right,0.0); alive(link,right); time.sleep(.5)
+            release(link,right); alive(link,right); time.sleep(.5)
             print(f'=== {name.upper()} PASS +/-100% NORMALIZED (EFeru physical ceiling) ===')
     finally:
         stop_all(link); link.close()

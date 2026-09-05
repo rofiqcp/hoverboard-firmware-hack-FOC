@@ -100,6 +100,8 @@
  * sebelum masuk ISR; jangan ubah menjadi mechanical RPM karena pole-pair bisa
  * berbeda antar motor dan dapat diubah dari VESC Tool. */
 #define MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT    500u
+/* Upstream VESC default: 3 extra samples => 7 instantaneous GPIO reads with majority vote. */
+#define MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT       3u
 #define MCCONF_FOC_CONTROL_DIV                  3u
 /* Hall timeout must be longer than one Hall sector at low VESC ERPM.
  * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.

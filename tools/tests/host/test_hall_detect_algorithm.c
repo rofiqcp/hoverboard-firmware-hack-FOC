@@ -166,6 +166,71 @@ int main(void){
     if(m_motor_1.m_hall_state!=h1)return fail("stable Hall transition acceptance");
     if(abs((int)(m_motor_1.m_position_counts-pos_before))!=1)return fail("stable Hall transition position count");
 
+    /* Hall-only fail-safe: unlike full VESC this board has no sensorless
+     * observer fallback. A debounced 000/111 reading must therefore drop Hall
+     * estimator lock and clear the live torque reference. When a valid Hall
+     * code returns, re-sync directly to that calibrated sector without
+     * inventing a skipped edge/tachometer count from the stale pre-fault state. */
+    {
+        const int32_t pos_valid=m_motor_1.m_position_counts;
+        const int32_t tach_valid=m_motor_1.m_tachometer;
+        const uint32_t reject_valid=m_motor_1.m_hall_sequence_reject_count;
+        set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,0u);
+        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_hall_state!=0u || m_motor_1.m_hall_initialized || m_motor_1.m_hall_direction!=0)
+            return fail("invalid Hall must drop estimator lock");
+        if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)
+            return fail("invalid Hall must remove closed-loop torque");
+        if(m_motor_1.m_position_counts!=pos_valid || m_motor_1.m_tachometer!=tach_valid)
+            return fail("invalid Hall must not create position/tachometer edge");
+
+        const uint8_t reconnect=left_raw_for_sector[0]; /* deliberately non-adjacent to h1 */
+        set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,reconnect);
+        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        if(!m_motor_1.m_hall_initialized || m_motor_1.m_hall_state!=reconnect)
+            return fail("valid Hall reconnect must re-sync estimator");
+        if(m_motor_1.m_position_counts!=pos_valid || m_motor_1.m_tachometer!=tach_valid)
+            return fail("Hall reconnect must not synthesize skipped edge");
+        if(m_motor_1.m_hall_sequence_reject_count!=reject_valid)
+            return fail("Hall reconnect must not count stale-state sequence reject");
+        const uint16_t reconnect_phase=(uint16_t)(((uint32_t)tl[reconnect]*65536u)/200u);
+        if(m_motor_1.m_phase_hall!=reconnect_phase)
+            return fail("Hall reconnect must use calibrated sector center");
+        mcpwm_foc_set_current(0.2f,false); mcpwm_foc_vesc_override_touch(false);
+        mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_phase!=m_motor_1.m_phase_hall)
+            return fail("closed-loop Hall phase after reconnect");
+
+        /* A stable non-adjacent code is electrically impossible at this
+         * sampled speed envelope. It must be rejected, must not leak into the
+         * Hall phase, and must release closed-loop drive. */
+        const uint8_t skipped=left_raw_for_sector[3];
+        const uint16_t phase_before_reject=m_motor_1.m_phase_hall;
+        const int32_t pos_before_reject=m_motor_1.m_position_counts;
+        const int32_t tach_before_reject=m_motor_1.m_tachometer;
+        const uint32_t rejects_before=m_motor_1.m_hall_sequence_reject_count;
+        set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,skipped);
+        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_hall_sequence_reject_count!=rejects_before+1u)
+            return fail("stable skipped Hall state must count one sequence reject");
+        if(m_motor_1.m_phase_hall!=phase_before_reject)
+            return fail("rejected Hall state must not leak into FOC phase");
+        if(m_motor_1.m_position_counts!=pos_before_reject || m_motor_1.m_tachometer!=tach_before_reject)
+            return fail("rejected Hall state must not create position/tachometer edge");
+        if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_state!=MC_STATE_OFF)
+            return fail("stable skipped Hall state must release closed-loop motor");
+
+        /* Returning to the last accepted Hall state clears the feedback mismatch
+         * but does not synthesize motion. A fresh command is required to drive. */
+        set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,reconnect);
+        for(uint8_t n=0u;n<MCCONF_HALL_DEBOUNCE_SAMPLES;++n)mcpwm_foc_adc_int_handler();
+        if(m_motor_1.m_position_counts!=pos_before_reject || m_motor_1.m_tachometer!=tach_before_reject)
+            return fail("Hall sequence recovery must not synthesize motion");
+        if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)
+            return fail("Hall sequence recovery must remain released until fresh command");
+        mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
+    }
+
     /* A malformed Hall table arriving through SET_MCCONF must never replace
      * the last-known-good angle map used by active FOC. */
     uint8_t good_table[8]; memcpy(good_table,m_motor_1.m_conf.foc_hall_table,8);

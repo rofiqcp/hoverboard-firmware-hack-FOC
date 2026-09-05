@@ -56,13 +56,16 @@ assert 'mc_interface_store_configuration_motor(second)' in vp and 'case COMM_SET
 assert 'm->m_iq_target_q4 != 0 || m->m_iq_set_q4 != 0' in mc and 'm->m_fault != FAULT_CODE_NONE' in mc
 assert (R/'tools/tests/hardware/test_hall_detect_repeat.py').exists()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
-assert 'COMM_DETECT_HALL_FOC, 20.0)' in dual
+assert 'COMM_DETECT_HALL_FOC, 60.0)' in dual
 
 # Upstream VESC reports zero public motor-current telemetry while released.
 # Keep the separately calibrated high-Z/raw ADC path diagnostic-only.
 assert 'leftOffTelemValid' in mc and 'rightOffTelemValid' in mc and 'off_telem_deadband_counts' in mc
 assert 'm_id_telem_q4' in mc and 'm_current_in_telem_counts' in mc
-off=mc[mc.index('if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE'):mc.index('return;',mc.index('if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE'))]
+assert 'const bool inactive = !source_enabled || !feedback_ready ||' in mc
+assert 'if (inactive && !control_update)' in mc
+idx=mc.index('if (inactive) {')
+off=mc[idx:mc.index('return;',idx)]
 for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0'):
     assert token in off, token
 for token in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
@@ -85,6 +88,7 @@ assert 'rotor stream local value' in host and 'rotor stream right value' in host
 
 
 assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'
+assert 'MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT' in mcc and 'm_hall_filter_window' in mc and 'm_hall_sample_history[41]' in mch and 'exactly one GPIO snapshot' in mc, 'bounded VESC Hall extra-sample rolling-majority filter missing'
 assert 'MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES' in mcc and 'm_hall_direction_stable_edges' in mc, 'Hall reversal/acceleration warmup missing'
 assert 'm_brake_direction' not in mch and 'm_brake_current_q4' in mch and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc
 assert 'm->m_hall_ticks>fresh' in mc and 'MCCONF_TRQ_STOP_RPM_DEADBAND' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc
@@ -95,6 +99,11 @@ assert 'MCCONF_POSITION_SETTLE_MS' not in mc and 'MCCONF_POSITION_SETTLE_MS' not
 
 assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not reject direction reversals'
 assert 'hall_table_runtime_sane' in mc and 'Preserve the last known-good table' in mc, 'runtime Hall-table validation missing'
+assert 'hall_feedback_valid' in mc and 'angle==m->m_hall_pos_prev' in mc, 'rejected Hall state must be excluded from feedback-ready gate'
+assert 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc, 'post-control Hall readiness/MOE race guard missing'
+assert 'stable non-adjacent Hall transition' in mc and 'mcpwm_foc_release_motor(second)' in mc, 'Hall sequence reject must release closed-loop drive'
+assert vp.count('s_detect_all.sl_erpm=buffer_get_float32(data,1e3f,&k);') == 1, 'Detect-All must consume exactly one sl_erpm field from VESC Tool packet'
+assert 'mcpwm_foc_hall_table_sane(table)' in vp, 'VESC Tool Hall-detect reply must reject unsafe table geometry'
 assert 'Standard VESC OPENLOOP_CURRENT' in mc and 'm->m_iq_target_q4=amp_to_q4(m,current)' in mc and '60*(int64_t)PWM_FREQ' in mc, 'standard VESC openloop must rotate signed Iq at electrical RPM without pole-pair multiplication'
 assert 'hall-phase' in (R/'tools/vesc_debug.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_debug.py').read_text(), 'active Hall phase-check utility missing'
 

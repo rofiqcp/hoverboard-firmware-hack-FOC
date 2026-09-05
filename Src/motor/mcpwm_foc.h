@@ -42,6 +42,10 @@ typedef struct {
      * implement vd_int += Ierr*Ki*dt; vd = vd_int + Ierr*Kp exactly. */
     uint32_t m_current_kpq_v_q16, m_current_kiq_dt_v_q16;
     uint32_t m_current_kpd_v_q16, m_current_kid_dt_v_q16;
+    /* Precomputed VESC physical PI gains per Q4-current-count, Q8 scaling.
+     * ISR uses multiply+shift only; no Cortex-M3 software 64-bit division. */
+    uint32_t m_current_kpq_err_q8, m_current_kiq_err_q8;
+    uint32_t m_current_kpd_err_q8, m_current_kid_err_q8;
     volatile uint16_t m_kps_q11, m_kis_q16, m_kds_q11;
     /* Precomputed speed-PID coefficients. Configuration may use float, but the
      * 16-kHz ISR executes multiply+shift only (no __aeabi_ldivmod). */
@@ -170,6 +174,17 @@ typedef struct {
     uint8_t m_hall_candidate_state;
     uint8_t m_hall_candidate_count;
     uint8_t m_hall_debounce_initialized;
+    /* VESC m_hall_extra_samples adapted to the EFeru hard realtime path:
+     * rolling 1+2N sample majority using one synchronized GPIO snapshot per
+     * 16-kHz ADC frame. O(1) update avoids repeated GPIO loops inside ISR. */
+    uint8_t m_hall_sample_history[41];
+    uint8_t m_hall_sample_index;
+    uint8_t m_hall_sample_count;
+    uint8_t m_hall_sample_sum_u;
+    uint8_t m_hall_sample_sum_v;
+    uint8_t m_hall_sample_sum_w;
+    uint8_t m_hall_filter_window;
+    uint8_t m_hall_filter_delay_ticks;
     uint8_t m_hall_direction_stable_edges;
     uint8_t m_hall_pos;
     uint8_t m_hall_pos_prev;
@@ -366,6 +381,7 @@ void mcpwm_foc_refresh_position_configuration(bool is_second_motor);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
 bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);
+bool mcpwm_foc_hall_table_sane(const uint8_t table[8]);
 
 /* Hardware calibration / ISR diagnostics. */
 bool mcpwm_foc_dc_cal_done(void);

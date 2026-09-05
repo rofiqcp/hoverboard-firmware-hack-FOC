@@ -66,7 +66,7 @@ def check_static():
     assert 'CONTROL_MODE_HANDBRAKE' in mc and 'm->m_phase=0u' in mc and 'mcpwm_foc_set_handbrake' in mc, 'VESC handbrake fixed-phase mode missing'
     assert 'leftDqFresh=m_motor_1.m_dq_sample_fresh' in mc and 'rightDqFresh=m_motor_2.m_dq_sample_fresh' in mc and 'leftDqFresh&&leftPhaseExceeded' in mc and 'rightDqFresh&&rightPhaseExceeded' in mc and 'leftDcTrip = leftCurrentSampleValid' in mc and 'rightDcTrip = rightCurrentSampleValid' in mc, 'D/Q ABS must use distinct fresh samples while raw DC trip remains active every driven ISR'
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
-    assert 'Safety gate phase 2' in mc and 'if(leftDriveRequest && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update'
+    assert 'Safety gate phase 2' in mc and 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc and 'if(leftDriveRequest && leftFeedbackReadyPost && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update and post-Hall readiness check'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
     assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)' in mc and 'motor_pole_pairs(second)' in mc, 'VESC mc_values.rpm must be atomic ERPM'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
@@ -123,7 +123,7 @@ def check_static():
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
-        'EE_CFG_SIGNATURE_VALUE 0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
+        'EE_CFG_SIGNATURE_VALUE 0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
         'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and \
         'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and \
         'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and \
@@ -157,6 +157,9 @@ def check_static():
         pos=vp.find(setter)
         assert pos >= 0 and vp.rfind('touch_motor(second)', max(0,pos-140), pos) >= 0, f'VESC ownership must be claimed before {setter}'
     assert 'alive_local' in vp and 'alive_right' in vp and 'mcpwm_foc_vesc_override_touch(alive_right)' in vp, 'COMM_ALIVE must bypass RX FIFO after CRC validation'
+    assert 'vesc_protocol_link_active() ? 1u : 0u' in vp, 'diagnostic ARM must follow live VESC Tool/Python telemetry link'
+    assert 'step>=64251u && step<=66873u' in mc and 'const float div=m->m_conf.p_pid_ang_div;' not in mc[mc.find('static void position_feedback_update'):mc.find('static void encoder_runtime_configure')], '16-kHz position feedback must not use soft-float comparisons'
+    assert 'elapsed_ms=(uint32_t)(now_ms-s_hall_detect.align_start_ms)' in vp and 'elapsed_ms < 1000u' in vp, 'Hall detect 1-s align ramp must use wall-clock time, not 1000 main-loop visits'
     assert 's_vesc_owned[2]' in mc and 's_vesc_timeout_ticks[2]' in mc, 'VESC ownership and timeout must be separate state'
     assert 'POWER_OFF_ENABLE          0' in cfg and 'POWER_BUTTON_BYPASS       1' in cfg, 'development power latch bypass missing'
     assert 'm_fault_recovery_ticks' in mc and 'm_fault_stop_time_ms' in mc, 'fault recovery timer missing'
@@ -170,13 +173,15 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)205u\)', eeh), 'EEPROM virtual variable count mismatch'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)207u\)', eeh), 'EEPROM virtual variable count mismatch'
+    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==207 and addrs[0]==1000 and addrs[-1]==1206 and addrs==list(range(1000,1207)), 'EEPROM VirtAddVarTab must exactly cover all 207 append-only variables'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
     assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'
     assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*252K', lds), 'linker must reserve final 4 KiB for two EEPROM pages'
     mainc=(ROOT/'Src/main.c').read_text()
+    assert '!vescLinkActive && !timeoutFlgSerial && enable == 0' in mainc, 'legacy blocking enable handshake must be suppressed while VESC link is armed'
     assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
     assert 'feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);' in mainc, 'custom telemetry right Vq sign not normalized'
     h=hashlib.sha256((ROOT/'Src/vesc/datatypes.h').read_bytes()).hexdigest()

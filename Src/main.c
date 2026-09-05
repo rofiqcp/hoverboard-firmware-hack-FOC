@@ -141,7 +141,7 @@ int main(void) {
   HAL_NVIC_SetPriority(SVCall_IRQn, 0, 0);
   HAL_NVIC_SetPriority(DebugMonitor_IRQn, 0, 0);
   HAL_NVIC_SetPriority(PendSV_IRQn, 0, 0);
-  HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
 
   SystemClock_Config();
   cycleCounterInit();
@@ -193,7 +193,11 @@ int main(void) {
     app_vesc_process(HAL_GetTick());
     mcpwm_foc_energy_update(HAL_GetTick());
 
-    if (!timeoutFlgSerial && enable == 0 && !controllerFaultActive() &&
+    /* Legacy serial has its own enable/beep handshake. A live VESC binary link
+     * is armed by valid VESC traffic and must never enter this blocking ~300-ms
+     * legacy sequence; otherwise VESC Tool/Python telemetry can time out exactly
+     * when a motor command is first issued. */
+    if (!vescLinkActive && !timeoutFlgSerial && enable == 0 && !controllerFaultActive() &&
         input1[0].cmd > -50 && input1[0].cmd < 50 && input2[0].cmd > -50 && input2[0].cmd < 50) {
       beepShort(6);
       beepShort(4);
@@ -362,5 +366,5 @@ void SystemClock_Config(void) {
   HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
 
   /* SysTick_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
 }

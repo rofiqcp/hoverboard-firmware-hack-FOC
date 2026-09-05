@@ -45,6 +45,16 @@ extern volatile adc_buf_t adc_buffer;
 extern volatile uint32_t main_prof_vesc_max_cycles;
 extern volatile uint32_t main_prof_house_max_cycles;
 extern volatile uint32_t main_prof_tail_max_cycles;
+extern volatile uint32_t foc_isr_pre_max_cycles;
+extern volatile uint32_t foc_isr_control_max_cycles;
+extern volatile uint32_t foc_isr_post_max_cycles;
+extern volatile uint32_t foc_step_left_max_cycles;
+extern volatile uint32_t foc_step_right_max_cycles;
+extern volatile uint32_t foc_slot_max_cycles[3];
+extern volatile uint32_t foc_prof_sensor_max_cycles;
+extern volatile uint32_t foc_prof_current_max_cycles;
+extern volatile uint32_t foc_prof_regulator_max_cycles;
+extern volatile uint32_t foc_prof_svpwm_max_cycles;
 #else
 volatile uint32_t main_prof_vesc_max_cycles = 0u;
 volatile uint32_t main_prof_house_max_cycles = 0u;
@@ -122,6 +132,7 @@ typedef struct {
     uint8_t waiting_sample;
     uint16_t align_step;
     int16_t degree;
+    uint32_t align_start_ms;
     uint32_t next_ms;
     float current_a;
     int64_t sum_s[8];
@@ -457,7 +468,10 @@ void vesc_protocol_periodic(uint32_t now_ms) {
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
     s_display_prev_ms = now_ms;
-    if (!vesc_protocol_link_active()) return;
+    /* COMM_SET_DETECT explicitly enables VESC Tool rotor-position streaming.
+     * Upstream keeps display_position_mode active until another SET_DETECT
+     * changes/disables it; do not couple this stream to the generic UART
+     * link-hold timeout. Solicited traffic is still protected below. */
     /* Do not delay a solicited VESC Tool reply. Upstream uses a separate packet
      * transport thread; on this small bare-metal target we skip one 10-ms rotor
      * sample whenever RX/TX is busy instead of blocking realtime traffic. */
@@ -568,52 +582,58 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
     if (selective) buffer_append_uint32(b, mask, &i);
 
 #ifdef STM32F103xE
-    if (!selective && mask == 0xffffffffu) {
-        /* Fast path untuk halaman realtime VESC Tool. STM32F103 tidak punya FPU;
-         * mengubah seluruh snapshot ke float lalu kembali ke integer wire membatasi
-         * GET_VALUES ~25 Hz. Snapshot scaled menjaga layout VESC 6.00 identik dan
-         * membuat current/RPM/Vdq serialization murni integer. */
+    {
+        /* STM32F103 has no FPU. Use the integer-scaled snapshot for both full
+         * and selective GET_VALUES so telemetry latency stays bounded while
+         * the 16-kHz FOC ISR is active. Selective polling previously fell back
+         * to the soft-float path and could exceed the host timeout under load. */
         mcpwm_foc_values_scaled_t v;
         uint32_t pv0=DWT->CYCCNT;
         mcpwm_foc_get_values_scaled(&v, second);
         uint32_t pv1=DWT->CYCCNT;
-        if((uint32_t)(pv1-pv0)>s_prof_values_snapshot_max_cycles)s_prof_values_snapshot_max_cycles=(uint32_t)(pv1-pv0);
+        uint32_t dt=(uint32_t)(pv1-pv0);
+        if(dt>s_prof_values_snapshot_max_cycles)s_prof_values_snapshot_max_cycles=dt;
         const mc_configuration *conf=(const mc_configuration *)mc_interface_get_configuration_motor(second);
         const int32_t dir=(conf && conf->m_invert_direction)?-1:1;
-        buffer_append_int16(b, board_temp_deg_c, &i);
-        buffer_append_int16(b, 0, &i);
-        buffer_append_int32(b, v.current_motor_x100, &i);
-        buffer_append_int32(b, v.current_in_x100, &i);
-        buffer_append_int32(b, v.id_x100, &i);
-        buffer_append_int32(b, dir*v.iq_x100, &i);
-        buffer_append_int16(b, (int16_t)(dir*(int32_t)v.duty_x1000), &i);
-        buffer_append_int32(b, dir*v.erpm, &i);
-        buffer_append_int16(b, v.vin_x10, &i);
-        buffer_append_int32(b, v.ah_x10000, &i);
-        buffer_append_int32(b, v.ah_charged_x10000, &i);
-        buffer_append_int32(b, v.wh_x10000, &i);
-        buffer_append_int32(b, v.wh_charged_x10000, &i);
-        buffer_append_int32(b, dir*v.tachometer, &i);
-        buffer_append_int32(b, v.tachometer_abs, &i);
-        b[i++]=v.fault;
-        /* Posisi tetap memakai transformasi user VESC (encoder inversion,
-         * m_invert_direction, p_pid_offset). Ini satu-satunya float di fast path. */
-        uint32_t pv2=DWT->CYCCNT;
-        buffer_append_float32(b, mc_interface_get_pid_pos_now_motor(second), 1e6f, &i);
-        uint32_t pv3=DWT->CYCCNT;
-        if((uint32_t)(pv3-pv2)>s_prof_values_position_max_cycles)s_prof_values_position_max_cycles=(uint32_t)(pv3-pv2);
-        b[i++]=second?VESC_SECOND_MOTOR_ID:VESC_LOCAL_ID;
-        buffer_append_int16(b, board_temp_deg_c, &i);
-        buffer_append_int16(b, board_temp_deg_c, &i);
-        buffer_append_int16(b, board_temp_deg_c, &i);
-        buffer_append_int32(b, v.vd_x1000, &i);
-        buffer_append_int32(b, dir*v.vq_x1000, &i);
-        b[i++]=0u;
+        if(mask&(1u<<0)) buffer_append_int16(b, board_temp_deg_c, &i);
+        if(mask&(1u<<1)) buffer_append_int16(b, 0, &i);
+        if(mask&(1u<<2)) buffer_append_int32(b, v.current_motor_x100, &i);
+        if(mask&(1u<<3)) buffer_append_int32(b, v.current_in_x100, &i);
+        if(mask&(1u<<4)) buffer_append_int32(b, v.id_x100, &i);
+        if(mask&(1u<<5)) buffer_append_int32(b, dir*v.iq_x100, &i);
+        if(mask&(1u<<6)) buffer_append_int16(b, (int16_t)(dir*(int32_t)v.duty_x1000), &i);
+        if(mask&(1u<<7)) buffer_append_int32(b, dir*v.erpm, &i);
+        if(mask&(1u<<8)) buffer_append_int16(b, v.vin_x10, &i);
+        if(mask&(1u<<9)) buffer_append_int32(b, v.ah_x10000, &i);
+        if(mask&(1u<<10)) buffer_append_int32(b, v.ah_charged_x10000, &i);
+        if(mask&(1u<<11)) buffer_append_int32(b, v.wh_x10000, &i);
+        if(mask&(1u<<12)) buffer_append_int32(b, v.wh_charged_x10000, &i);
+        if(mask&(1u<<13)) buffer_append_int32(b, dir*v.tachometer, &i);
+        if(mask&(1u<<14)) buffer_append_int32(b, v.tachometer_abs, &i);
+        if(mask&(1u<<15)) b[i++]=v.fault;
+        if(mask&(1u<<16)) {
+            uint32_t pv2=DWT->CYCCNT;
+            buffer_append_float32(b, mc_interface_get_pid_pos_now_motor(second), 1e6f, &i);
+            uint32_t pv3=DWT->CYCCNT;
+            dt=(uint32_t)(pv3-pv2);
+            if(dt>s_prof_values_position_max_cycles)s_prof_values_position_max_cycles=dt;
+        }
+        if(mask&(1u<<17)) b[i++]=second?VESC_SECOND_MOTOR_ID:VESC_LOCAL_ID;
+        if(mask&(1u<<18)) {
+            buffer_append_int16(b, board_temp_deg_c, &i);
+            buffer_append_int16(b, board_temp_deg_c, &i);
+            buffer_append_int16(b, board_temp_deg_c, &i);
+        }
+        if(mask&(1u<<19)) buffer_append_int32(b, v.vd_x1000, &i);
+        if(mask&(1u<<20)) buffer_append_int32(b, dir*v.vq_x1000, &i);
+        if(mask&(1u<<21)) b[i++]=0u;
         uint32_t pv4=DWT->CYCCNT;
-        if((uint32_t)(pv4-pv3)>s_prof_values_serialize_max_cycles)s_prof_values_serialize_max_cycles=(uint32_t)(pv4-pv3);
+        dt=(uint32_t)(pv4-pv1);
+        if(dt>s_prof_values_serialize_max_cycles)s_prof_values_serialize_max_cycles=dt;
         uart_send_payload(b,(uint16_t)i);
         uint32_t pv5=DWT->CYCCNT;
-        if((uint32_t)(pv5-pv4)>s_prof_values_tx_max_cycles)s_prof_values_tx_max_cycles=(uint32_t)(pv5-pv4);
+        dt=(uint32_t)(pv5-pv4);
+        if(dt>s_prof_values_tx_max_cycles)s_prof_values_tx_max_cycles=dt;
         return;
     }
 #endif
@@ -1068,7 +1088,8 @@ static void hall_detect_start_current(bool second, float current) {
     s_hall_detect.second = second ? 1u : 0u;
     s_hall_detect.stage = HALL_DETECT_ALIGN;
     s_hall_detect.current_a = current;
-    s_hall_detect.next_ms = HAL_GetTick();
+    s_hall_detect.align_start_ms = HAL_GetTick();
+    s_hall_detect.next_ms = s_hall_detect.align_start_ms;
     mc_interface_select_motor_thread(second ? 2 : 1);
     mcpwm_foc_set_openloop_phase(0.0f, 0.0f, second);
     mcpwm_foc_vesc_override_touch(second);
@@ -1127,7 +1148,7 @@ static void hall_detect_reply_and_stop(bool success) {
         table[h]=a;
         if(a==255u)fails++;
     }
-    if(fails!=2u)success=false;
+    if(fails!=2u || !mcpwm_foc_hall_table_sane(table))success=false;
     const bool second=s_hall_detect.second!=0u;
     mc_interface_select_motor_thread(second?2:1);
     mc_interface_release_motor();
@@ -1211,14 +1232,23 @@ static void hall_detect_periodic(uint32_t now_ms) {
     if (m->m_fault != FAULT_CODE_NONE) { hall_detect_reply_and_stop(false); return; }
 
     if (s_hall_detect.stage == HALL_DETECT_ALIGN) {
-        if (s_hall_detect.align_step < 1000u) {
-            s_hall_detect.align_step++;
-            const float i = s_hall_detect.current_a * (float)s_hall_detect.align_step / 1000.0f;
-            mcpwm_foc_set_openloop_phase(i, 0.0f, second);
+        /* The upstream detector ramps alignment current for about one second.
+         * On this bare-metal target the main loop is preempted by the 16-kHz FOC
+         * ISR, so counting 1000 scheduler visits can stretch one second into
+         * tens of seconds (especially on motor 2). Drive the ramp from wall time
+         * instead; skipped visits simply advance to the correct current. */
+        const uint32_t elapsed_ms=(uint32_t)(now_ms-s_hall_detect.align_start_ms);
+        if (elapsed_ms < 1000u) {
+            const uint16_t step=(uint16_t)(elapsed_ms+1u);
+            s_hall_detect.align_step=step;
+            const float i=s_hall_detect.current_a*(float)step/1000.0f;
+            mcpwm_foc_set_openloop_phase(i,0.0f,second);
             mcpwm_foc_vesc_override_touch(second);
-            s_hall_detect.next_ms = now_ms + 1u;
+            s_hall_detect.next_ms=now_ms+1u;
             return;
         }
+        s_hall_detect.align_step=1000u;
+        mcpwm_foc_set_openloop_phase(s_hall_detect.current_a,0.0f,second);
         s_hall_detect.stage = HALL_DETECT_SWEEP;
         s_hall_detect.pass = 0u;
         s_hall_detect.degree = 0;
@@ -1435,7 +1465,10 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         b[i++] = ds.hall;
         b[i++] = mcpwm_foc_vesc_override_active(second) ? 1u : 0u;
         b[i++] = s_last_hall_store_ok[second ? 1u : 0u];
-        b[i++] = 0u;
+        /* Logical ARM follows a live VESC binary link (VESC Tool or Python).
+         * This is intentionally distinct from motor-command ownership above:
+         * telemetry alone arms the control link, but never energizes the bridge. */
+        b[i++] = vesc_protocol_link_active() ? 1u : 0u;
         buffer_append_int32(b, q4_to_milliamps_normalized(ds.iq_target, second), &i);
         buffer_append_int32(b, q4_to_milliamps_normalized(ds.iq_set, second), &i);
         buffer_append_int32(b, q4_to_milliamps_normalized(ds.iq, second), &i);
@@ -1516,8 +1549,16 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint32(b,s_prof_values_position_max_cycles,&i);
             buffer_append_uint32(b,s_prof_values_serialize_max_cycles,&i);
             buffer_append_uint32(b,s_prof_values_tx_max_cycles,&i);
+            /* Keep diagnostic reply below the 256-byte local payload buffer.
+             * Pre/post were measured separately during profiling; retain the
+             * actionable control/step maxima plus explicit overrun counters. */
+            buffer_append_uint32(b,foc_prof_sensor_max_cycles,&i);
+            buffer_append_uint32(b,foc_prof_current_max_cycles,&i);
+            buffer_append_uint32(b,foc_prof_regulator_max_cycles,&i);
+            buffer_append_uint32(b,foc_prof_svpwm_max_cycles,&i);
+            buffer_append_uint32(b,m_motor_1.m_overrun_count+m_motor_2.m_overrun_count,&i);
 #else
-            for(uint8_t pi=0u;pi<4u;++pi)buffer_append_uint32(b,0u,&i);
+            for(uint8_t pi=0u;pi<9u;++pi)buffer_append_uint32(b,0u,&i);
 #endif
         }
         if ((uint32_t)i <= sizeof(b)) uart_send_payload(b, (uint16_t)i);

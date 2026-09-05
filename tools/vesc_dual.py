@@ -254,6 +254,7 @@ class Diag:
     hall: int
     override: bool
     hall_store_ok: bool
+    link_armed: bool
     iq_target_a: float
     iq_ref_a: float
     iq_a: float
@@ -327,7 +328,7 @@ class Diag:
     def short(self) -> str:
         return (
             f"id={self.vesc_id} mode={self.control_mode} state={self.state} fault={self.fault} "
-            f"hall={self.hall} own={int(self.override)} Iq_tgt={self.iq_target_a:.3f}A "
+            f"hall={self.hall} arm={int(self.link_armed)} own={int(self.override)} Iq_tgt={self.iq_target_a:.3f}A "
             f"Iq_ref={self.iq_ref_a:.3f}A Iq={self.iq_a:.3f}A Id={self.id_a:.3f}A "
             f"erpm={self.erpm} duty={100*self.duty:.2f}% pos={self.position} "
             f"target={self.position_target} trips={self.current_trips} hall_bad={self.hall_invalid}"
@@ -357,7 +358,7 @@ def parse_diag(payload: bytes) -> Diag:
         raise RuntimeError(f"diagnostic command failed status={status}")
     if len(payload) < 78:
         raise ValueError(f"short diagnostic reply: {len(payload)}")
-    vid, mode, state, fault, hall, own, store_ok, _reserved = struct.unpack_from(">8B", payload, 6)
+    vid, mode, state, fault, hall, own, store_ok, link_armed = struct.unpack_from(">8B", payload, 6)
     vals = struct.unpack_from(">10i", payload, 14)
     hall_invalid, trips, rx_ok, rx_crc = struct.unpack_from(">4I", payload, 54)
     table = list(payload[70:78])
@@ -417,7 +418,7 @@ def parse_diag(payload: bytes) -> Diag:
         ext.update(rx_queue_highwater=rxhi, process_gap_max_ms=gapmax)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
-        override=bool(own), hall_store_ok=bool(store_ok),
+        override=bool(own), hall_store_ok=bool(store_ok), link_armed=bool(link_armed),
         iq_target_a=vals[0] / 1000.0, iq_ref_a=vals[1] / 1000.0,
         iq_a=vals[2] / 1000.0, id_a=vals[3] / 1000.0,
         erpm=vals[4], duty=vals[5] / 100000.0,
@@ -815,7 +816,10 @@ class VescDual:
         if current_a <= 0.0:
             raise ValueError("Hall detect current must be > 0 A")
         req = bytes((COMM_DETECT_HALL_FOC,)) + struct.pack(">i", round(current_a * 1000.0))
-        p = self.transact(self.fwd(req) if right else req, COMM_DETECT_HALL_FOC, 20.0)
+        # Bare-metal F103 runs the VESC-compatible 1-degree, 3F+3R Hall sweep
+        # cooperatively while the 16-kHz FOC ISR stays live. Under load this can
+        # legitimately exceed 20 s; VESC Tool waits for the asynchronous reply.
+        p = self.transact(self.fwd(req) if right else req, COMM_DETECT_HALL_FOC, 60.0)
         if len(p) != 10:
             raise ValueError(f"unexpected Hall detect reply length {len(p)}")
         table = list(p[1:9])

@@ -150,6 +150,14 @@ int32_t mcpwm_foc_get_position_max_user_counts(bool second){return pos_max_user[
 void mcpwm_foc_reset_position(bool second){const int j=second?1:0;pos_user[j]=0;pos_target_user[j]=0;}
 bool mc_interface_store_configuration_motor(bool second) { store_count[second?1:0]++; return store_ok; }
 bool mc_interface_load_configuration_motor(bool second) { (void)second; return load_ok; }
+bool mcpwm_foc_hall_table_sane(const uint8_t table[8]) {
+    if(!table || table[0]!=255u || table[7]!=255u)return false;
+    uint8_t a[6];
+    for(int i=0;i<6;i++){a[i]=table[i+1];if(a[i]>=200u)return false;}
+    for(int i=0;i<5;i++)for(int j=i+1;j<6;j++)if(a[j]<a[i]){uint8_t t=a[i];a[i]=a[j];a[j]=t;}
+    for(int i=0;i<6;i++){unsigned x=a[i],y=(i==5)?(unsigned)a[0]+200u:a[i+1];unsigned g=y-x;if(g<18u||g>48u)return false;}
+    return true;
+}
 bool mcpwm_foc_detect_hall(float current, bool second, uint8_t table[8]) {
     (void)current;
     static const uint8_t t[8]={255u,83u,17u,50u,150u,117u,183u,255u};

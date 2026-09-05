@@ -37,6 +37,16 @@ volatile int32_t positionCommandR = 0;
 
 volatile uint32_t foc_isr_cycles = 0;
 volatile uint32_t foc_isr_cycles_max = 0;
+volatile uint32_t foc_isr_pre_max_cycles = 0;
+volatile uint32_t foc_isr_control_max_cycles = 0;
+volatile uint32_t foc_isr_post_max_cycles = 0;
+volatile uint32_t foc_step_left_max_cycles = 0;
+volatile uint32_t foc_step_right_max_cycles = 0;
+volatile uint32_t foc_slot_max_cycles[3] = {0u,0u,0u};
+volatile uint32_t foc_prof_sensor_max_cycles=0u;
+volatile uint32_t foc_prof_current_max_cycles=0u;
+volatile uint32_t foc_prof_regulator_max_cycles=0u;
+volatile uint32_t foc_prof_svpwm_max_cycles=0u;
 volatile int16_t foc_iqL_q4 = 0;
 volatile int16_t foc_iqR_q4 = 0;
 volatile int16_t foc_idL_q4 = 0;
@@ -51,6 +61,7 @@ static int32_t batVoltageFixdt = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_R
  * current regulator needs only multiply/shift, no floating point or division. */
 static uint32_t s_mod_counts_per_volt_q16 = 39321600u; /* 40 V startup */
 static uint32_t s_volt_q24_per_mod_count = 27962u;      /* 40 V startup */
+static int16_t s_voltage_scale_bat_adc = INT16_MIN;
 
 static void current_voltage_scale_refresh(void) {
     const uint32_t vin_cv=((uint32_t)(batVoltage>0?batVoltage:1)*(uint32_t)BAT_CALIB_REAL_VOLTAGE)/(uint32_t)BAT_CALIB_ADC;
@@ -59,6 +70,7 @@ static void current_voltage_scale_refresh(void) {
     s_mod_counts_per_volt_q16=(uint32_t)(a/cv);
     s_volt_q24_per_mod_count=(uint32_t)(((uint64_t)cv*16777216u+1200000u)/2400000u);
     if(s_volt_q24_per_mod_count==0u)s_volt_q24_per_mod_count=1u;
+    s_voltage_scale_bat_adc=batVoltage;
 }
 
 
@@ -239,8 +251,15 @@ static int16_t current_circle_iq_limit_q4(const mcpwm_foc_motor_t *m, int16_t iq
             const int32_t vin_cv=((int32_t)batVoltage*(int32_t)BAT_CALIB_REAL_VOLTAGE)/(int32_t)BAT_CALIB_ADC;
             const uint32_t watt_x10=drawing?m->m_watt_max_x10:m->m_watt_regen_x10;
             if (vin_cv > 0 && watt_x10 > 0u) {
-                const uint64_t wi=((uint64_t)watt_x10*8000u)/(uint32_t)vin_cv;
-                if (wi < (uint64_t)in_lim) in_lim=(int32_t)wi;
+                /* Avoid a 64-bit software divide in the 16-kHz ISR when the
+                 * configured watt limit is looser than the already active input
+                 * current limit. Only calculate P/V when it can actually bind. */
+                const uint64_t watt_num=(uint64_t)watt_x10*8000u;
+                const uint64_t input_need=(uint64_t)(uint32_t)in_lim*(uint32_t)vin_cv;
+                if (watt_num < input_need) {
+                    const uint32_t wi=(uint32_t)(watt_num/(uint32_t)vin_cv);
+                    if (wi < (uint32_t)in_lim) in_lim=(int32_t)wi;
+                }
             }
             if (in_lim > 0) {
                 int32_t motor_from_input=(in_lim*1000)/ad;
@@ -339,6 +358,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->m_encoder_counts = (int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
     c->foc_openloop_rpm = (float)MCCONF_OPENLOOP_RPM_DEFAULT;
     c->foc_hall_interp_erpm = (float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
+    c->m_hall_extra_samples = (int)MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT;
     c->s_pid_ramp_erpms_s = (float)MCCONF_SPEED_RAMP_ERPMS_S;
     c->s_pid_min_erpm = (float)MCCONF_SPEED_RELEASE_ERPM;
     c->s_pid_allow_braking = true;
@@ -373,6 +393,17 @@ static void hall_interp_recompute(mcpwm_foc_motor_t *m) {
     uint32_t erpm=(uint32_t)(erpm_f+0.5f);
     if (erpm>65535u) erpm=65535u;
     m->m_hall_interp_erpm=(uint16_t)erpm;
+    {
+        int extra=m->m_conf.m_hall_extra_samples;
+        if(extra<0 || extra>20)extra=(int)MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT;
+        const uint8_t window=(uint8_t)(1u+2u*(uint32_t)extra);
+        m->m_hall_filter_delay_ticks=(uint8_t)extra; /* majority edge delay = N frames */
+        if(m->m_hall_filter_window!=window){
+            m->m_hall_filter_window=window;
+            m->m_hall_sample_index=0u; m->m_hall_sample_count=0u;
+            m->m_hall_sample_sum_u=0u; m->m_hall_sample_sum_v=0u; m->m_hall_sample_sum_w=0u;
+        }
+    }
 
     /* VESC foc_correct_hall(): interpolation is disabled when
      * 10*PWM_FREQ/max(edge_age,last_period) falls below foc_hall_interp_erpm.
@@ -429,15 +460,17 @@ static void position_ang_div_recompute(mcpwm_foc_motor_t *m) {
 
 static void position_feedback_update(mcpwm_foc_motor_t *m, uint16_t raw) {
     if(!m)return;
-    const float div=m->m_conf.p_pid_ang_div;
-    if(div>0.98f && div<1.02f){
+    /* p_pid_ang_div is converted to inverse Q16 whenever config changes. Do not
+     * execute Cortex-M3 soft-float comparisons in the 16-kHz ADC ISR. The
+     * integer interval below is exactly the rounded inverse of 0.98<div<1.02. */
+    const uint32_t step=m->m_pos_pid_ang_div_inv_q16?m->m_pos_pid_ang_div_inv_q16:65536u;
+    if(step>=64251u && step<=66873u){
         m->m_pos_pid_feedback_phase=raw;
         m->m_pos_pid_raw_last=raw;
         m->m_pos_pid_div_accum=0u;
         return;
     }
     const uint16_t last=m->m_pos_pid_raw_last;
-    const uint32_t step=m->m_pos_pid_ang_div_inv_q16?m->m_pos_pid_ang_div_inv_q16:65536u;
     if(raw<16384u && last>49152u)m->m_pos_pid_div_accum=(uint16_t)(m->m_pos_pid_div_accum+step);
     else if(raw>49152u && last<16384u)m->m_pos_pid_div_accum=(uint16_t)(m->m_pos_pid_div_accum-step);
     m->m_pos_pid_raw_last=raw;
@@ -513,10 +546,14 @@ static void encoder_runtime_set_deg(mcpwm_foc_motor_t *m, float deg) {
 }
 
 static uint16_t position_feedback_phase_u16(const mcpwm_foc_motor_t *m, bool second) {
-    (void)second;
-    /* Sama dengan upstream m_pos_pid_now: raw sensor/FOC position lebih dulu
-     * melewati p_pid_ang_div. mc_interface baru menerapkan inversion/direction. */
-    return m ? m->m_pos_pid_feedback_phase : 0u;
+    if(!m)return 0u;
+    /* Hall + default p_pid_ang_div=1 uses the live FOC/Hall phase directly,
+     * matching upstream fallback state_now->phase and avoiding redundant 16-kHz
+     * copies. Encoder or non-unity angular division uses the scaled cache. */
+    const bool enc_active=!second && encoder_port_active(m,false) && m->m_encoder_configured;
+    const uint32_t step=m->m_pos_pid_ang_div_inv_q16?m->m_pos_pid_ang_div_inv_q16:65536u;
+    if(!enc_active && step>=64251u && step<=66873u)return m->m_phase;
+    return m->m_pos_pid_feedback_phase;
 }
 
 static int32_t position_error_sign(const mcpwm_foc_motor_t *m, bool second) {
@@ -534,6 +571,14 @@ static void current_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     m->m_current_kpd_v_q16=(uint32_t)(((uint64_t)m->m_kpd_q11*128u+1u)/3u);
     m->m_current_kiq_dt_v_q16=(uint32_t)(((uint64_t)m->m_kiq_q16*MCCONF_FOC_CONTROL_DIV*8u+4u)/9u);
     m->m_current_kid_dt_v_q16=(uint32_t)(((uint64_t)m->m_kid_q16*MCCONF_FOC_CONTROL_DIV*8u+4u)/9u);
+    /* p_v_q16 = err_q4 * gain_v_q16 / 800. Store gain*256/800
+     * once here so current_pi_vesc_state() can use a signed 64-bit multiply
+     * followed by >>8. Error versus the exact division is below 1 Q16-LSB per
+     * current-count and is covered by the host current-loop regression. */
+    m->m_current_kpq_err_q8=(uint32_t)(((uint64_t)m->m_current_kpq_v_q16*8u+12u)/25u);
+    m->m_current_kpd_err_q8=(uint32_t)(((uint64_t)m->m_current_kpd_v_q16*8u+12u)/25u);
+    m->m_current_kiq_err_q8=(uint32_t)(((uint64_t)m->m_current_kiq_dt_v_q16*8u+12u)/25u);
+    m->m_current_kid_err_q8=(uint32_t)(((uint64_t)m->m_current_kid_dt_v_q16*8u+12u)/25u);
 }
 
 static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
@@ -610,6 +655,10 @@ static bool hall_table_runtime_sane(const uint8_t t[8]) {
         const uint16_t gap=b-a; if(gap<18u || gap>48u) return false;
     }
     return true;
+}
+
+bool mcpwm_foc_hall_table_sane(const uint8_t table[8]) {
+    return table && hall_table_runtime_sane(table);
 }
 
 static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
@@ -696,7 +745,12 @@ void mcpwm_foc_init(void) {
     m_motor_1.m_off_offset0=offsetrlA; m_motor_1.m_off_offset1=offsetrlB; m_motor_1.m_off_offsetdc=offsetdcl;
     m_motor_2.m_off_offset0=offsetrrB; m_motor_2.m_off_offset1=offsetrrC; m_motor_2.m_off_offsetdc=offsetdcr;
     foc_isr_cycles = foc_isr_cycles_max = 0;
+    foc_isr_pre_max_cycles = foc_isr_control_max_cycles = foc_isr_post_max_cycles = 0;
+    foc_step_left_max_cycles = foc_step_right_max_cycles = 0;
+    foc_slot_max_cycles[0]=foc_slot_max_cycles[1]=foc_slot_max_cycles[2]=0u;
+    foc_prof_sensor_max_cycles=foc_prof_current_max_cycles=foc_prof_regulator_max_cycles=foc_prof_svpwm_max_cycles=0u;
     s_overrun = 0;
+    s_voltage_scale_bat_adc = INT16_MIN;
     s_vesc_owned[0]=s_vesc_owned[1]=0u;
     s_vesc_timeout_braking[0]=s_vesc_timeout_braking[1]=0u;
     s_vesc_timeout_ticks[0]=s_vesc_timeout_ticks[1]=0u;
@@ -793,6 +847,8 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         next.foc_current_filter_const=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
     if (!(next.foc_hall_interp_erpm >= 0.0f && next.foc_hall_interp_erpm <= MCCONF_L_MAX_ERPM))
         next.foc_hall_interp_erpm=(float)MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT;
+    if(next.m_hall_extra_samples < 0 || next.m_hall_extra_samples > 20)
+        next.m_hall_extra_samples=(int)MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT;
     if (!(next.p_pid_kd_filter >= 0.0f && next.p_pid_kd_filter <= 1.0f))
         next.p_pid_kd_filter=(float)MCCONF_POSITION_KD_FILTER_Q16/65536.0f;
     if (!(next.p_pid_ang_div>=0.01f && next.p_pid_ang_div<=1000.0f))next.p_pid_ang_div=1.0f;
@@ -1465,17 +1521,69 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
     }
 }
 
-static uint8_t hall_read(bool second) {
-    if (!second) {
-        uint8_t u=!(LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN), v=!(LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN), w=!(LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN);
-        return (uint8_t)((u<<2)|(v<<1)|w);
+static uint8_t hall_read(mcpwm_foc_motor_t *m, bool second) {
+    /* Preserve EFeru master timing: exactly one GPIO snapshot per motor and
+     * 16-kHz ADC frame. VESC m_hall_extra_samples is implemented as a rolling
+     * majority over synchronized frames instead of repeated immediate reads;
+     * this preserves the same odd 1+2N majority semantics without starving the
+     * UART/main loop on the 72-MHz Cortex-M3. */
+    const uint32_t idr=second?RIGHT_HALL_U_PORT->IDR:LEFT_HALL_U_PORT->IDR;
+    uint8_t raw;
+    if(!second){
+        const uint8_t u=(idr&LEFT_HALL_U_PIN)?0u:1u;
+        const uint8_t v=(idr&LEFT_HALL_V_PIN)?0u:1u;
+        const uint8_t w=(idr&LEFT_HALL_W_PIN)?0u:1u;
+        raw=(uint8_t)((u<<2)|(v<<1)|w);
+    }else{
+        const uint8_t u=(idr&RIGHT_HALL_U_PIN)?0u:1u;
+        const uint8_t v=(idr&RIGHT_HALL_V_PIN)?0u:1u;
+        const uint8_t w=(idr&RIGHT_HALL_W_PIN)?0u:1u;
+        raw=(uint8_t)((u<<2)|(v<<1)|w);
     }
-    uint8_t u=!(RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN), v=!(RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN), w=!(RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN);
-    return (uint8_t)((u<<2)|(v<<1)|w);
+    m->m_hall_raw_state=raw;
+    uint8_t window=m->m_hall_filter_window;
+    if(window==0u || window>41u)window=1u;
+
+    uint8_t idx=m->m_hall_sample_index;
+    if(idx>=window)idx=0u;
+    if(m->m_hall_sample_count>=window){
+        const uint8_t old=m->m_hall_sample_history[idx];
+        m->m_hall_sample_sum_u-=(uint8_t)((old>>2)&1u);
+        m->m_hall_sample_sum_v-=(uint8_t)((old>>1)&1u);
+        m->m_hall_sample_sum_w-=(uint8_t)(old&1u);
+    }else{
+        m->m_hall_sample_count++;
+    }
+    m->m_hall_sample_history[idx]=raw;
+    m->m_hall_sample_sum_u+=(uint8_t)((raw>>2)&1u);
+    m->m_hall_sample_sum_v+=(uint8_t)((raw>>1)&1u);
+    m->m_hall_sample_sum_w+=(uint8_t)(raw&1u);
+    idx++;
+    if(idx>=window)idx=0u;
+    m->m_hall_sample_index=idx;
+
+    const uint8_t n=m->m_hall_sample_count?m->m_hall_sample_count:1u;
+    const uint8_t th=(uint8_t)(n/2u);
+    return (uint8_t)(((m->m_hall_sample_sum_u>th)?4u:0u) |
+                     ((m->m_hall_sample_sum_v>th)?2u:0u) |
+                     ((m->m_hall_sample_sum_w>th)?1u:0u));
 }
 
 static uint8_t hall_table_angle(const mcpwm_foc_motor_t *m, uint8_t hall) {
     return (uint8_t)m->m_conf.foc_hall_table[hall & 7u];
+}
+
+static bool hall_feedback_valid(const mcpwm_foc_motor_t *m) {
+    if (!m || !m->m_hall_debounce_initialized || !m->m_hall_initialized) return false;
+    const uint8_t h=m->m_hall_state & 7u;
+    if(h==0u || h==7u) return false;
+    const uint8_t angle=hall_table_angle(m,h);
+    /* m_hall_pos_prev is the last electrically accepted Hall center. A stable
+     * but non-adjacent debounced code is intentionally kept out of the FOC
+     * bridge until it returns to the accepted state or reaches a genuinely
+     * adjacent state. This turns the sequence-reject counter into a real
+     * fail-safe instead of merely diagnostic bookkeeping. */
+    return angle<200u && angle==m->m_hall_pos_prev;
 }
 
 static int16_t hall_angle_diff(uint8_t now, uint8_t prev) {
@@ -1490,6 +1598,8 @@ static void hall_estimator_reset(mcpwm_foc_motor_t *m) {
     m->m_hall_direction = 0;
     m->m_hall_debounce_initialized = 0u;
     m->m_hall_candidate_count = 0u;
+    m->m_hall_sample_index=0u; m->m_hall_sample_count=0u;
+    m->m_hall_sample_sum_u=0u; m->m_hall_sample_sum_v=0u; m->m_hall_sample_sum_w=0u;
     m->m_hall_direction_stable_edges = 0u;
     m->m_hall_ticks = 0u;
     m->m_hall_period = MCCONF_HALL_TIMEOUT_TICKS;
@@ -1519,8 +1629,7 @@ static uint8_t hall_midpoint200(uint8_t previous_center, int16_t center_delta) {
 }
 
 static void hall_update(mcpwm_foc_motor_t *m, bool second) {
-    const uint8_t raw_h = hall_read(second);
-    m->m_hall_raw_state = raw_h;
+    const uint8_t raw_h = hall_read(m,second);
 
     /* GPIO Hall inputs are asynchronous to the 16-kHz ADC ISR. One transient
      * sample during a switching edge must never become an electrical-sector
@@ -1550,6 +1659,28 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
     const uint8_t angle = hall_table_angle(m, h);
     const bool valid = (h != 0u && h != 7u && angle < 200u);
     if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
+
+    /* Upstream foc_correct_hall() clears the previous Hall angle when the
+     * Hall code is invalid. This target has no sensorless observer fallback,
+     * so keeping a stale Hall phase while the bridge is powered is unsafe.
+     * Drop estimator lock immediately after the debounced input becomes 0/7
+     * (or maps to an invalid table entry). The bridge gate below releases the
+     * motor, while the next valid Hall code re-initializes directly to its
+     * calibrated sector center. Position/tachometer counters are preserved. */
+    if (!valid) {
+        const bool closed_loop_active=m->m_control_mode!=CONTROL_MODE_NONE &&
+            m->m_control_mode!=CONTROL_MODE_OPENLOOP &&
+            m->m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE;
+        if(closed_loop_active)mcpwm_foc_release_motor(second);
+        m->m_hall_initialized=0u;
+        m->m_hall_direction=0;
+        m->m_hall_direction_stable_edges=0u;
+        m->m_hall_interp_active=0u;
+        m->m_hall_period=MCCONF_HALL_TIMEOUT_TICKS;
+        m->m_hall_interp_step_q16=0u;
+        m->m_hall_rate_limit_step=m->m_hall_rate_min_step?m->m_hall_rate_min_step:1u;
+        m->m_rpm=0;
+    }
 
     if (valid) {
         if (!m->m_hall_initialized) {
@@ -1620,8 +1751,9 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                      * saat akselerasi. Faktor 3/2 identik dengan angle_step
                      * upstream = hall_speed * dt * 1.5. */
                     const uint32_t raw_period = period > 0u ? period : 1u;
-                    uint32_t rs = (uint32_t)(((uint64_t)sector * 3u + raw_period) /
-                                             ((uint64_t)raw_period * 2u));
+                    /* sector<=10922 and period<=65535, so this ratio fits
+                     * entirely in uint32_t; avoid __aeabi_uldivmod on Hall edge. */
+                    uint32_t rs = (sector * 3u + raw_period) / (raw_period * 2u);
                     if (rs == 0u) rs = 1u;
                     /* Minimum rate follows VESC foc_correct_hall exactly:
                      * max(hall_erpm, foc_hall_interp_erpm) * dt * 1.5.
@@ -1642,15 +1774,19 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                 }
                 if (m->m_hall_direction_stable_edges < 0xffu) m->m_hall_direction_stable_edges++;
                 if (m->m_position_abs_counts < UINT32_MAX) m->m_position_abs_counts++;
-                if (dir > 0 && m->m_position_counts < INT32_MAX) {
-                    m->m_position_counts++;
-                    if (!second) { odom_l = (odom_l >= 8999) ? 0 : (int16_t)(odom_l + 1); }
-                    else { odom_r = (odom_r <= 0) ? 8999 : (int16_t)(odom_r - 1); }
-                } else if (dir < 0 && m->m_position_counts > INT32_MIN) {
-                    m->m_position_counts--;
-                    if (!second) { odom_l = (odom_l <= 0) ? 8999 : (int16_t)(odom_l - 1); }
-                    else { odom_r = (odom_r >= 8999) ? 0 : (int16_t)(odom_r + 1); }
+                /* With Hall feedback one accepted edge is exactly one VESC
+                 * tachometer step (6 steps/electrical revolution). Count it at
+                 * the edge instead of re-quantizing electrical phase at 16 kHz. */
+                if(dir>0){
+                    if(m->m_tachometer<INT32_MAX)m->m_tachometer++;
+                    if(m->m_position_counts<INT32_MAX)m->m_position_counts++;
+                    if(!second){odom_l=(odom_l>=8999)?0:(int16_t)(odom_l+1);}else{odom_r=(odom_r<=0)?8999:(int16_t)(odom_r-1);}
+                }else{
+                    if(m->m_tachometer>INT32_MIN)m->m_tachometer--;
+                    if(m->m_position_counts>INT32_MIN)m->m_position_counts--;
+                    if(!second){odom_l=(odom_l<=0)?8999:(int16_t)(odom_l-1);}else{odom_r=(odom_r>=8999)?0:(int16_t)(odom_r+1);}
                 }
+                if(m->m_tachometer_abs<UINT32_MAX)m->m_tachometer_abs++;
                 m->m_hall_pos = hall_midpoint200(previous_center, ad);
                 /* VESC 6.00 memulai estimator Hall tepat di midpoint saat edge
                  * baru diterima. Output FOC sendiri tetap melewati rate limiter. */
@@ -1666,6 +1802,17 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
                     m->m_hall_last_reject_to = h;
                     m->m_hall_reject_counted_state = h;
                 }
+                /* At 16 kHz a stable non-adjacent Hall transition is not a
+                 * normal skipped sector at this hardware's ERPM envelope. The
+                 * local target has no observer fallback, so release closed-loop
+                 * drive and keep the last accepted Hall center latched. A fresh
+                 * VESC command can run again only after the Hall sequence has
+                 * returned to a valid accepted/adjacent state. Open-loop Hall
+                 * detection remains observation-only and is never aborted here. */
+                if(m->m_control_mode!=CONTROL_MODE_NONE &&
+                   m->m_control_mode!=CONTROL_MODE_OPENLOOP &&
+                   m->m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE)
+                    mcpwm_foc_release_motor(second);
             }
         } else {
             /* Returned to the last accepted Hall sector. A later departure is
@@ -1695,18 +1842,25 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
 
     uint16_t desired = m->m_phase_hall;
     if (valid) {
+        /* If this debounced code was rejected as a non-adjacent transition,
+         * m_hall_pos_prev deliberately remains the previous accepted center.
+         * Never let the rejected code leak into the Hall phase estimator. */
+        const uint8_t phase_angle=(m->m_hall_initialized && angle!=m->m_hall_pos_prev) ?
+                                  m->m_hall_pos_prev : angle;
         if (m->m_hall_interp_active && m->m_hall_direction != 0 &&
             m->m_hall_period > 0u && m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
             const uint16_t edge_phase = hall_angle200_to_phase(m->m_hall_pos);
             uint32_t ticks = m->m_hall_ticks;
             if (ticks > m->m_hall_period) ticks = m->m_hall_period;
             const uint32_t frac = (uint32_t)((ticks * m->m_hall_interp_step_q16) >> 16);
-            const uint32_t debounce_adv=(uint32_t)((MCCONF_HALL_PHASE_ADVANCE_TICKS * m->m_hall_interp_step_q16) >> 16);
+            const uint32_t phase_delay_ticks=(uint32_t)MCCONF_HALL_PHASE_ADVANCE_TICKS+
+                                             (uint32_t)m->m_hall_filter_delay_ticks;
+            const uint32_t debounce_adv=(uint32_t)((phase_delay_ticks * m->m_hall_interp_step_q16) >> 16);
             const uint32_t phase_frac=frac+debounce_adv;
             const uint16_t interp_phase = (uint16_t)(m->m_hall_direction > 0 ?
                                          (uint32_t)edge_phase + phase_frac :
                                          (uint32_t)edge_phase - phase_frac);
-            const uint16_t center_phase = hall_angle200_to_phase(angle);
+            const uint16_t center_phase = hall_angle200_to_phase(phase_angle);
             const int16_t interp_center_err = phase_diff_u16(interp_phase, center_phase);
             const int16_t max_interp_err = (int16_t)(65536u / 12u); /* 30 deg */
             const int16_t abs_interp_err = interp_center_err < 0 ?
@@ -1734,7 +1888,7 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
         } else {
             /* At low speed use the calibrated Hall-sector center directly,
              * just like foc_correct_hall() in VESC 6.00. */
-            desired = hall_angle200_to_phase(angle);
+            desired = hall_angle200_to_phase(phase_angle);
         }
     }
     m->m_phase_hall_target = desired;
@@ -1803,7 +1957,7 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
             int64_t mq16=mnum/((int64_t)counts*(int64_t)ticks);
             if(mq16>INT32_MAX)mq16=INT32_MAX; else if(mq16<INT32_MIN)mq16=INT32_MIN;
             m->m_encoder_mech_rpm_q16=(int32_t)mq16;
-            m->m_rpm=(int16_t)CLAMP((int32_t)(mq16>>16),-MCCONF_MOTOR_RPM_MAX,MCCONF_MOTOR_RPM_MAX);
+            m->m_rpm=(int16_t)CLAMP((int32_t)(mq16 / 65536LL),-MCCONF_MOTOR_RPM_MAX,MCCONF_MOTOR_RPM_MAX);
         }else if(m->m_encoder_idle_ticks>=MCCONF_ENCODER_SPEED_TIMEOUT_TICKS){
             m->m_encoder_erpm_q16=0; m->m_encoder_mech_rpm_q16=0; m->m_rpm=0;
         }
@@ -1816,7 +1970,7 @@ static void vesc_tachometer_update(mcpwm_foc_motor_t *m) {
     /* Upstream VESC FOC tachometer selalu 6 step/electrical revolution. Phase
      * uint16 diubah ke domain signed [-180,+180), lalu dibagi 6 sektor. */
     const int32_t signed_phase=(int32_t)(int16_t)m->m_phase;
-    uint32_t step=(uint32_t)(((uint64_t)(uint32_t)(signed_phase+32768)*6u)>>16);
+    uint32_t step=((uint32_t)(signed_phase+32768)*6u)>>16;
     if(step>5u)step=5u;
     int32_t diff=(int32_t)step-(int32_t)m->m_tacho_step_last;
     m->m_tacho_step_last=(uint8_t)step;
@@ -1917,7 +2071,7 @@ static void openloop_update(mcpwm_foc_motor_t *m, bool second) {
     }
 }
 
-static int16_t current_pi_vesc_state(int16_t err_q4, uint32_t kp_v_q16, uint32_t ki_dt_v_q16,
+static int16_t current_pi_vesc_state(int16_t err_q4, uint32_t kp_err_q8, uint32_t ki_err_q8,
                                     int16_t max_counts, int16_t min_counts,
                                     int32_t *integ_v_q16, uint8_t *sat) {
     /* Fixed-point equivalent of upstream VESC control_current():
@@ -1925,8 +2079,10 @@ static int16_t current_pi_vesc_state(int16_t err_q4, uint32_t kp_v_q16, uint32_t
      *   output      = integrator + Ierr * Kp
      * followed by voltage-vector saturation/anti-windup. Integrator is stored
      * in physical volts Q16, therefore a Vin change does not rescale its state. */
-    int64_t p=((int64_t)err_q4*(int64_t)kp_v_q16)/FOC_CURRENT_Q4_PER_A;
-    int64_t istep=((int64_t)err_q4*(int64_t)ki_dt_v_q16)/FOC_CURRENT_Q4_PER_A;
+    const int64_t pmul=(int64_t)err_q4*(int64_t)kp_err_q8;
+    const int64_t imul=(int64_t)err_q4*(int64_t)ki_err_q8;
+    const int64_t p=(pmul>=0)?((pmul+128)>>8):-(((-pmul)+128)>>8);
+    const int64_t istep=(imul>=0)?((imul+128)>>8):-(((-imul)+128)>>8);
     int64_t isum=(int64_t)*integ_v_q16+istep;
     int32_t lim_counts=max_counts;
     if(lim_counts<0)lim_counts=-lim_counts;
@@ -2366,6 +2522,8 @@ static void telemetry_avg_push(mcpwm_foc_motor_t *m, int16_t id_q4, int16_t iq_q
 
 static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_counts,
                                int16_t i1_counts, int16_t idc_counts, bool control_update) {
+    const uint32_t profSensorStart=DWT->CYCCNT;
+    uint32_t profRegStart=0u;
     /* PB6/PB7 are mutually exclusive: once LEFT ABI owns TIM4, never sample
      * those lines as Hall V/W. Encoder raw/count/phase remains live even OFF. */
     if (encoder_port_active(m,second)) encoder_feedback_update(m,second);
@@ -2394,11 +2552,34 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         /* ABI yang belum sync tidak boleh menjadi active FOC phase. Raw
          * mechanical/electrical encoder tetap tersedia lewat diagnostic getter,
          * sedangkan m_phase mempertahankan phase aktif terakhir sampai alignment. */
-        const uint16_t pos_raw=(!second && encoder_port_active(m,false) && m->m_encoder_configured)?
-            m->m_encoder_mech_phase:m->m_phase;
-        position_feedback_update(m,pos_raw);
-        if(!encoder_port_active(m,second) || m->m_encoder_synced || openloop_phase)
-            vesc_tachometer_update(m);
+        const bool enc_active=(!second && encoder_port_active(m,false) && m->m_encoder_configured);
+        if(enc_active){
+            position_feedback_update(m,m->m_encoder_mech_phase);
+            if(m->m_encoder_synced || openloop_phase) vesc_tachometer_update(m);
+        }else if(m->m_control_mode==CONTROL_MODE_POS ||
+                 m->m_pos_pid_ang_div_inv_q16<64251u || m->m_pos_pid_ang_div_inv_q16>66873u){
+            /* Hall duty/current/speed modes do not need p_pid_ang_div work.
+             * Position mode still preserves exact VESC configurable scaling. */
+            position_feedback_update(m,m->m_phase);
+        }
+    }
+
+    if(control_update){ const uint32_t c=DWT->CYCCNT-profSensorStart; if(c>foc_prof_sensor_max_cycles)foc_prof_sensor_max_cycles=c; }
+    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
+    const bool openloop_feedback = m->m_control_mode==CONTROL_MODE_OPENLOOP ||
+                                   m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
+    const bool feedback_ready = openloop_feedback ||
+        (encoder_feedback_selected(m,second) ? m->m_encoder_synced : hall_feedback_valid(m));
+    const bool inactive = !source_enabled || !feedback_ready ||
+        m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE;
+    /* On the two non-regulator slots an already inactive motor has no current
+     * transform or control state to update. Hall/encoder position and tacho above
+     * remain 16 kHz; OFF current telemetry is still refreshed on this motor's
+     * 5.33-kHz regulator slot. */
+    if (inactive && !control_update) {
+        m->m_state=MC_STATE_OFF;
+        m->m_isr_count++;
+        return;
     }
 
     /* Control-current offset is calibrated once in the original EFeru
@@ -2418,6 +2599,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
      * coefficient below is the exact three-sample equivalent of alpha=0.12, so
      * current-loop measurement bandwidth is unchanged in real time. */
     m->m_current_in_counts=idc_counts;
+    const uint32_t profCurrentStart=DWT->CYCCNT;
     if(control_update){
         const int16_t i0_q4=phase_current_counts_to_q4(m,i0_counts);
         const int16_t i1_q4=phase_current_counts_to_q4(m,i1_counts);
@@ -2435,12 +2617,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         m->m_iq_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[1],a,m->m_iq_q4);
         m->m_current_in_telem_counts=telemetry_lpf_step(&m->m_telem_current_lpf_q16[2],a,m->m_current_in_counts);
         telemetry_avg_push(m,m->m_id_telem_q4,m->m_iq_telem_q4,m->m_current_in_telem_counts);
+        { const uint32_t c=DWT->CYCCNT-profCurrentStart; if(c>foc_prof_current_max_cycles)foc_prof_current_max_cycles=c; }
     }
 
-    const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
-    const bool feedback_ready = !encoder_feedback_selected(m,second) || m->m_encoder_synced ||
-        m->m_control_mode==CONTROL_MODE_OPENLOOP || m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
-    if (!source_enabled || !feedback_ready || m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE) {
+    if (inactive) {
         m->m_state=MC_STATE_OFF;
         reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0;
         m->m_speed_sat_hold=0; reset_position_pid(m);
@@ -2480,6 +2660,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     foc_dq_t v={m->m_vd,m->m_vq};
     m->m_state=MC_STATE_RUNNING;
         if (control_update) {
+            profRegStart=DWT->CYCCNT;
             /* The proven generated controller updates its regulators once every
              * three 16-kHz ADC frames (~5.333 kHz). */
             /* Current/speed/position modes may use the same configured physical
@@ -2508,7 +2689,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                               m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) ?
                               m->m_id_set_q4 : 0;
             const int16_t ed=(int16_t)CLAMP((int32_t)m->m_id_set_q4-m->m_id_q4,-32768,32767);
-            v.d=current_pi_vesc_state(ed,m->m_current_kpd_v_q16,m->m_current_kid_dt_v_q16,
+            v.d=current_pi_vesc_state(ed,m->m_current_kpd_err_q8,m->m_current_kid_err_q8,
                              v_closed,(int16_t)-v_closed,&m->m_id_integrator,&m->m_id_sat_hold);
             int16_t q_lim=voltage_circle_q_limit(v.d,v_closed);
             if (m->m_control_mode==CONTROL_MODE_DUTY) {
@@ -2544,7 +2725,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 }
                 m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
-                v.q=current_pi_vesc_state(eq,m->m_current_kpq_v_q16,m->m_current_kiq_dt_v_q16,
+                v.q=current_pi_vesc_state(eq,m->m_current_kpq_err_q8,m->m_current_kiq_err_q8,
                                  q_lim,(int16_t)-q_lim,
                                  &m->m_iq_integrator,&m->m_iq_sat_hold);
             } else {
@@ -2594,7 +2775,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 }
                 m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
-                v.q=current_pi_vesc_state(eq,m->m_current_kpq_v_q16,m->m_current_kiq_dt_v_q16,
+                v.q=current_pi_vesc_state(eq,m->m_current_kpq_err_q8,m->m_current_kiq_err_q8,
                                  q_lim,(int16_t)-q_lim,
                                  &m->m_iq_integrator,&m->m_iq_sat_hold);
             }
@@ -2603,6 +2784,8 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
             foc_vector_limit(&v,vector_limit);
         }
 control_done:
+    if(profRegStart){ const uint32_t c=DWT->CYCCNT-profRegStart; if(c>foc_prof_regulator_max_cycles)foc_prof_regulator_max_cycles=c; }
+    const uint32_t profSvpwmStart=DWT->CYCCNT;
     m->m_vd=v.d; m->m_vq=v.q;
     foc_abc_t pwm; foc_centered_svpwm(&v,m->m_phase,&pwm);
     /* Keep EFeru's exact hardware clamp: ARR=2000, pwm_margin=110, therefore
@@ -2615,7 +2798,7 @@ control_done:
     if (control_update) {
         uint32_t mag2=(uint32_t)((int32_t)v.d*v.d)+(uint32_t)((int32_t)v.q*v.q);
         uint32_t mag=foc_isqrt_u32(mag2);
-        int32_t dpm=(int32_t)(((uint64_t)mag*1000u+(MCCONF_FOC_DUTY_VOLTAGE_MAX/2u))/MCCONF_FOC_DUTY_VOLTAGE_MAX);
+        int32_t dpm=(int32_t)(((uint32_t)mag*1000u+(MCCONF_FOC_DUTY_VOLTAGE_MAX/2u))/MCCONF_FOC_DUTY_VOLTAGE_MAX);
         if(dpm>1000)dpm=1000;
         if(v.q<0)dpm=-dpm;
         m->m_duty_now_permille=(int16_t)dpm;
@@ -2623,6 +2806,7 @@ control_done:
     m->m_ccr_a=(uint16_t)CLAMP((int32_t)pwm.a+pwm_res/2,pwm_margin,pwm_res-pwm_margin);
     m->m_ccr_b=(uint16_t)CLAMP((int32_t)pwm.b+pwm_res/2,pwm_margin,pwm_res-pwm_margin);
     m->m_ccr_c=(uint16_t)CLAMP((int32_t)pwm.c+pwm_res/2,pwm_margin,pwm_res-pwm_margin);
+    if(control_update){ const uint32_t c=DWT->CYCCNT-profSvpwmStart; if(c>foc_prof_svpwm_max_cycles)foc_prof_svpwm_max_cycles=c; }
     m->m_isr_count++;
 }
 
@@ -2709,6 +2893,8 @@ void mcpwm_foc_vesc_override_clear(bool second) {
     s_vesc_owned[i]=0u; s_vesc_timeout_braking[i]=0u; s_vesc_timeout_ticks[i]=0u;
 }
 
+
+
 /* ========================================================================== */
 /* Original EFeru ADC DMA ISR timing/calibration path                          */
 /* ========================================================================== */
@@ -2738,7 +2924,6 @@ void DMA1_Channel1_IRQHandler(void) {
     if (buzzerTimer % 1000 == 0) {
         filtLowPass32(adc_buffer.batt1, BAT_FILT_COEF, &batVoltageFixdt);
         batVoltage = (int16_t)(batVoltageFixdt >> 16);
-        current_voltage_scale_refresh();
     }
 
     /* VESC ownership is per motor. A right-motor forwarded command must not
@@ -2747,10 +2932,13 @@ void DMA1_Channel1_IRQHandler(void) {
     const uint8_t rightSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(true);
     const bool leftOpenloopRequest=(m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||
                                     m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
-    const bool leftFeedbackReady=!encoder_feedback_selected(&m_motor_1,false) ||
-                                 m_motor_1.m_encoder_synced || leftOpenloopRequest;
+    const bool rightOpenloopRequest=(m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP ||
+                                     m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
+    const bool leftFeedbackReady=leftOpenloopRequest ||
+        (encoder_feedback_selected(&m_motor_1,false) ? m_motor_1.m_encoder_synced : hall_feedback_valid(&m_motor_1));
+    const bool rightFeedbackReady=rightOpenloopRequest || hall_feedback_valid(&m_motor_2);
     const uint8_t leftDriveRequest=(leftSourceEnable!=0u)&&(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)&&leftFeedbackReady;
-    const uint8_t rightDriveRequest=(rightSourceEnable!=0u)&&(m_motor_2.m_control_mode!=CONTROL_MODE_NONE);
+    const uint8_t rightDriveRequest=(rightSourceEnable!=0u)&&(m_motor_2.m_control_mode!=CONTROL_MODE_NONE)&&rightFeedbackReady;
     /* Semantik fault Vin VESC 6.00: integrasikan besar pelanggaran agar noise
      * satu sampel tidak langsung memicu fault, lalu fault tetap auto-recover
      * melalui m_fault_stop_time_ms sementara telemetry USART tetap berjalan. */
@@ -3007,10 +3195,16 @@ void DMA1_Channel1_IRQHandler(void) {
     if(rightBridgeWasOn && rightDriveRequest && m_motor_2.m_bridge_settle_ticks>0u) m_motor_2.m_bridge_settle_ticks--;
 
     /* Safety gate phase 2: only after motor_control_step has written the CCRs
-     * may a previously-off bridge be armed. Existing powered bridges remain on
-     * unless phase/DC protection, fault state, or drive request disabled them. */
-    if(leftDriveRequest && !leftCurrentTrip && m_motor_1.m_fault==FAULT_CODE_NONE) LEFT_TIM->BDTR|=TIM_BDTR_MOE;
-    if(rightDriveRequest && !rightCurrentTrip && m_motor_2.m_fault==FAULT_CODE_NONE) RIGHT_TIM->BDTR|=TIM_BDTR_MOE;
+     * may a previously-off bridge be armed. Re-evaluate sensor feedback here:
+     * hall_update()/encoder update runs inside motor_control_step, so the
+     * pre-control driveRequest can be stale on the exact frame where a debounced
+     * Hall input becomes invalid or an encoder loses readiness. Never re-arm
+     * MOE from that stale pre-control decision. */
+    const bool leftFeedbackReadyPost=leftOpenloopRequest ||
+        (encoder_feedback_selected(&m_motor_1,false) ? m_motor_1.m_encoder_synced : hall_feedback_valid(&m_motor_1));
+    const bool rightFeedbackReadyPost=rightOpenloopRequest || hall_feedback_valid(&m_motor_2);
+    if(leftDriveRequest && leftFeedbackReadyPost && !leftCurrentTrip && m_motor_1.m_fault==FAULT_CODE_NONE) LEFT_TIM->BDTR|=TIM_BDTR_MOE;
+    if(rightDriveRequest && rightFeedbackReadyPost && !rightCurrentTrip && m_motor_2.m_fault==FAULT_CODE_NONE) RIGHT_TIM->BDTR|=TIM_BDTR_MOE;
     s_overrun=0;
     foc_isr_monitor_end(focIsrStartCycles);
 }
@@ -3207,6 +3401,10 @@ float mcpwm_foc_get_id_motor(bool s){return q4_to_amp(mcpwm_foc_get_motor_const(
 static float bus_voltage_now(void){return (float)(batVoltage*BAT_CALIB_REAL_VOLTAGE/BAT_CALIB_ADC)/100.0f;}
 
 void mcpwm_foc_energy_update(uint32_t now_ms) {
+    /* Keep the proven hoverFOC ADC ISR free of VESC reciprocal/division work.
+     * Battery ADC/filtering remains in DMA1_Channel1 exactly as the master;
+     * only the derived VESC voltage scale is refreshed here in main context. */
+    if (s_voltage_scale_bat_adc != batVoltage) current_voltage_scale_refresh();
     if (s_energy_last_ms == 0u) { s_energy_last_ms = now_ms; return; }
     uint32_t dt_ms = (uint32_t)(now_ms - s_energy_last_ms);
     if (dt_ms == 0u) return;
