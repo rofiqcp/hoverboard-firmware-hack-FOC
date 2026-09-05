@@ -37,6 +37,19 @@ volatile int32_t positionCommandR = 0;
 
 volatile uint32_t foc_isr_cycles = 0;
 volatile uint8_t encoder_detect_stage = 0u;
+volatile int32_t encoder_detect_plus_mdeg = 0;
+volatile int32_t encoder_detect_minus_mdeg = 0;
+volatile uint32_t encoder_detect_plus_count = 0u;
+volatile uint32_t encoder_detect_minus_count = 0u;
+volatile uint32_t encoder_detect_origin_count = 0u;
+volatile uint32_t encoder_gpio_edge_a = 0u;
+volatile uint32_t encoder_gpio_edge_b = 0u;
+volatile uint32_t encoder_gpio_samples = 0u;
+volatile uint8_t encoder_gpio_last_ab = 0u;
+volatile int16_t encoder_detect_plus_id_q4 = 0;
+volatile int16_t encoder_detect_plus_iq_q4 = 0;
+volatile int16_t encoder_detect_minus_id_q4 = 0;
+volatile int16_t encoder_detect_minus_iq_q4 = 0;
 static inline void encoder_stage_set(uint8_t stage) {
     encoder_detect_stage = stage;
 #ifdef STM32F103xE
@@ -1418,6 +1431,12 @@ static bool encoder_detect_move(mcpwm_foc_motor_t *m, float current,
 
 bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *ratio, bool *inverted) {
     encoder_stage_set(1u);
+    encoder_detect_plus_mdeg=0; encoder_detect_minus_mdeg=0;
+    encoder_detect_plus_count=0u; encoder_detect_minus_count=0u; encoder_detect_origin_count=0u;
+    encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_samples=0u;
+    encoder_gpio_last_ab=(uint8_t)(((GPIOB->IDR & GPIO_PIN_6)?1u:0u) | ((GPIOB->IDR & GPIO_PIN_7)?2u:0u));
+    encoder_detect_plus_id_q4=encoder_detect_plus_iq_q4=0;
+    encoder_detect_minus_id_q4=encoder_detect_minus_iq_q4=0;
     uint8_t fail_code=0u;
     if(offset)*offset=1001.0f;
     if(ratio)*ratio=0.0f;
@@ -1463,20 +1482,29 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
 
     encoder_stage_set(4u);
     encoder_runtime_set_deg(m,0.0f);
+    encoder_detect_origin_count=encoder_read_raw_count();
     float phase_cont=0.0f;
     float plus_sum=0.0f, minus_sum=0.0f;
     const int samples=3;
     for(int pass=0;pass<samples;++pass){
         if(!encoder_detect_move(m,current,&phase_cont,60.0f)){fail_code=3u; goto detect_fail;}
         foc_bounded_delay_ms(150u);
-        plus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        const float plus_sample=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        plus_sum+=plus_sample;
+        encoder_detect_plus_mdeg=(int32_t)(plus_sample*1000.0f);
+        encoder_detect_plus_count=encoder_read_raw_count();
+        encoder_detect_plus_id_q4=m->m_id_q4; encoder_detect_plus_iq_q4=m->m_iq_q4;
         if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=4u; goto detect_fail;}
         foc_bounded_delay_ms(150u);
         if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=5u; goto detect_fail;}
 
         if(!encoder_detect_move(m,current,&phase_cont,-60.0f)){fail_code=6u; goto detect_fail;}
         foc_bounded_delay_ms(150u);
-        minus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        const float minus_sample=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        minus_sum+=minus_sample;
+        encoder_detect_minus_mdeg=(int32_t)(minus_sample*1000.0f);
+        encoder_detect_minus_count=encoder_read_raw_count();
+        encoder_detect_minus_id_q4=m->m_id_q4; encoder_detect_minus_iq_q4=m->m_iq_q4;
         if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=7u; goto detect_fail;}
         foc_bounded_delay_ms(150u);
         if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=8u; goto detect_fail;}
@@ -2021,6 +2049,15 @@ static void hall_update(mcpwm_foc_motor_t *m, bool second) {
 
 static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
     if (!encoder_port_active(m,second) || !m->m_encoder_configured || m->m_encoder_counts<4u) return;
+#ifdef STM32F103xE
+    if(!second){
+        const uint8_t ab=(uint8_t)(((GPIOB->IDR & GPIO_PIN_6)?1u:0u) | ((GPIOB->IDR & GPIO_PIN_7)?2u:0u));
+        const uint8_t ch=(uint8_t)(ab ^ encoder_gpio_last_ab);
+        if(ch & 1u) encoder_gpio_edge_a++;
+        if(ch & 2u) encoder_gpio_edge_b++;
+        encoder_gpio_last_ab=ab; encoder_gpio_samples++;
+    }
+#endif
     const uint32_t cnt=encoder_read_raw_count();
     const uint32_t counts=m->m_encoder_counts;
     int32_t delta=(int32_t)cnt-(int32_t)m->m_encoder_prev_count;
@@ -3168,21 +3205,28 @@ void DMA1_Channel1_IRQHandler(void) {
     const uint8_t rightBridgeWasOn=(RIGHT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u;
     if(leftDriveRequest && !leftBridgeWasOn && m_motor_1.m_fault==FAULT_CODE_NONE){
         m_motor_1.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
+        /* The hoverboard low-side current amplifiers shift common-mode when
+         * MOE turns on. Re-measure the driven baseline during the existing
+         * zero-vector settle window instead of applying the bridge-OFF boot
+         * offset to powered samples. This keeps the 8 A open-loop protection
+         * meaningful without false trips from a several-ampere offset step. */
+        m_motor_1.m_driven_offset_valid=0u;
+        m_motor_1.m_driven_offset_samples=0u;
         LEFT_TIM->LEFT_TIM_U=pwm_res/2u; LEFT_TIM->LEFT_TIM_V=pwm_res/2u; LEFT_TIM->LEFT_TIM_W=pwm_res/2u;
         reset_current_pi(&m_motor_1);
         m_motor_1.m_current_lpf_q16[0]=m_motor_1.m_current_lpf_q16[1]=0;
     }
     if(rightDriveRequest && !rightBridgeWasOn && m_motor_2.m_fault==FAULT_CODE_NONE){
         m_motor_2.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
+        m_motor_2.m_driven_offset_valid=0u;
+        m_motor_2.m_driven_offset_samples=0u;
         RIGHT_TIM->RIGHT_TIM_U=pwm_res/2u; RIGHT_TIM->RIGHT_TIM_V=pwm_res/2u; RIGHT_TIM->RIGHT_TIM_W=pwm_res/2u;
         reset_current_pi(&m_motor_2);
         m_motor_2.m_current_lpf_q16[0]=m_motor_2.m_current_lpf_q16[1]=0;
     }
-    /* Match upstream hoverboard-firmware-hack-FOC: the phase/DC current
-     * control offsets are calibrated once during the first 2000 synchronized
-     * ADC frames and then remain fixed. There is deliberately no per-start
-     * driven-offset calibration and no 50%% zero-vector hold before a command.
-     * m_driven_offset* mirrors this fixed control baseline for diagnostics only. */
+    /* Driven-offset learning is complete before bridge_settle_ticks reaches
+     * zero. Keep the legacy diagnostic flag deasserted; samples/valid expose
+     * the actual powered calibration state. */
     m_motor_1.m_driven_offset_calibrating=0u;
     m_motor_2.m_driven_offset_calibrating=0u;
 
@@ -3260,29 +3304,69 @@ void DMA1_Channel1_IRQHandler(void) {
         }
     }
 
+    /* While the bridge is deliberately held at the zero vector, learn its
+     * powered common-mode baseline. Incremental means avoid extra accumulators
+     * and converge over the full settle window before any sample can enter FOC
+     * or over-current protection. */
+    if(leftBridgeWasOn && leftDriveRequest && m_motor_1.m_bridge_settle_ticks>0u){
+        uint16_t n=m_motor_1.m_driven_offset_samples;
+        if(n==0u){
+            m_motor_1.m_driven_offset0=(int16_t)adc_buffer.rlA;
+            m_motor_1.m_driven_offset1=(int16_t)adc_buffer.rlB;
+            m_motor_1.m_driven_offsetdc=(int16_t)adc_buffer.dcl;
+        }else{
+            const int32_t d0=(int32_t)adc_buffer.rlA-m_motor_1.m_driven_offset0;
+            const int32_t d1=(int32_t)adc_buffer.rlB-m_motor_1.m_driven_offset1;
+            const int32_t dd=(int32_t)adc_buffer.dcl-m_motor_1.m_driven_offsetdc;
+            const int32_t den=(int32_t)n+1;
+            m_motor_1.m_driven_offset0+=(int16_t)(d0/den);
+            m_motor_1.m_driven_offset1+=(int16_t)(d1/den);
+            m_motor_1.m_driven_offsetdc+=(int16_t)(dd/den);
+        }
+        if(n<UINT16_MAX)m_motor_1.m_driven_offset_samples=(uint16_t)(n+1u);
+        m_motor_1.m_driven_offset_valid=1u;
+    }
+    if(rightBridgeWasOn && rightDriveRequest && m_motor_2.m_bridge_settle_ticks>0u){
+        uint16_t n=m_motor_2.m_driven_offset_samples;
+        if(n==0u){
+            m_motor_2.m_driven_offset0=(int16_t)adc_buffer.rrB;
+            m_motor_2.m_driven_offset1=(int16_t)adc_buffer.rrC;
+            m_motor_2.m_driven_offsetdc=(int16_t)adc_buffer.dcr;
+        }else{
+            const int32_t d0=(int32_t)adc_buffer.rrB-m_motor_2.m_driven_offset0;
+            const int32_t d1=(int32_t)adc_buffer.rrC-m_motor_2.m_driven_offset1;
+            const int32_t dd=(int32_t)adc_buffer.dcr-m_motor_2.m_driven_offsetdc;
+            const int32_t den=(int32_t)n+1;
+            m_motor_2.m_driven_offset0+=(int16_t)(d0/den);
+            m_motor_2.m_driven_offset1+=(int16_t)(d1/den);
+            m_motor_2.m_driven_offsetdc+=(int16_t)(dd/den);
+        }
+        if(n<UINT16_MAX)m_motor_2.m_driven_offset_samples=(uint16_t)(n+1u);
+        m_motor_2.m_driven_offset_valid=1u;
+    }
+
     /* Three current-sampling states are kept deliberately separate:
-     *  1) DRIVEN+settled: use the original 2000-sample control offset.
-     *  2) Stable bridge-OFF: use the frozen high-impedance offset for telemetry
-     *     only, so manual back-drive/passive regeneration remains observable.
-     *  3) OFF<->RUN transition/settling: sample is ambiguous, publish zero.
+     *  1) DRIVEN+settled: use the powered zero-vector baseline learned above.
+     *  2) Stable bridge-OFF: use the high-impedance offset for telemetry only.
+     *  3) OFF<->RUN transition/settling: publish zero and never trip current.
      * Only state (1) is ever allowed to feed over-current protection below. */
-    const uint8_t leftCurrentSampleValid=leftBridgeWasOn&&leftDriveRequest&&(m_motor_1.m_bridge_settle_ticks==0u);
-    const uint8_t rightCurrentSampleValid=rightBridgeWasOn&&rightDriveRequest&&(m_motor_2.m_bridge_settle_ticks==0u);
+    const uint8_t leftCurrentSampleValid=leftBridgeWasOn&&leftDriveRequest&&(m_motor_1.m_bridge_settle_ticks==0u)&&m_motor_1.m_driven_offset_valid;
+    const uint8_t rightCurrentSampleValid=rightBridgeWasOn&&rightDriveRequest&&(m_motor_2.m_bridge_settle_ticks==0u)&&m_motor_2.m_driven_offset_valid;
     const uint8_t leftOffTelemValid=(!leftBridgeWasOn)&&(!leftDriveRequest)&&m_motor_1.m_off_offset_valid;
     const uint8_t rightOffTelemValid=(!rightBridgeWasOn)&&(!rightDriveRequest)&&m_motor_2.m_off_offset_valid;
     if(leftCurrentSampleValid){
-        curL_phaA=(int16_t)(offsetrlA-adc_buffer.rlA);
-        curL_phaB=(int16_t)(offsetrlB-adc_buffer.rlB);
-        curL_DC=(int16_t)(offsetdcl-adc_buffer.dcl);
+        curL_phaA=(int16_t)(m_motor_1.m_driven_offset0-(int16_t)adc_buffer.rlA);
+        curL_phaB=(int16_t)(m_motor_1.m_driven_offset1-(int16_t)adc_buffer.rlB);
+        curL_DC=(int16_t)(m_motor_1.m_driven_offsetdc-(int16_t)adc_buffer.dcl);
     }else if(leftOffTelemValid){
         curL_phaA=off_telem_deadband_counts((int16_t)(m_motor_1.m_off_offset0-(int16_t)adc_buffer.rlA));
         curL_phaB=off_telem_deadband_counts((int16_t)(m_motor_1.m_off_offset1-(int16_t)adc_buffer.rlB));
         curL_DC=off_telem_deadband_counts((int16_t)(m_motor_1.m_off_offsetdc-(int16_t)adc_buffer.dcl));
     }else{ curL_phaA=0; curL_phaB=0; curL_DC=0; }
     if(rightCurrentSampleValid){
-        curR_phaB=(int16_t)(offsetrrB-adc_buffer.rrB);
-        curR_phaC=(int16_t)(offsetrrC-adc_buffer.rrC);
-        curR_DC=(int16_t)(offsetdcr-adc_buffer.dcr);
+        curR_phaB=(int16_t)(m_motor_2.m_driven_offset0-(int16_t)adc_buffer.rrB);
+        curR_phaC=(int16_t)(m_motor_2.m_driven_offset1-(int16_t)adc_buffer.rrC);
+        curR_DC=(int16_t)(m_motor_2.m_driven_offsetdc-(int16_t)adc_buffer.dcr);
     }else if(rightOffTelemValid){
         curR_phaB=off_telem_deadband_counts((int16_t)(m_motor_2.m_off_offset0-(int16_t)adc_buffer.rrB));
         curR_phaC=off_telem_deadband_counts((int16_t)(m_motor_2.m_off_offset1-(int16_t)adc_buffer.rrC));

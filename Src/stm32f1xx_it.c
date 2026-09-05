@@ -212,8 +212,11 @@ void USART3_IRQHandler(void)
 {
   if ((__HAL_UART_GET_FLAG(&huart3, UART_FLAG_IDLE) != RESET) &&
       (__HAL_UART_GET_IT_SOURCE(&huart3, UART_IT_IDLE) != RESET)) {
+    /* RX DMA is drained only from the main loop. Calling usart3_rx_check()
+     * here races its static oldPos against the main-loop caller and can feed
+     * the same DMA bytes twice into the VESC parser, producing false CRC
+     * errors on otherwise valid frames. IDLE only wakes/acknowledges UART. */
     __HAL_UART_CLEAR_IDLEFLAG(&huart3);
-    usart3_rx_check();
   }
   HAL_UART_IRQHandler(&huart3);
 }
