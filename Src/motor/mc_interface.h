@@ -61,4 +61,14 @@ void mc_interface_restore_default_motor(bool is_second_motor, bool store_to_eepr
 }
 #endif
 
+
+/* LEFT ABI steering calibration/homing. */
+bool mc_interface_store_steering_calibration(void);
+bool mc_interface_load_steering_calibration(void);
+bool mc_interface_steering_calibration_valid(void);
+bool mc_interface_steering_boot_home(void);
+bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,
+                                            int32_t *raw_left, int32_t *raw_right, int32_t *span);
+bool mc_interface_set_steering_deg(float deg);
+float mc_interface_get_steering_deg(void);
 #endif

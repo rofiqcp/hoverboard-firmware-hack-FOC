@@ -49,6 +49,12 @@
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
 #define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   1000u
+#define MCCONF_STEERING_HOME_CURRENT_A             0.70f
+#define MCCONF_STEERING_CAL_CURRENT_MAX_A          1.00f
+#define MCCONF_STEERING_STALL_MS                    350u
+#define MCCONF_STEERING_SEEK_TIMEOUT_MS            8000u
+#define MCCONF_STEERING_MIN_SPAN_COUNTS              32
+#define MCCONF_STEERING_SETTLE_COUNTS                 6
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */
 #define MCCONF_ENCODER_SPEED_TIMEOUT_TICKS         8000u /* 0.5 s -> zero */
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u

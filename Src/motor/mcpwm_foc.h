@@ -66,6 +66,11 @@ typedef struct {
     volatile int32_t m_position_target_counts;
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
+    /* LEFT steering calibration. span is signed user-direction count travel
+     * from physical left stop (-30 deg) to right stop (+30 deg). */
+    volatile int32_t m_steering_span_counts;
+    volatile uint8_t m_steering_calibrated;
+    volatile uint8_t m_steering_homed;
     /* Stock VESC COMM_SET_POS is single-turn electrical rotor position. Keep it
      * separate from this project's long-range Hall-count position extension. */
     volatile uint16_t m_pos_pid_set_phase;
@@ -420,4 +425,12 @@ void mcpwm_foc_adc_int_handler(void);
 }
 #endif
 
+
+bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed);
+bool mcpwm_foc_steering_rebase_left(void);
+bool mcpwm_foc_steering_is_calibrated(void);
+bool mcpwm_foc_steering_is_homed(void);
+int32_t mcpwm_foc_steering_span_counts(void);
+float mcpwm_foc_get_steering_deg(void);
+bool mcpwm_foc_set_steering_deg(float deg);
 #endif

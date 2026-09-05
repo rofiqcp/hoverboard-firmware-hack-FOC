@@ -80,6 +80,7 @@ HB_GET_TUNING = 6
 HB_SET_TUNING = 7
 HB_SET_ID_TEST = 8
 HB_SET_STEERING_DEG = 9
+HB_GET_STEERING_CAL = 10
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))

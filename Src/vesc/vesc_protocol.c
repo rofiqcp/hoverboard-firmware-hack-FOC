@@ -41,6 +41,7 @@
 #define HB_CUSTOM_SET_TUNING             7u
 #define HB_CUSTOM_SET_ID_TEST            8u
 #define HB_CUSTOM_SET_STEERING_DEG        9u /* ROS/Web signed mechanical millidegree */
+#define HB_CUSTOM_GET_STEERING_CAL       10u
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -594,7 +595,8 @@ static void get_values_normalized(bool second, mc_values *v) {
         v->rpm=-v->rpm; v->iq=-v->iq; v->duty_now=-v->duty_now; v->vq=-v->vq;
         v->tachometer=-v->tachometer;
     }
-    v->position=mc_interface_get_pid_pos_now_motor(second);
+    v->position=(!second && mc_interface_steering_calibration_valid()) ?
+        mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
     /* Hoverboard temperature calibration is deci-degC (358 = 35.8C). */
     v->temp_mos = (float)board_temp_deg_c * 0.1f;
     v->temp_mos_1 = v->temp_mos;
@@ -1775,6 +1777,20 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         reply_custom_pos_state(second, op, 0u);
         return;
     }
+    if (op == HB_CUSTOM_GET_STEERING_CAL) {
+        uint8_t b[32]; int32_t j=0; uint8_t flags=0u;
+        if(mc_interface_steering_calibration_valid())flags|=0x01u;
+        if(mcpwm_foc_steering_is_homed())flags|=0x02u;
+        if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
+        const int32_t sp=mcpwm_foc_steering_span_counts();
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u; b[j++]=flags;
+        buffer_append_int32(b,sp,&j);
+        buffer_append_int32(b,mcpwm_foc_get_position_user_counts(false),&j);
+        buffer_append_int32(b,mcpwm_foc_get_position_target_user_counts(false),&j);
+        buffer_append_int32(b,(int32_t)lroundf(mc_interface_get_steering_deg()*1000.0f),&j);
+        uart_send_payload(b,(uint16_t)j); return;
+    }
     if (op == HB_CUSTOM_SET_STEERING_DEG) {
         /* ROS/Web runtime path: signed mechanical steering degrees with 0=center.
          * Keep this separate from stock COMM_SET_POS, whose VESC Tool widget is
@@ -1785,7 +1801,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         if(mdeg>30000)mdeg=30000;
         if(mdeg< -30000)mdeg=-30000;
         touch_motor(false);
-        mc_interface_set_pid_pos((float)mdeg/1000.0f);
+        (void)mc_interface_set_steering_deg((float)mdeg/1000.0f);
         return;
     }
     if (op == HB_CUSTOM_GET_TUNING || op == HB_CUSTOM_SET_TUNING) {
@@ -2202,7 +2218,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
                 pos=MCCONF_STEERING_POS_MIN_DEG +
                     (pos/360.0f)*(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
             }
-            touch_motor(second); mc_interface_set_pid_pos(pos);
+            touch_motor(second);
+            if(!second) (void)mc_interface_set_steering_deg(pos);
+            else mc_interface_set_pid_pos(pos);
         }
         break;
     case COMM_ALIVE:
@@ -2268,15 +2286,24 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_DETECT_ENCODER: {
         float off=1001.0f, ratio=0.0f; bool inv=false;
-        float current=1.0f;
+        float current=MCCONF_STEERING_HOME_CURRENT_A;
         if(n>=4u) current=(float)buffer_get_int32(d,&k)/1000.0f;
+        if(current<0.30f)current=0.30f;
+        if(current>MCCONF_STEERING_CAL_CURRENT_MAX_A)current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
         app_vesc_disable_output(60000);
-        (void)mcpwm_foc_encoder_detect(current,second,&off,&ratio,&inv);
+        int32_t raw_left=0,raw_right=0,span=0;
+        const bool ok=!second && mc_interface_steering_detect_calibrate(
+            current,&off,&ratio,&inv,&raw_left,&raw_right,&span);
+        /* Preserve the stock VESC reply shape so VESC Tool still sees encoder
+         * offset/ratio/inversion. Hard-stop/span details are available through
+         * project diagnostics/ROS and are stored transactionally in EEPROM. */
+        if(!ok){off=1001.0f;ratio=0.0f;inv=false;}
         uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
         buffer_append_float32(reply,off,1e6f,&ri);
         buffer_append_float32(reply,ratio,1e6f,&ri);
         reply[ri++]=inv?1u:0u;
         uart_send_payload(reply,(uint16_t)ri);
+        (void)raw_left; (void)raw_right; (void)span;
         break;
     }
     case COMM_DETECT_HALL_FOC:

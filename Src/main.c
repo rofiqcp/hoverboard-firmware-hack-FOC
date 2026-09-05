@@ -164,9 +164,12 @@ int main(void) {
    * after GPIO/TIM/ADC/UART/DMA are configured and their state is valid. */
   __enable_irq();
 
-  /* ABI A/B tanpa index membutuhkan electrical-zero setiap power cycle.
-   * Fungsi ini no-op pada default Hall dan tidak pernah menggerakkan RIGHT. */
-  (void)mcpwm_foc_encoder_startup_align(false);
+  /* Incremental ABI has no absolute index. Boot must never move steering before
+   * the VESC protocol is alive: keep LEFT high-Z and responsive. A persisted
+   * span is only geometry; absolute position is intentionally not trusted after
+   * reset. Detect Encoder performs phase detect + hard-stop calibration + center
+   * and arms signed steering for this power cycle. */
+  mcpwm_foc_release_motor(false);
 
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);

@@ -694,6 +694,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_position_kd_filter_q16=MCCONF_POSITION_KD_FILTER_Q16;
     m->m_position_dt_ticks=1u;
     m->m_position_min_counts=INT32_MIN; m->m_position_max_counts=INT32_MAX;
+    m->m_steering_span_counts=0; m->m_steering_calibrated=0u; m->m_steering_homed=0u;
     m->m_current_limit_q4=(int16_t)(MCCONF_L_CURRENT_MAX*MCCONF_L_CURRENT_MAX_SCALE*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_current_limit_neg_q4=(int16_t)(-MCCONF_L_CURRENT_MIN*MCCONF_L_CURRENT_MIN_SCALE*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_battery_cut_start_adc=(uint16_t)(MCCONF_L_BATTERY_CUT_START*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
@@ -1132,6 +1133,58 @@ void mcpwm_foc_set_position_counts(int32_t pc,bool second){
 }
 void mcpwm_foc_set_position_user_counts(int32_t pc,bool second){
     mcpwm_foc_set_position_counts(user_position_to_internal(pc,second),second);
+}
+
+bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
+    mcpwm_foc_motor_t *m=&m_motor_1;
+    int32_t a=span_counts<0?-span_counts:span_counts;
+    if(a<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
+    m->m_steering_span_counts=span_counts;
+    m->m_steering_calibrated=1u;
+    m->m_steering_homed=homed?1u:0u;
+    m->m_position_min_counts=span_counts<0?span_counts:0;
+    m->m_position_max_counts=span_counts>0?span_counts:0;
+    return true;
+}
+
+bool mcpwm_foc_steering_rebase_left(void){
+    mcpwm_foc_motor_t *m=&m_motor_1;
+    if(!m->m_steering_calibrated)return false;
+    m->m_position_counts=0; m->m_position_abs_counts=0u;
+    m->m_position_target_counts=0;
+    reset_position_pid(m);
+    m->m_steering_homed=1u;
+    return true;
+}
+
+bool mcpwm_foc_steering_is_calibrated(void){return m_motor_1.m_steering_calibrated!=0u;}
+bool mcpwm_foc_steering_is_homed(void){return m_motor_1.m_steering_calibrated&&m_motor_1.m_steering_homed;}
+int32_t mcpwm_foc_steering_span_counts(void){return m_motor_1.m_steering_span_counts;}
+
+float mcpwm_foc_get_steering_deg(void){
+    const mcpwm_foc_motor_t *m=&m_motor_1;
+    if(!m->m_steering_calibrated || m->m_steering_span_counts==0)return 0.0f;
+    float f=(float)m->m_position_counts/(float)m->m_steering_span_counts;
+    float d=MCCONF_STEERING_POS_MIN_DEG +
+        f*(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+    /* Allow a little overshoot to remain visible in telemetry, but never emit
+     * wraparound 330/350-degree values for LEFT steering. */
+    if(d<-45.0f)d=-45.0f;
+    if(d>45.0f)d=45.0f;
+    return d;
+}
+
+bool mcpwm_foc_set_steering_deg(float deg){
+    mcpwm_foc_motor_t *m=&m_motor_1;
+    if(!m->m_steering_calibrated || !m->m_steering_homed || !m->m_encoder_synced ||
+       m->m_steering_span_counts==0){mcpwm_foc_release_motor(false);return false;}
+    if(deg<MCCONF_STEERING_POS_MIN_DEG)deg=MCCONF_STEERING_POS_MIN_DEG;
+    if(deg>MCCONF_STEERING_POS_MAX_DEG)deg=MCCONF_STEERING_POS_MAX_DEG;
+    const float f=(deg-MCCONF_STEERING_POS_MIN_DEG)/
+        (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+    const int32_t target=(int32_t)lroundf(f*(float)m->m_steering_span_counts);
+    mcpwm_foc_set_position_counts(target,false);
+    return true;
 }
 void mcpwm_foc_set_position_user_limits(int32_t minc,int32_t maxc,bool second){
     mcpwm_foc_motor_t*m=mcpwm_foc_get_motor(second);

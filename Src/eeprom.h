@@ -216,7 +216,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             ((uint8_t)223u)       /* 123 legacy/App + 100 append-only MC extension slots */
+#define NB_OF_VAR             ((uint8_t)228u)       /* 123 legacy/App + 100 append-only MC extension slots */
 
 /* Exported types ------------------------------------------------------------*/
 /* Exported macro ------------------------------------------------------------*/

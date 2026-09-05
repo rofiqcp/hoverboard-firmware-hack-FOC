@@ -272,14 +272,21 @@ static bool copy_pending_image(void) {
 
     /* Copy page-by-page. PENDING metadata stays intact until the complete app
      * CRC and vector are valid, so a power loss retries from page zero safely. */
+    /* STM32F103 is single-bank flash. Never use the staging flash address as
+     * the source while erasing/programming another page in that same bank.
+     * Snapshot one page into SRAM first, then erase and program from SRAM.
+     * This also makes the copy deterministic if the flash interface stalls
+     * instruction/data reads while BSY is asserted. */
+    static uint8_t page_buf[F103_FLASH_PAGE_SIZE];
     uint32_t copied = 0u;
     while (copied < size) {
         const uint32_t remain = size - copied;
         const uint32_t chunk = remain < F103_FLASH_PAGE_SIZE ? remain : F103_FLASH_PAGE_SIZE;
         const uint32_t dst = F103_APP_BASE_ADDR + copied;
         const uint8_t *src = (const uint8_t *)(F103_STAGE_BASE_ADDR + F103_VESC_IMAGE_HEADER_SIZE + copied);
+        memcpy(page_buf, src, chunk);
         if (!erase_one_page(dst)) return false;
-        if (!program_halfwords(dst, src, chunk)) return false;
+        if (!program_halfwords(dst, page_buf, chunk)) return false;
         copied += chunk;
     }
     if (crc16((const uint8_t *)F103_APP_BASE_ADDR, size) != wanted) return false;

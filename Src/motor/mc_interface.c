@@ -229,8 +229,13 @@ enum {
     EE_L_EXT9_R_LO, EE_L_EXT9_R_HI, EE_L_EXT9_L_LO, EE_L_EXT9_L_HI,
     EE_L_EXT9_LDIFF_LO, EE_L_EXT9_LDIFF_HI, EE_L_EXT9_FLUX_LO, EE_L_EXT9_FLUX_HI,
     EE_R_EXT9_R_LO, EE_R_EXT9_R_HI, EE_R_EXT9_L_LO, EE_R_EXT9_L_HI,
-    EE_R_EXT9_LDIFF_LO, EE_R_EXT9_LDIFF_HI, EE_R_EXT9_FLUX_LO, EE_R_EXT9_FLUX_HI
+    EE_R_EXT9_LDIFF_LO, EE_R_EXT9_LDIFF_HI, EE_R_EXT9_FLUX_LO, EE_R_EXT9_FLUX_HI,
+    /* Project steering calibration, independent from standard MC signature.
+     * Magic is written last; span and bitwise complement make torn writes fail closed. */
+    EE_L_STEER_CAL_MAGIC = 223, EE_L_STEER_SPAN_LO, EE_L_STEER_SPAN_HI,
+    EE_L_STEER_SPAN_INV_LO, EE_L_STEER_SPAN_INV_HI
 };
+#define EE_L_STEER_CAL_MAGIC_VALUE 0xC360u
 #define EE_CFG_SIGNATURE_VALUE 0x6021u
 #define EE_CFG_SIGNATURE_V34   0x6020u /* before Detect-All R/L/flux persistence */
 #define EE_CFG_SIGNATURE_V33   0x601Fu /* before Hall extra-sample persistence */
@@ -299,6 +304,133 @@ static bool hall_table_sane(const uint8_t t[8]) {
         const uint16_t gap=b-a;
         if (gap < 18u || gap > 48u) return false;
     }
+    return true;
+}
+
+static bool steering_seek_stop_user(float current_a, int8_t user_dir, int32_t *stop_counts) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
+    if(!m || !mcpwm_foc_encoder_is_synced(false) || user_dir==0)return false;
+    if(current_a<0.30f)current_a=0.30f;
+    if(current_a>MCCONF_STEERING_CAL_CURRENT_MAX_A)current_a=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+    const uint32_t start=HAL_GetTick();
+    uint32_t last_move=start;
+    int32_t last=m->m_position_counts;
+    bool any_motion=false;
+    while((uint32_t)(HAL_GetTick()-start)<MCCONF_STEERING_SEEK_TIMEOUT_MS){
+        const uint32_t age=(uint32_t)(HAL_GetTick()-start);
+        float ramp=(float)age/300.0f; if(ramp>1.0f)ramp=1.0f;
+        mc_interface_select_motor_thread(1);
+        mc_interface_set_current((float)user_dir*current_a*ramp);
+        mcpwm_foc_vesc_override_touch(false);
+        HAL_Delay(5u);
+        if(m->m_fault!=FAULT_CODE_NONE)break;
+        const int32_t now=m->m_position_counts;
+        int32_t d=now-last; if(d<0)d=-d;
+        if(d>=1){last=now;last_move=HAL_GetTick();any_motion=true;}
+        if(age>500u && (uint32_t)(HAL_GetTick()-last_move)>=MCCONF_STEERING_STALL_MS){
+            if(stop_counts)*stop_counts=now;
+            mc_interface_release_motor();
+            mcpwm_foc_vesc_override_clear(false);
+            HAL_Delay(120u);
+            /* Starting already at a stop is valid; phase-detect already proved
+             * encoder wiring/motion before this function is called. */
+            (void)any_motion;
+            return true;
+        }
+    }
+    mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(false);
+    return false;
+}
+
+static bool steering_wait_target(int32_t target, uint32_t timeout_ms){
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
+    const uint32_t start=HAL_GetTick();
+    while((uint32_t)(HAL_GetTick()-start)<timeout_ms){
+        mcpwm_foc_vesc_override_touch(false);
+        const int32_t e=m->m_position_counts-target;
+        if(e<=MCCONF_STEERING_SETTLE_COUNTS && e>=-MCCONF_STEERING_SETTLE_COUNTS){
+            HAL_Delay(150u); return true;
+        }
+        if(m->m_fault!=FAULT_CODE_NONE)return false;
+        HAL_Delay(5u);
+    }
+    return false;
+}
+
+bool mc_interface_store_steering_calibration(void){
+    if(!mcpwm_foc_steering_is_calibrated())return false;
+    const int32_t span=mcpwm_foc_steering_span_counts();
+    const uint32_t u=(uint32_t)span, inv=~u; bool ok=true;
+    HAL_FLASH_Unlock();
+    ok &= ee_write_u32_pair(EE_L_STEER_SPAN_LO,u);
+    ok &= ee_write_u32_pair(EE_L_STEER_SPAN_INV_LO,inv);
+    ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC,EE_L_STEER_CAL_MAGIC_VALUE);
+    HAL_FLASH_Lock(); return ok;
+}
+
+bool mc_interface_load_steering_calibration(void){
+    uint16_t magic=0u; uint32_t u=0u,inv=0u;
+    if(!ee_read_slot(EE_L_STEER_CAL_MAGIC,&magic) || magic!=EE_L_STEER_CAL_MAGIC_VALUE ||
+       !ee_read_u32_pair(EE_L_STEER_SPAN_LO,&u) || !ee_read_u32_pair(EE_L_STEER_SPAN_INV_LO,&inv) ||
+       inv!=~u)return false;
+    const int32_t span=(int32_t)u;
+    return mcpwm_foc_steering_set_span(span,false);
+}
+
+bool mc_interface_steering_calibration_valid(void){return mcpwm_foc_steering_is_calibrated();}
+float mc_interface_get_steering_deg(void){return mcpwm_foc_get_steering_deg();}
+bool mc_interface_set_steering_deg(float deg){return mcpwm_foc_set_steering_deg(deg);}
+
+bool mc_interface_steering_boot_home(void){
+    if(!mcpwm_foc_steering_is_calibrated())return false;
+    if(!mcpwm_foc_encoder_startup_align(false))return false;
+    int32_t left=0;
+    if(!steering_seek_stop_user(MCCONF_STEERING_HOME_CURRENT_A,-1,&left))return false;
+    (void)left;
+    if(!mcpwm_foc_steering_rebase_left())return false;
+    const int32_t span=mcpwm_foc_steering_span_counts();
+    const int32_t center=span/2;
+    if(!mcpwm_foc_set_steering_deg(0.0f))return false;
+    const bool ok=steering_wait_target(center,5000u);
+    mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
+    return ok;
+}
+
+bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,
+                                            int32_t *raw_left, int32_t *raw_right, int32_t *span_out){
+    float off=1001.0f, rat=0.0f; bool inv=false;
+    if(!mcpwm_foc_encoder_detect(current,false,&off,&rat,&inv))return false;
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
+    mc_configuration c=m->m_conf;
+    c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI; c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    c.foc_encoder_offset=off; c.foc_encoder_ratio=rat; c.foc_encoder_inverted=inv;
+    mcpwm_foc_set_configuration(&c,false);
+    if(!mcpwm_foc_encoder_startup_align(false))return false;
+
+    int32_t l=0,r=0;
+    if(!steering_seek_stop_user(current,-1,&l))return false;
+    if(!steering_seek_stop_user(current,+1,&r))return false;
+    const int32_t span=r-l; int32_t aspan=span<0?-span:span;
+    if(aspan<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
+
+    /* We are physically at RIGHT stop. Rebase runtime count domain so LEFT=0
+     * and RIGHT=span regardless of encoder A/B numerical direction. */
+    mcpwm_foc_release_motor(false);
+    m->m_position_counts=span; m->m_position_abs_counts=0u; m->m_position_target_counts=span;
+    if(!mcpwm_foc_steering_set_span(span,true))return false;
+    if(!mc_interface_store_configuration_motor(false) || !mc_interface_store_steering_calibration())return false;
+
+    if(!mcpwm_foc_set_steering_deg(0.0f))return false;
+    const bool centered=steering_wait_target(span/2,6000u);
+    mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
+    if(!centered)return false;
+    if(offset)*offset=off;
+    if(ratio)*ratio=rat;
+    if(inverted)*inverted=inv;
+    if(raw_left)*raw_left=l;
+    if(raw_right)*raw_right=r;
+    if(span_out)*span_out=span;
     return true;
 }
 

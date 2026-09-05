@@ -173,8 +173,8 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_APP.ld').read_text(); bootlds=(ROOT/'STM32F103RCTx_BOOTLOADER.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)223u\)', eeh), 'EEPROM virtual variable count mismatch'
-    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==223 and addrs[0]==1000 and addrs[-1]==1222 and addrs==list(range(1000,1223)), 'EEPROM VirtAddVarTab must exactly cover all 223 append-only variables'
+    assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)228u\)', eeh), 'EEPROM virtual variable count mismatch'
+    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==228 and addrs[0]==1000 and addrs[-1]==1227 and addrs==list(range(1000,1228)), 'EEPROM VirtAddVarTab must exactly cover all 228 append-only variables'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()

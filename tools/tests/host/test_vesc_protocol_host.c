@@ -101,6 +101,17 @@ void mc_interface_set_brake_current_rel(float val) {
 void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
+bool mc_interface_steering_calibration_valid(void){return true;}
+float mc_interface_get_steering_deg(void){return 12.5f;}
+bool mc_interface_set_steering_deg(float p){set_pos[0]=p;return true;}
+bool mc_interface_steering_detect_calibrate(float current,float *offset,float *ratio,bool *inverted,
+                                            int32_t *raw_left,int32_t *raw_right,int32_t *span){
+    (void)current; if(offset)*offset=0.0f; if(ratio)*ratio=4.0f; if(inverted)*inverted=false;
+    if(raw_left)*raw_left=0;
+    if(raw_right)*raw_right=683;
+    if(span)*span=683;
+    return true;
+}
 void mcpwm_foc_sync_tuning_to_conf(bool second) { (void)second; }
 void mcpwm_foc_get_default_configuration(mc_configuration *c, bool second) {
     (void)second; memset(c,0,sizeof(*c)); c->motor_type=MOTOR_TYPE_FOC; c->l_current_max=15.0f; c->l_current_min=-15.0f;
@@ -162,6 +173,8 @@ float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?
 float mcpwm_foc_get_phase_encoder_motor(bool second) { return second?0.0f:12.5f; }
 float mcpwm_foc_get_encoder_position_motor(bool second) { return second?0.0f:12.5f; }
 bool mcpwm_foc_encoder_is_synced(bool second) { return !second && diag_motors[0].m_encoder_synced!=0u; }
+bool mcpwm_foc_steering_is_homed(void){return true;}
+int32_t mcpwm_foc_steering_span_counts(void){return 683;}
 bool mcpwm_foc_encoder_startup_align(bool second) { if(second)return false; diag_motors[0].m_encoder_synced=1u; return true; }
 bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *ratio,bool *inverted) {
     (void)current; if(second)return false; if(offset)*offset=12.0f; if(ratio)*ratio=15.0f; if(inverted)*inverted=false; return true;
@@ -331,7 +344,7 @@ int main(void){
         uint8_t qp[5]={COMM_SET_POS,0,0,0,0}; qi=1; buffer_append_int32(qp,15000000,&qi);
         enqueue_only(qd,sizeof(qd)); enqueue_only(qc,sizeof(qc)); enqueue_only(qr,sizeof(qr)); enqueue_only(qp,sizeof(qp));
         vesc_protocol_process_pending();
-        if(!nearf32(set_pos[0],15.0f,0.001f))return fail("realtime mailbox latest setpoint");
+        if(!nearf32(set_pos[0],-27.5f,0.001f))return fail("realtime mailbox latest VESC-tool mapped setpoint");
         if(!nearf32(set_duty[0],0.0f,0.0001f)||!nearf32(set_current[0],0.0f,0.001f)||
            !nearf32(set_rpm[0],0.0f,0.001f))return fail("realtime mailbox stale command applied");
     }
@@ -511,7 +524,7 @@ int main(void){
     uint8_t rpm[5]={COMM_SET_RPM,0,0,0,0}; k=1;buffer_append_int32(rpm,300,&k);if(!transact(rpm,sizeof(rpm),r,&rn))return fail("local rpm frame");
     if(fabsf(set_rpm[0]-300.0f)>0.001f||touch_count[0]==0u)return fail("local rpm");
     uint8_t posl[5]={COMM_SET_POS,0,0,0,0}; k=1;buffer_append_int32(posl,45000000,&k);
-    if(!transact(posl,sizeof(posl),r,&rn)||fabsf(set_pos[0]-45.0f)>0.001f)return fail("local position");
+    if(!transact(posl,sizeof(posl),r,&rn)||fabsf(set_pos[0]-(-22.5f))>0.001f)return fail("local VESC Tool position map");
     uint8_t posr[7]={COMM_FORWARD_CAN,2u,COMM_SET_POS,0,0,0,0}; k=3;buffer_append_int32(posr,30000000,&k);
     if(!transact(posr,sizeof(posr),r,&rn)||fabsf(set_pos[1]-30.0f)>0.001f)return fail("right position forward unchanged");
     uint8_t gmr[]={COMM_FORWARD_CAN,2u,COMM_GET_MCCONF};
