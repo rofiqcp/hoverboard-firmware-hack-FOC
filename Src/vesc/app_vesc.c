@@ -189,7 +189,7 @@ void app_vesc_defaults(app_configuration *a, uint8_t id) {
     a->permanent_uart_enabled = true;
     a->can_mode = CAN_MODE_VESC;
     a->app_to_use = APP_UART;
-    a->app_uart_baudrate = 115200u;
+    a->app_uart_baudrate = USART3_BAUD;
     a->app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
     a->app_adc_conf.hyst = 0.15f;
     a->app_adc_conf.voltage_start = 0.9f;
@@ -239,8 +239,8 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     if (c.app_adc_conf.ctrl_type > ADC_CTRL_TYPE_PID_REV_BUTTON) c.app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
     if (c.app_adc_conf.update_rate_hz == 0u) c.app_adc_conf.update_rate_hz = 1u;
     /* This board has one physical VESC UART. Keep its electrical link fixed at
-     * 115200 so writing App Config cannot strand VESC Tool on an unknown baud. */
-    c.app_uart_baudrate = 115200u;
+     * F103_VESC_UART_BAUD so writing App Config cannot strand VESC Tool on an unknown baud. */
+    c.app_uart_baudrate = USART3_BAUD;
     /* Leaving an active ADC controller must release its last motor command once.
      * In APP_ADC_UART with ctrl_type NONE, subsequent UART SET_* commands remain
      * authoritative because the ADC app no longer touches the motor at all. */

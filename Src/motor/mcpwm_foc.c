@@ -307,7 +307,10 @@ static void conf_defaults(mc_configuration *c, bool second) {
     memset(c, 0, sizeof(*c));
     c->motor_type = MOTOR_TYPE_FOC;
     c->sensor_mode = SENSOR_MODE_SENSORED;
-    c->foc_sensor_mode = FOC_SENSOR_MODE_HALL;
+    /* Project hardware is mixed-sensor: LEFT steering uses the 4096-count ABI
+     * encoder on PB6/PB7; RIGHT traction remains Hall. Detect-All may refine
+     * offset/ratio/inversion, but a blank EEPROM must boot with the right port. */
+    c->foc_sensor_mode = second ? FOC_SENSOR_MODE_HALL : FOC_SENSOR_MODE_ENCODER;
     c->l_current_max = MCCONF_L_CURRENT_MAX;
     c->l_current_min = MCCONF_L_CURRENT_MIN;
     c->l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
@@ -337,7 +340,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->l_temp_fet_end = MCCONF_L_TEMP_FET_END;
     c->l_temp_motor_start = MCCONF_L_TEMP_MOTOR_START;
     c->l_temp_motor_end = MCCONF_L_TEMP_MOTOR_END;
-    c->m_sensor_port_mode = SENSOR_PORT_MODE_HALL;
+    c->m_sensor_port_mode = second ? SENSOR_PORT_MODE_HALL : SENSOR_PORT_MODE_ABI;
     /* Hardware default only: the right bridge/motor installation is mirrored.
      * VESC packets remain motor-local; mc_interface DIR_MULT applies this
      * standard Motor Configuration field for motor thread 2. */

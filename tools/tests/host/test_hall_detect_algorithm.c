@@ -33,6 +33,15 @@ static void hold_left_hall(uint8_t h,uint16_t ticks){
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,h);
     for(uint16_t i=0u;i<ticks;++i)mcpwm_foc_adc_int_handler();
 }
+static void force_hall_fixture(void){
+    /* This file deliberately validates the Hall detector on both bridges.
+     * Production LEFT defaults to ABI encoder, so opt into Hall explicitly. */
+    m_motor_1.m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    m_motor_1.m_conf.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    m_motor_1.m_encoder_synced=0u;
+    m_motor_2.m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    m_motor_2.m_conf.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+}
 
 /* Deliberately non-default Hall/phase permutations. Index is 60-degree
  * electrical sector in applied board phase coordinates. */
@@ -103,7 +112,7 @@ int main(void){
                 const unsigned src=rev?((6u-sec)%6u):sec;
                 left_raw_for_sector[sec]=permute_hall_bits(base[src],perms[pi]);
             }
-            mcpwm_foc_init();
+            mcpwm_foc_init(); force_hall_fixture();
             if(!mcpwm_foc_detect_hall(1.0f,false,testtab))return fail("permuted Hall/phase detector returned false");
             if(validate(testtab,left_raw_for_sector,"permuted"))return 1;
             cases++;
@@ -113,7 +122,7 @@ int main(void){
         printf("HALL_WIRING_PERMUTATION_PASS cases=%u\n",cases);
     }
 
-    mcpwm_foc_init();
+    mcpwm_foc_init(); force_hall_fixture();
     HAL_Delay(1u);
     if(!mcpwm_foc_detect_hall(1.0f,false,tl))return fail("left detector returned false");
     if(validate(tl,left_raw_for_sector,"left"))return 1;
@@ -135,7 +144,7 @@ int main(void){
      * left legitimately carries interpolation/rate-limit history. Re-apply the
      * just-detected tables exactly as a clean boot/config load would. */
     mc_configuration cl=m_motor_1.m_conf, cr=m_motor_2.m_conf;
-    mcpwm_foc_init();
+    mcpwm_foc_init(); force_hall_fixture();
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
 
@@ -246,7 +255,7 @@ int main(void){
      * Sequence follows detected table phase order. One deliberate one-ISR
      * skipped-state glitch must be invisible after debounce. A real reversal
      * must reset period history and cannot be counted as a bad Hall sequence. */
-    mcpwm_foc_init(); mcpwm_foc_set_configuration(&cl,false);
+    mcpwm_foc_init(); force_hall_fixture(); mcpwm_foc_set_configuration(&cl,false);
     const uint8_t seq[6]={5u,1u,3u,2u,6u,4u};
     hold_left_hall(seq[0],240u);
     for(uint8_t lap=0u;lap<2u;++lap){

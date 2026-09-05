@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include "stm32f1xx_hal.h"
+#include "vesc/f103_boot_layout.h"
 
 /* Fixed firmware profile: BOARD 0 + USART3 only. */
 #ifndef VARIANT_USART
@@ -126,7 +127,7 @@
 #define SERIAL_BUFFER_SIZE       768
 #define SERIAL_DEBUG_LINE_SIZE   96
 #define SERIAL_TIMEOUT           160
-#define USART3_BAUD              115200
+#define USART3_BAUD              F103_VESC_UART_BAUD
 #define USART3_WORDLENGTH        UART_WORDLENGTH_8B
 
 #define SERIAL_STATUS_ENABLED    (1u << 0)

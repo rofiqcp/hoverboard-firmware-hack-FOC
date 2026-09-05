@@ -41,9 +41,18 @@ static void set_halls(uint8_t l,uint8_t r){
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,l);
     set_hall(GPIOC,RIGHT_HALL_U_PIN,RIGHT_HALL_V_PIN,RIGHT_HALL_W_PIN,r);
 }
+static void use_legacy_hall_fixture(void){
+    /* These regression cases predate the production LEFT encoder. Override only
+     * the feedback-selection fields directly so PI defaults remain untouched. */
+    m_motor_1.m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    m_motor_1.m_conf.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    m_motor_1.m_encoder_synced=0u;
+    m_motor_2.m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    m_motor_2.m_conf.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+}
 
 int main(void){
-    mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
 
     /* MODE 1: VESC-style duty limits modulation while inner current PI stays active. */
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
@@ -57,7 +66,7 @@ int main(void){
 
     /* Verify free-run is electrical high impedance, not merely Vq=0: after the
      * control mode is released the corresponding timer MOE must turn off. */
-    mcpwm_foc_init(); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2004;i++)DMA1_Channel1_IRQHandler();
@@ -72,7 +81,7 @@ int main(void){
     /* Upstream EFeru contract: current-control offset is calibrated once during
      * the first 2000 synchronized ADC frames. Starting a new command must NOT
      * enter a second driven-offset calibration or suppress the command. */
-    mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
     ctrlModReq=VLT_MODE; pwml=100; pwmr=0;
     adc_buffer.rlA=2010; adc_buffer.rlB=2020; adc_buffer.dcl=2030;
     adc_buffer.rrB=1990; adc_buffer.rrC=1980; adc_buffer.dcr=1970; adc_buffer.batt1=2000;
@@ -92,7 +101,7 @@ int main(void){
 
     /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
      * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
-    mcpwm_foc_init(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
     ctrlModReq=SPD_MODE; pwml=50; pwmr=-50;
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_speed_target_rpm!=50)return fail("mode2 target must be 50 mechanical RPM");
@@ -132,7 +141,7 @@ int main(void){
 
     /* VESC boundary: 750 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
-    mcpwm_foc_init(); enable=1u; set_halls(3u,3u);
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
     mcpwm_foc_set_pid_speed(750.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
@@ -154,7 +163,7 @@ int main(void){
 
     /* VESC speed STOP: once the ramp enters s_pid_min_erpm, command duty=0 and
      * zero the Iq reference while retaining SPEED mode. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     mcpwm_foc_set_pid_speed(300.0f,false); mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_speed_set_ramp_q16=(int32_t)4<<16;
     m_motor_1.m_speed_target_rpm_q16=0; m_motor_1.m_speed_target_rpm=0;
@@ -167,7 +176,7 @@ int main(void){
 
     /* VESC current brake: recompute torque sign from live rotor speed. At zero/stale
      * speed the zero-current zero-vector remains active until another command. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1; m_motor_1.m_hall_period=200u; m_motor_1.m_hall_ticks=20u; m_motor_1.m_rpm=53;
     mcpwm_foc_set_brake_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
     for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
@@ -180,7 +189,7 @@ int main(void){
 
     /* VESC handbrake is not current-brake. It creates a stationary electrical
      * field at phase zero so the rotor is held rather than continuously driven. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     mcpwm_foc_set_handbrake(1.0f,false); mcpwm_foc_vesc_override_touch(false);
     for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_HANDBRAKE)return fail("handbrake control mode");
@@ -188,13 +197,13 @@ int main(void){
     if(m_motor_1.m_iq_target_q4<=0)return fail("handbrake current missing");
 
     /* MODE 3 scaling remains exact: 50 cA = 0.50 A, 1500 cA = 15 A. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
     ctrlModReq=TRQ_MODE; pwml=1500; pwmr=-1500;
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_iq_target_q4!=12000)return fail("TRQ 1500cA = 15A scaling");
     if(m_motor_2.m_iq_target_q4!=-12000)return fail("TRQ right 15A internal mirror scaling");
 
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
     ctrlModReq=TRQ_MODE; pwml=50; pwmr=-50;
     for(int i=0;i<1000;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_iq_target_q4!=400)return fail("TRQ 50cA target scaling");
@@ -216,7 +225,7 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("TRQ STOP must stay released");
 
     /* MODE 4 unchanged: sensorless Id current, Iq=0, 2 -> 2 A and 6 A safety clamp. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
     ctrlModReq=SVPWM_MODE; pwml=2; pwmr=-2;
     mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_id_set_q4>=1600)return fail("mode4 Id must slew, not step");
@@ -231,7 +240,7 @@ int main(void){
 
     /* VESC normalized +/-1.0 must reach the exact EFeru FOC hardware ceiling:
      * ARR=2000 with symmetric 110-count current-sampling margin. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
     ctrlModReq=VLT_MODE; pwml=1000; pwmr=0;
     for(int i=0;i<32000;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_duty_set_permille!=1000)return fail("duty +1.0 command scaling");
@@ -258,7 +267,7 @@ int main(void){
      * boundary and must NOT directly cause VESC ABS_OVER_CURRENT. The ABS source
      * is D/Q motor-current magnitude; three consecutive over-limit D/Q samples
      * still must fault. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
@@ -279,7 +288,7 @@ int main(void){
         return fail("DQ ABS diagnostic split");
 
     /* DC-link level-2 protection remains immediate even at high duty. */
-    mcpwm_foc_init(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
+    mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=950; pwmr=0;
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
@@ -292,7 +301,7 @@ int main(void){
     /* RIGHT Hall direction regression. Hall filtering now honors VESC
      * m_hall_extra_samples (default window 7), so allow the majority filter
      * plus debounce to settle before checking the accepted 3->2 edge. */
-    mcpwm_foc_init(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
     if(!m_motor_2.m_conf.m_invert_direction)return fail("right default direction mirror config");
     for(int i=0;i<100;i++)mcpwm_foc_adc_int_handler();
     set_halls(2u,2u);

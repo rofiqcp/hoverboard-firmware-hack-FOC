@@ -481,7 +481,7 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 
 class VescDual:
-    def __init__(self, port: str, baud: int = 115200, timeout: float = 0.15):
+    def __init__(self, port: str, baud: int = 2000000, timeout: float = 0.15):
         if serial is None:
             raise RuntimeError("pyserial required: python -m pip install pyserial")
         self.ser = serial.Serial(port, baud, timeout=0.01)
@@ -997,7 +997,7 @@ def parse_fw(p: bytes) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=2000000)
     ap.add_argument("--command-hz", type=float, default=50.0)
     ap.add_argument("--telemetry-hz", type=float, default=50.0,
                     help="selective VESC telemetry polling; default 50 Hz")

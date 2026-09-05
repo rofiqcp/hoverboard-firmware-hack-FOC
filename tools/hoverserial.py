@@ -716,7 +716,7 @@ def main() -> None:
         description="Interactive Left/Right hoverboard USART3 terminal"
     )
     parser.add_argument("--port", default="/dev/ttyUSB0", help="e.g. COM3 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=2000000)
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--rate", type=float, default=20.0, help="binary command TX rate Hz")
     parser.add_argument("--print-rate", type=float, default=10.0, help="telemetry display rate Hz")

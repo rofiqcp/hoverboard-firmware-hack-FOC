@@ -11,6 +11,7 @@
 #include "vesc/datatypes.h"
 #include "vesc/buffer.h"
 #include "vesc/crc.h"
+#include "vesc/flash_update_f103.h"
 #include "vesc/mcconf_serial.h"
 #include "vesc/vesc_protocol.h"
 #include "vesc/app_vesc.h"
@@ -146,6 +147,7 @@ static hall_detect_job_t s_hall_detect;
 
 typedef enum {
     DETECT_ALL_IDLE = 0,
+    DETECT_ALL_ENCODER,
     DETECT_ALL_HALL,
     DETECT_ALL_RL_ALIGN,
     DETECT_ALL_RL_LOW,
@@ -179,6 +181,9 @@ typedef struct {
     mc_configuration backup[2];
     mc_configuration result[2];
     float r[2], l[2], ld_lq[2], flux[2], imax[2];
+    float encoder_offset;
+    float encoder_ratio;
+    uint8_t encoder_inverted;
     float low_i[2], low_v[2], high_i[2], high_v[2];
     float low_i_raw[2], low_v_raw[2], high_i_raw[2], high_v_raw[2];
     uint8_t hall[2][8];
@@ -1210,13 +1215,8 @@ static void detect_all_apply_runtime(uint8_t mi) {
     mc_interface_select_motor_thread(1);
 }
 
-static void detect_all_prepare_common(uint8_t mi) {
-    mc_configuration *c=&s_detect_all.result[mi];
-    *c=s_detect_all.backup[mi];
-    memcpy(c->foc_hall_table,s_detect_all.hall[mi],8u);
-    c->motor_type=MOTOR_TYPE_FOC;
-    c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
-    c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+static void detect_all_apply_common_limits(mc_configuration *c) {
+    if(!c)return;
     if(s_detect_all.min_current_in < -0.001f && s_detect_all.min_current_in >= -(float)I_DC_MAX)
         c->l_in_current_min=s_detect_all.min_current_in;
     if(s_detect_all.max_current_in > 0.001f && s_detect_all.max_current_in <= (float)I_DC_MAX)
@@ -1227,6 +1227,50 @@ static void detect_all_prepare_common(uint8_t mi) {
         c->foc_sl_erpm=s_detect_all.sl_erpm;
 }
 
+static void detect_all_prepare_hall(uint8_t mi) {
+    mc_configuration *c=&s_detect_all.result[mi];
+    *c=s_detect_all.backup[mi];
+    detect_all_apply_common_limits(c);
+    memcpy(c->foc_hall_table,s_detect_all.hall[mi],8u);
+    c->motor_type=MOTOR_TYPE_FOC;
+    c->sensor_mode=SENSOR_MODE_SENSORED;
+    c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+}
+
+static bool detect_all_prepare_encoder_left(void) {
+    mc_configuration *c=&s_detect_all.result[0];
+    *c=s_detect_all.backup[0];
+    detect_all_apply_common_limits(c);
+    c->motor_type=MOTOR_TYPE_FOC;
+    c->sensor_mode=SENSOR_MODE_SENSORED;
+    c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+    c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    if(c->m_encoder_counts<4 || c->m_encoder_counts>65536)
+        c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+
+    mc_interface_select_motor_thread(1);
+    mc_interface_set_configuration(c);
+    float off=1001.0f, ratio=0.0f; bool inv=false;
+    float detect_current=1.0f;
+    if(c->l_current_max>0.20f && detect_current>c->l_current_max)detect_current=c->l_current_max;
+    if(!mcpwm_foc_encoder_detect(detect_current,false,&off,&ratio,&inv))return false;
+    const int poles=(int)lroundf(ratio*2.0f);
+    if(!(off>=0.0f && off<360.0f) || !(ratio>=1.0f && ratio<=100.0f) ||
+       poles<2 || poles>200 || (poles&1))return false;
+
+    c->foc_encoder_offset=off;
+    c->foc_encoder_ratio=ratio;
+    c->foc_encoder_inverted=inv;
+    c->si_motor_poles=(uint8_t)poles;
+    s_detect_all.encoder_offset=off;
+    s_detect_all.encoder_ratio=ratio;
+    s_detect_all.encoder_inverted=inv?1u:0u;
+    mc_interface_set_configuration(c);
+    if(!mcpwm_foc_encoder_startup_align(false))return false;
+    return true;
+}
+
 static bool detect_all_commit(void) {
     bool ok=true;
     for(uint8_t mi=0u;mi<2u;++mi){
@@ -1234,7 +1278,7 @@ static bool detect_all_commit(void) {
         mc_configuration c=s_detect_all.result[mi];
         mc_interface_set_configuration(&c);
         if(!mc_interface_store_configuration_motor(mi!=0u)){ok=false;break;}
-        s_last_hall_store_ok[mi]=1u;
+        s_last_hall_store_ok[mi]=(mi==1u)?1u:0u;
     }
     if(!ok){
         /* Best-effort atomic rollback: restore RAM and rewrite both old configs.
@@ -1306,22 +1350,19 @@ static void hall_detect_reply_and_stop(bool success) {
     mc_interface_select_motor_thread(1);
 
     if(s_detect_all.active){
-        if(!success){
-            detect_all_finish(detect_all_fault_result(second));
+        /* Mixed-sensor hardware: Detect-All must never sweep Hall on LEFT,
+         * because PB6/PB7 are occupied by the steering ABI encoder. Only the
+         * RIGHT virtual VESC is Hall. */
+        if(!second || !success){
+            detect_all_finish(!second ? -11 : detect_all_fault_result(second));
             return;
         }
-        const uint8_t mi=second?1u:0u;
-        memcpy(s_detect_all.hall[mi],table,8u);
-        detect_all_prepare_common(mi);
-        detect_all_apply_runtime(mi); /* calibrate Hall coordinates now; do not store yet */
+        memcpy(s_detect_all.hall[1],table,8u);
+        detect_all_prepare_hall(1u);
+        detect_all_apply_runtime(1u); /* calibrate Hall coordinates now; do not store yet */
         memset(&s_hall_detect,0,sizeof(s_hall_detect));
-        if(!second){
-            s_detect_all.motor_index=1u;
-            hall_detect_start_current(true,1.0f);
-            return;
-        }
-        /* Both Hall maps are now known. Parameter identification is performed
-         * one motor at a time to keep bus/current stress bounded. */
+        /* LEFT encoder and RIGHT Hall are now synchronized. Identify the motor
+         * model one bridge at a time to keep DC-link stress bounded. */
         detect_all_start_rl(0u,detect_time_now());
         return;
     }
@@ -1363,7 +1404,7 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     memset(&s_detect_all,0,sizeof(s_detect_all));
     s_detect_all_last_detail=0;
     s_detect_all.active=1u;
-    s_detect_all.stage=DETECT_ALL_HALL;
+    s_detect_all.stage=DETECT_ALL_ENCODER;
     s_detect_all.max_power_loss=max_power_loss;
     s_detect_all.min_current_in=min_current_in;
     s_detect_all.max_current_in=max_current_in;
@@ -1376,9 +1417,11 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
 
     app_vesc_disable_output(180000);
     detect_all_release_all();
-    /* Hall comes first on this Hall-only board. It is independent of the old
-     * phase/Hall wiring and gives a trustworthy speed reference for flux tests. */
-    hall_detect_start_current(false,1.0f);
+    /* Stage order follows the actual vehicle hardware: LEFT ABI encoder first
+     * (electrical offset/ratio/inversion + physical plausibility alignment),
+     * then RIGHT Hall table, then R/L/flux identification for both bridges. */
+    s_detect_all.stage_start_time=detect_time_now();
+    s_detect_all.next_sample_time=s_detect_all.stage_start_time;
 }
 
 static void hall_detect_periodic(uint32_t now_time) {
@@ -1511,13 +1554,35 @@ static void detect_all_finalize_motor(uint8_t mi) {
     if(absmax<s_detect_all.imax[mi])absmax=s_detect_all.imax[mi];
     c->l_abs_current_max=absmax;
     c->motor_type=MOTOR_TYPE_FOC;
-    c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
-    c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    c->sensor_mode=SENSOR_MODE_SENSORED;
+    if(mi==0u){
+        c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+        c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+        c->foc_encoder_offset=s_detect_all.encoder_offset;
+        c->foc_encoder_ratio=s_detect_all.encoder_ratio;
+        c->foc_encoder_inverted=s_detect_all.encoder_inverted!=0u;
+    }else{
+        c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+        c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+    }
 }
 
 static void detect_all_periodic(uint32_t now_time) {
-    if(!s_detect_all.active || s_detect_all.stage==DETECT_ALL_IDLE ||
-       s_detect_all.stage==DETECT_ALL_HALL) return;
+    if(!s_detect_all.active || s_detect_all.stage==DETECT_ALL_IDLE) return;
+    if(s_detect_all.stage==DETECT_ALL_ENCODER){
+        /* Encoder detect is intentionally blocking like upstream VESC's motor
+         * detection worker, while the bridge remains output-gated. */
+        if(!detect_all_prepare_encoder_left()){
+            s_detect_all_last_detail=9;
+            detect_all_finish(-10);
+            return;
+        }
+        s_detect_all.stage=DETECT_ALL_HALL;
+        s_detect_all.motor_index=1u;
+        hall_detect_start_current(true,1.0f);
+        return;
+    }
+    if(s_detect_all.stage==DETECT_ALL_HALL) return;
     if(!detect_time_due(now_time,s_detect_all.next_sample_time)) return;
     s_detect_all.next_sample_time=detect_time_after_ms(now_time,1u);
     const uint8_t mi=s_detect_all.motor_index;
@@ -1999,6 +2064,36 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     switch (id) {
     case COMM_FW_VERSION:
         reply_fw_version(second);
+        break;
+    case COMM_ERASE_NEW_APP: {
+        uint8_t reply[2] = {COMM_ERASE_NEW_APP, 0u};
+        if (!second && n >= 4u) {
+            int32_t ui = 0;
+            const uint32_t fw_size = buffer_get_uint32(d, &ui);
+            reply[1] = f103_fw_erase_staging(fw_size) ? 1u : 0u;
+        }
+        uart_send_payload(reply, sizeof(reply));
+        break;
+    }
+    case COMM_WRITE_NEW_APP_DATA: {
+        uint8_t reply[6] = {COMM_WRITE_NEW_APP_DATA, 0u, 0u, 0u, 0u, 0u};
+        if (!second && n >= 4u) {
+            int32_t ui = 0;
+            const uint32_t offset = buffer_get_uint32(d, &ui);
+            const uint32_t data_len = (uint32_t)n - 4u;
+            reply[1] = f103_fw_write_staging(offset, d + 4u, data_len) ? 1u : 0u;
+            reply[2] = (uint8_t)(offset >> 24);
+            reply[3] = (uint8_t)(offset >> 16);
+            reply[4] = (uint8_t)(offset >> 8);
+            reply[5] = (uint8_t)offset;
+        }
+        uart_send_payload(reply, sizeof(reply));
+        break;
+    }
+    case COMM_JUMP_TO_BOOTLOADER:
+        if (!second && f103_fw_mark_pending_or_recovery()) {
+            f103_fw_reset_to_bootloader();
+        }
         break;
     case COMM_GET_VALUES:
         reply_values(second, false, d, n);

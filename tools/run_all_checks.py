@@ -13,17 +13,17 @@ def run(cmd):
 
 def check_static():
     required = [
-        'platformio.ini','STM32F103RCTx_FLASH.ld',
+        'platformio.ini','STM32F103RCTx_APP.ld','STM32F103RCTx_BOOTLOADER.ld',
         'Src/main.c','Src/setup.c','Src/util.c','Src/comms.c','Src/config.h',
         'Src/motor/foc_math.c','Src/motor/mc_interface.c','Src/motor/mcpwm_foc.c',
         'Src/encoder/encoder.c','Src/encoder/encoder.h','Src/encoder/encoder_datatype.h',
         'Src/encoder/enc_abi.c','Src/encoder/enc_abi.h','Src/encoder/encoder_cfg.c','Src/encoder/encoder_cfg.h',
-        'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c','Src/vesc/vesc_protocol.c',
+        'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c','Src/vesc/vesc_protocol.c','Src/vesc/flash_update_f103.c','Src/vesc/flash_update_f103.h','Src/vesc/f103_boot_layout.h','Src/bootloader/main.c',
         'Src/motor/mcpwm_foc.c','Src/motor/mcpwm_foc.h','Src/motor/mc_interface.c','Src/motor/mc_interface.h',
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
+        'tools/build_factory_image.py','tools/install_bootloader_stlink.sh','tools/pio_vesc_upload.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -35,7 +35,7 @@ def check_static():
     for token in ('BLDC_controller','rtwtypes.h','rtP_Left','rtP_Right','rtDW_Left','rtDW_Right'):
         assert token not in source_text, f'obsolete generated dependency in live source: {token}'
     ini=(ROOT/'platformio.ini').read_text()
-    for token in ('src_dir = Src','default_envs = VARIANT_USART','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
+    for token in ('src_dir = Src','default_envs = APP_STLINK','[env:APP_STLINK]','[env:APP_USART_PC]','[env:APP_F411]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
         assert token in ini, f'platformio.ini missing {token}'
     # Warning policy: project sources use -Wall/-Wextra/-Werror via build_src_flags only.
     # Framework STM32Cube must not inherit project -Werror (avoids HAL_PCD unused-parameter build failure).
@@ -170,7 +170,7 @@ def check_static():
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'
     util=(ROOT/'Src/util.c').read_text()
     eeh=(ROOT/'Src/eeprom.h').read_text()
-    lds=(ROOT/'STM32F103RCTx_FLASH.ld').read_text()
+    lds=(ROOT/'STM32F103RCTx_APP.ld').read_text(); bootlds=(ROOT/'STM32F103RCTx_BOOTLOADER.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
     assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)223u\)', eeh), 'EEPROM virtual variable count mismatch'
@@ -179,7 +179,8 @@ def check_static():
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
     assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'
-    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*252K', lds), 'linker must reserve final 4 KiB for two EEPROM pages'
+    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*120K', lds), 'application linker must start after 10-KiB bootloader and stay inside 120-KiB slot'
+    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K', bootlds), 'bootloader linker must own immutable first 10 KiB'
     mainc=(ROOT/'Src/main.c').read_text()
     assert '!vescLinkActive && !timeoutFlgSerial && enable == 0' in mainc, 'legacy blocking enable handshake must be suppressed while VESC link is armed'
     assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
@@ -223,10 +224,13 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_vesc_dual.py'])
     run([sys.executable,'tools/tests/host/test_v13_features.py'])
     run([sys.executable,'tools/tests/host/test_v14_features.py'])
+    run([sys.executable,'tools/tests/host/test_bootloader_layout.py'])
+    run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
     run([sys.executable,'tools/tests/host/test_v15_features.py'])
     run([sys.executable,'tools/tests/host/test_v16_features.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
     run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])
     run([sys.executable,'tools/tests/host/test_hall_3rev_runtime.py'])
+    run([sys.executable,'tools/tests/host/test_encoder_abi_runtime.py'])
     run([sys.executable,'tools/tests/host/test_eeprom_persistence.py'])
     print('ALL_FINAL_HOST_CHECKS_PASS')

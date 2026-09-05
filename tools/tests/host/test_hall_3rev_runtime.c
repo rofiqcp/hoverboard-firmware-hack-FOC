@@ -37,6 +37,10 @@ static uint16_t phase_from_table(uint8_t a){return (uint16_t)(((uint32_t)a*65536
 static int run_motor(int second,const uint8_t table[8]){
     const uint8_t seq[6]={2,3,1,5,4,6};
     mc_configuration c = second ? m_motor_2.m_conf : m_motor_1.m_conf;
+    /* This regression deliberately exercises Hall interpolation on either
+     * bridge. Production LEFT defaults to ABI encoder, so opt into Hall here. */
+    c.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+    c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
     memcpy(c.foc_hall_table,table,8);
     mcpwm_foc_set_configuration(&c,second!=0);
     enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=1; pwmr=-1;

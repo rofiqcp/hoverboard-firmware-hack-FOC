@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 R=next(p for p in Path(__file__).resolve().parents if (p/'platformio.ini').exists())
 mc=(R/'Src/motor/mcpwm_foc.c').read_text()
+assert 'second ? FOC_SENSOR_MODE_HALL : FOC_SENSOR_MODE_ENCODER' in mc and 'second ? SENSOR_PORT_MODE_HALL : SENSOR_PORT_MODE_ABI' in mc, 'Blank/default config must be LEFT ABI encoder + RIGHT Hall'
 mch=(R/'Src/motor/mcpwm_foc.h').read_text()
 mcc=(R/'Src/motor/mcconf_default.h').read_text()
 vp=(R/'Src/vesc/vesc_protocol.c').read_text()
@@ -104,6 +105,7 @@ assert 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc, 'post-c
 assert 'stable non-adjacent Hall transition' in mc and 'mcpwm_foc_release_motor(second)' in mc, 'Hall sequence reject must release closed-loop drive'
 assert vp.count('const float sl_erpm=buffer_get_float32(data,1e3f,&k);') == 1, 'Detect-All must consume exactly one sl_erpm field from VESC Tool packet'
 assert 'detect_all_compute_rl' in vp and 'foc_current_kp=c->foc_motor_l*1000.0f' in vp and 'foc_current_ki=c->foc_motor_r*1000.0f' in vp, 'Detect-All must identify R/L and derive VESC current gains'
+assert 'DETECT_ALL_ENCODER' in vp and 'detect_all_prepare_encoder_left' in vp and 'detect_all_prepare_hall(1u)' in vp, 'Detect-All must use LEFT ABI encoder and RIGHT Hall'
 assert 'DETECT_ALL_FLUX_SAMPLE' in vp and 'foc_motor_flux_linkage' in vp, 'Detect-All flux-linkage stage missing'
 assert 'mcpwm_foc_hall_table_sane(table)' in vp, 'VESC Tool Hall-detect reply must reject unsafe table geometry'
 assert 'Standard VESC OPENLOOP_CURRENT' in mc and 'm->m_iq_target_q4=amp_to_q4(m,current)' in mc and '60*(int64_t)PWM_FREQ' in mc, 'standard VESC openloop must rotate signed Iq at electrical RPM without pole-pair multiplication'

@@ -15,7 +15,7 @@ def wrapped_diff(a,b): return ((a-b+180.0)%360.0)-180.0
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--seconds',type=float,default=1.2)
-    a=ap.parse_args(); s=serial.Serial(a.port,115200,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
+    a=ap.parse_args(); s=serial.Serial(a.port,2000000,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
     def send(p): s.write(frame(bytes(p))); s.flush()
     ok=True
     try:

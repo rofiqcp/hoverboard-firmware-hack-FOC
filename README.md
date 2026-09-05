@@ -2,7 +2,7 @@
 
 Firmware dual-motor FOC bare-metal untuk board hoverboard STM32F103RCT6.
 Jalur ADC dual-DMA, PWM TIM8/TIM1, dan ISR FOC 16 kHz tetap memakai basis EFeru
-yang sudah digunakan pada hardware ini. USART3 PB10/PB11 = 115200 baud.
+yang sudah digunakan pada hardware ini. USART3 PB10/PB11 = 2000000 baud.
 
 ## Mapping motor
 

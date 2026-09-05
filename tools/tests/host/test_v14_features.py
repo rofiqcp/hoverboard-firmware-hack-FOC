@@ -8,7 +8,7 @@ serialc=(R/'Src/vesc/mcconf_serial.c').read_text()
 mc=(R/'Src/motor/mcpwm_foc.c').read_text()
 mci=(R/'Src/motor/mc_interface.c').read_text()
 eeh=(R/'Src/eeprom.h').read_text()
-ld=(R/'STM32F103RCTx_FLASH.ld').read_text()
+ld=(R/'STM32F103RCTx_APP.ld').read_text(); bld=(R/'STM32F103RCTx_BOOTLOADER.ld').read_text()
 # Firmware/protocol identity must be VESC 6.00.
 assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp)
 assert re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp)
@@ -53,7 +53,8 @@ assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in ee
 assert 'FLASH_PAGE_SIZE != 0x800U' in eeh
 assert re.search(r'#define\s+NB_OF_VAR\s+\(\(uint8_t\)223u\)',eeh)
 util=(R/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert addrs==list(range(1000,1223))
-assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*252K',ld)
+assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*120K',ld)
+assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K',bld)
 # Stock SET MCCONF ACK and default/read separation.
 assert 'uint8_t ack = COMM_SET_MCCONF' in vp
 assert 'if (id == COMM_GET_MCCONF_DEFAULT)' in vp and 'mcpwm_foc_get_default_configuration(&c, second)' in vp

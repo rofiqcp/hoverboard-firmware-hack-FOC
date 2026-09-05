@@ -44,6 +44,13 @@ static int32_t pos_user[2] = {0,0};
 static int32_t pos_target_user[2] = {0,0};
 static int32_t pos_min_user[2] = {INT32_MIN,INT32_MIN};
 static int32_t pos_max_user[2] = {INT32_MAX,INT32_MAX};
+static uint32_t fw_erase_size=0u, fw_write_offset=0u, fw_write_len=0u;
+static unsigned fw_pending_count=0u, fw_reset_count=0u;
+bool f103_fw_erase_staging(uint32_t fw_size){fw_erase_size=fw_size;return fw_size>0u;}
+bool f103_fw_write_staging(uint32_t offset,const uint8_t *data,uint32_t len){(void)data;fw_write_offset=offset;fw_write_len=len;return len>0u;}
+bool f103_fw_stage_is_valid(uint32_t *size_out,uint16_t *crc_out){if(size_out)*size_out=fw_erase_size;if(crc_out)*crc_out=0x1234u;return fw_erase_size>0u;}
+bool f103_fw_mark_pending_or_recovery(void){fw_pending_count++;return true;}
+void f103_fw_reset_to_bootloader(void){fw_reset_count++;}
 
 uint32_t HAL_GetTick(void) { return tick_ms; }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *d, uint16_t n, uint32_t t) {
@@ -489,9 +496,9 @@ int main(void){
             return fail("APP_ADC_UART support");
         ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_UART;
         if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART ||
-           app_vesc_get_configuration(false)->app_uart_baudrate!=115200u ||
+           app_vesc_get_configuration(false)->app_uart_baudrate!=2000000u ||
            !app_vesc_get_configuration(false)->permanent_uart_enabled)
-            return fail("APP_UART permanent 115200 support");
+            return fail("APP_UART permanent 2000000 support");
     }
 
     {
@@ -643,10 +650,18 @@ int main(void){
         if(!pump_until_cmd(45000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all result timeout");
         { int32_t ri=1; if(buffer_get_int16(r,&ri)<0)return fail("detect all returned failure"); }
         if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
-        for(int m=0;m<2;m++){
+        if(confs[0].m_sensor_port_mode!=SENSOR_PORT_MODE_ABI ||
+           confs[0].foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
+           fabsf(confs[0].foc_encoder_offset-12.0f)>0.01f ||
+           fabsf(confs[0].foc_encoder_ratio-15.0f)>0.01f ||
+           confs[0].foc_encoder_inverted || confs[0].si_motor_poles!=30u)
+            return fail("detect all left encoder apply");
+        {
             int valid=0;
-            for(int h=0;h<8;h++)if((uint8_t)confs[m].foc_hall_table[h]!=255u)valid++;
-            if(valid!=6 || confs[m].foc_sensor_mode!=FOC_SENSOR_MODE_HALL)return fail("detect all hall apply");
+            for(int h=0;h<8;h++)if((uint8_t)confs[1].foc_hall_table[h]!=255u)valid++;
+            if(valid!=6 || confs[1].m_sensor_port_mode!=SENSOR_PORT_MODE_HALL ||
+               confs[1].foc_sensor_mode!=FOC_SENSOR_MODE_HALL)
+                return fail("detect all right hall apply");
         }
         if(!nearf32(confs[0].l_in_current_min,-8.0f,0.01f)||!nearf32(confs[1].l_in_current_max,8.0f,0.01f))return fail("detect all input-current apply");
         if(!nearf32(confs[0].foc_openloop_rpm,250.0f,0.01f)||!nearf32(confs[1].foc_sl_erpm,2500.0f,0.01f))return fail("detect all FOC setup fields");

@@ -158,7 +158,9 @@ int main(void){
     m_motor_1.m_encoder_mech_rpm_q16=50*65536;
     m_motor_1.m_encoder_idle_ticks=0u; m_motor_1.m_encoder_synced=1u;
     mcpwm_foc_set_brake_current(1.0f,false);
-    if(m_motor_1.m_brake_direction!=1)return fail("ABI brake direction source");
+    mcpwm_foc_vesc_override_touch(false);
+    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    if(m_motor_1.m_iq_target_q4>=0)return fail("ABI brake must oppose positive encoder speed");
 
     printf("ENCODER_ABI_RUNTIME_PASS mech=%.3f elec=%.3f erpm=%.1f tacho=%ld poscnt=%ld\n",
            mcpwm_foc_get_encoder_position_motor(false),
