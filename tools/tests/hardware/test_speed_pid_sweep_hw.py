@@ -82,7 +82,7 @@ def main():
     elif a.quick: base=base[:3]
     targets=[a.target] if not a.targets else [float(x) for x in a.targets.split(',') if x.strip()]
     out=Path(a.out); out.mkdir(parents=True,exist_ok=True); stamp=time.strftime('%Y%m%d_%H%M%S'); rawcsv=out/f'raw_{stamp}.csv'; summ=out/f'summary_{stamp}.csv'; meta=out/f'meta_{stamp}.json'
-    link=VescDual(a.port,2000000,timeout=.65); originals={}; results=[]
+    link=VescDual(a.port,1000000,timeout=.65); originals={}; results=[]
     fields=['case','motor','kp','ki','kd','target','phase','t','erpm','iq','id','imotor','iin','duty','vq','vd','fault']
     try:
         for right,motor in [(False,'left'),(True,'right')]: originals[motor]=get_mc(link,right)

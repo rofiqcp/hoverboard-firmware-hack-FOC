@@ -26,14 +26,28 @@ assert 'board_build.ldscript = STM32F103RCTx_APP.ld' in ini and 'board_build.lds
 assert '-DVECT_TAB_OFFSET=0x00002800U' in ini
 for token in ('COMM_ERASE_NEW_APP','COMM_WRITE_NEW_APP_DATA','COMM_JUMP_TO_BOOTLOADER'):
     assert f'case {token}:' in vp,token
-for token in ('f103_fw_erase_staging','f103_fw_write_staging','f103_fw_mark_pending_or_recovery'):
+for token in ('f103_fw_erase_staging','f103_fw_write_staging'):
     assert token in upd and token in vp,token
+assert 'f103_fw_reset_to_bootloader' in upd and 'f103_fw_reset_to_bootloader();' in vp
+assert 'F103_BOOT_REQUEST_ADDR' in layout and 'F103_BOOT_REQUEST_MAGIC_INV' in layout
+assert 'boot_request[0] == F103_BOOT_REQUEST_MAGIC' in boot and 'force_recovery' in boot
+assert 'F103_BOOT_REQUEST_ADDR' in upd and 'NVIC_SystemReset();' in upd
+assert 'f103_fw_mark_pending_or_recovery' not in upd and 'f103_fw_mark_pending_or_recovery' not in vp
 for token in ('F103_UPDATE_STATE_PENDING','copy_pending_image','stage_valid','app_vector_valid','jump_app','F103_APP_REGION_SIZE'):
     assert token in boot,token
 assert 'recv_payload(RECOVERY_BOOT_WINDOW_MS' not in boot
-assert '__disable_irq();' in boot and '__enable_irq();' in boot
+assert '__disable_irq();' in boot and 'cpsie i' not in boot
+app=(R/'Src/main.c').read_text()
+assert '__enable_irq();' in app and app.index('__enable_irq();') > app.index('HAL_ADC_Start(&hadc2);')
+assert ('branch_to_app' in boot and '__attribute__((naked, noreturn))' in boot) or '__set_MSP(sp);' in boot
+assert 'void SysTick_Handler(void)' in boot and 'HAL_IncTick();' in boot
 assert 'SystemCoreClockUpdate();' in boot and boot.index('SystemCoreClockUpdate();') < boot.index('HAL_Init();')
 assert 'boot_clock_init()' in boot and 'RCC_PLL_MUL16' in boot and 'RCC_HCLK_DIV2' in boot
 assert boot.index('boot_clock_init()') < boot.index('uart_init();')
-assert 'erase_pages(F103_APP_BASE_ADDR, F103_APP_REGION_SIZE)' in boot
+assert 'ensure_stage_pages_erased' in boot and 'erase_one_page(dst)' in boot
+assert 'erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)' not in boot
+assert 'erase_pages(F103_APP_BASE_ADDR, F103_APP_REGION_SIZE)' not in boot
 print('BOOTLOADER_LAYOUT_STATIC_PASS app=120K stage=120K boot=10K meta=2K eeprom=4K powerloss_retry=1')
+
+assert 'uart_recv_byte' in boot and 'uart_send_bytes' in boot and 'USART_SR_ORE' in boot
+assert 'HAL_UART_Receive(&huart3' not in boot and 'HAL_UART_Transmit(&huart3' not in boot

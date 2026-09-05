@@ -79,6 +79,7 @@ HB_RESET_POSITION = 5
 HB_GET_TUNING = 6
 HB_SET_TUNING = 7
 HB_SET_ID_TEST = 8
+HB_SET_STEERING_DEG = 9
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -481,7 +482,7 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 
 class VescDual:
-    def __init__(self, port: str, baud: int = 2000000, timeout: float = 0.15):
+    def __init__(self, port: str, baud: int = 1000000, timeout: float = 0.15):
         if serial is None:
             raise RuntimeError("pyserial required: python -m pip install pyserial")
         self.ser = serial.Serial(port, baud, timeout=0.01)
@@ -884,6 +885,13 @@ class VescDual:
     def reset_position(self, right: bool = False) -> PositionState:
         return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
 
+    def set_steering_deg(self, deg: float):
+        """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""
+        deg=max(-30.0,min(30.0,float(deg)))
+        payload=self.custom_payload(HB_SET_STEERING_DEG,struct.pack(">i",round(deg*1000.0)))
+        self._send_frame(payload)
+
+
     def diag(self, right: bool = False) -> Diag:
         # Diagnostic reply can overlap a previous endpoint reply on the single
         # UART transport. Filter by embedded VESC ID exactly like values().
@@ -997,7 +1005,7 @@ def parse_fw(p: bytes) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
-    ap.add_argument("--baud", type=int, default=2000000)
+    ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--command-hz", type=float, default=50.0)
     ap.add_argument("--telemetry-hz", type=float, default=50.0,
                     help="selective VESC telemetry polling; default 50 Hz")

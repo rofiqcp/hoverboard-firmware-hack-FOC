@@ -151,10 +151,10 @@ int main(void){
        m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)
         return fail("mode2 zero-vector state");
 
-    /* VESC boundary: 750 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
+    /* VESC boundary: 200 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
-    mcpwm_foc_set_pid_speed(750.0f,false);
+    mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC speed mode entry");
@@ -166,20 +166,20 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
     for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)return fail("VESC zero ERPM zero-vector");
-    mcpwm_foc_set_pid_speed(750.0f,false);
+    mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_rpm=50;
     mc_values vals;
     mcpwm_foc_get_values(&vals,false);
-    if(fabsf(vals.rpm-750.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
+    if(fabsf(vals.rpm-200.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
 
-    /* Low-speed VESC regression: 50 ERPM @15 pole pairs is 3.333... mechanical
+    /* Low-speed VESC regression: 50 ERPM @4 pole pairs is 12.5 mechanical
      * RPM. Keep that fractional target in Q16 rather than truncating control to
      * 3 RPM (=45 ERPM). Hall telemetry also derives ERPM directly from period. */
     mcpwm_foc_init(); use_legacy_hall_fixture();
     mcpwm_foc_set_pid_speed(50.0f,false);
     mcpwm_foc_vesc_override_touch(false);
-    const int32_t q16_50_erpm=(int32_t)((50.0f/15.0f)*65536.0f+0.5f);
+    const int32_t q16_50_erpm=(int32_t)((50.0f/4.0f)*65536.0f+0.5f);
     if(abs(m_motor_1.m_speed_target_rpm_q16-q16_50_erpm)>2)return fail("50 ERPM fractional Q16 target");
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1;
     m_motor_1.m_hall_period=3200u; m_motor_1.m_hall_ticks=0u;

@@ -159,6 +159,11 @@ int main(void) {
   HAL_ADC_Start(&hadc1);
   HAL_ADC_Start(&hadc2);
 
+  /* Bootloader hands off with PRIMASK set so no peripheral IRQ can run before
+   * C runtime and all HAL handles are initialized. Enable globally only here,
+   * after GPIO/TIM/ADC/UART/DMA are configured and their state is valid. */
+  __enable_irq();
+
   /* ABI A/B tanpa index membutuhkan electrical-zero setiap power cycle.
    * Fungsi ini no-op pada default Hall dan tidak pernah menggerakkan RIGHT. */
   (void)mcpwm_foc_encoder_startup_align(false);
@@ -178,6 +183,12 @@ int main(void) {
      * control-loop period of latency to every UART transaction. FOC itself
      * remains interrupt-driven and is not moved into this path. */
     uint32_t prof0=DWT->CYCCNT;
+    /* Drain USART3 circular DMA every main-loop pass as a deterministic
+     * fallback to the IDLE-line IRQ. On this F103 the 16-kHz FOC DMA ISR can
+     * make short VESC bursts miss the expected IDLE callback even though the
+     * bytes are already present in rxBuffer. Polling the DMA write position is
+     * cheap when no bytes arrived and guarantees request/reply progress. */
+    usart3_rx_check();
     vesc_protocol_process_pending();
     vesc_protocol_periodic(HAL_GetTick());
     uint32_t profd=DWT->CYCCNT-prof0;

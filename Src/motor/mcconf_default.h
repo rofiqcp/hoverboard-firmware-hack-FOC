@@ -43,6 +43,12 @@
 #define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.80f
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       250u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       500u
+/* Physical LEFT steering envelope. VESC COMM_SET_POS is still the wire API,
+ * but the user coordinate is signed mechanical degrees around center. 330 deg
+ * from a legacy 0..360 UI is interpreted as -30 deg. */
+#define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
+#define MCCONF_STEERING_POS_MAX_DEG               30.0f
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   1000u
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */
 #define MCCONF_ENCODER_SPEED_TIMEOUT_TICKS         8000u /* 0.5 s -> zero */
 #define MCCONF_FOC_CURRENT_KP_Q11           1229u
@@ -93,7 +99,7 @@
 #define MCCONF_OFF_TELEM_SETTLE_SAMPLES           16000u /* 1 s @16 kHz: high-Z shunt common-mode benar-benar stabil */
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
-#define MCCONF_POLE_PAIRS_LEFT               15u
+#define MCCONF_POLE_PAIRS_LEFT               4u
 #define MCCONF_POLE_PAIRS_RIGHT              15u
 /* VESC mcconf_default.h: foc_hall_interp_erpm default = 500 ERPM.
  * Nilai runtime tetap berasal dari Motor Config dan diprecompute ke integer

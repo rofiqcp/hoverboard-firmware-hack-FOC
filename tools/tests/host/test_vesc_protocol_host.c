@@ -45,11 +45,9 @@ static int32_t pos_target_user[2] = {0,0};
 static int32_t pos_min_user[2] = {INT32_MIN,INT32_MIN};
 static int32_t pos_max_user[2] = {INT32_MAX,INT32_MAX};
 static uint32_t fw_erase_size=0u, fw_write_offset=0u, fw_write_len=0u;
-static unsigned fw_pending_count=0u, fw_reset_count=0u;
+static unsigned fw_reset_count=0u;
 bool f103_fw_erase_staging(uint32_t fw_size){fw_erase_size=fw_size;return fw_size>0u;}
 bool f103_fw_write_staging(uint32_t offset,const uint8_t *data,uint32_t len){(void)data;fw_write_offset=offset;fw_write_len=len;return len>0u;}
-bool f103_fw_stage_is_valid(uint32_t *size_out,uint16_t *crc_out){if(size_out)*size_out=fw_erase_size;if(crc_out)*crc_out=0x1234u;return fw_erase_size>0u;}
-bool f103_fw_mark_pending_or_recovery(void){fw_pending_count++;return true;}
 void f103_fw_reset_to_bootloader(void){fw_reset_count++;}
 
 uint32_t HAL_GetTick(void) { return tick_ms; }
@@ -496,9 +494,9 @@ int main(void){
             return fail("APP_ADC_UART support");
         ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_UART;
         if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART ||
-           app_vesc_get_configuration(false)->app_uart_baudrate!=2000000u ||
+           app_vesc_get_configuration(false)->app_uart_baudrate!=1000000u ||
            !app_vesc_get_configuration(false)->permanent_uart_enabled)
-            return fail("APP_UART permanent 2000000 support");
+            return fail("APP_UART permanent 1000000 support");
     }
 
     {
@@ -567,10 +565,10 @@ int main(void){
          * VESC single-turn degrees. */
         const uint8_t magic0=0x48u, magic1=0x42u, ver=1u;
         uint8_t cp[16]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,3u};
-        k=5; buffer_append_int32(cp,-1000000,&k); buffer_append_int32(cp,2000000,&k);
+        k=5; buffer_append_int32(cp,-1000000,&k); buffer_append_int32(cp,1000000,&k);
         if(!transact(cp,(uint16_t)k,r,&rn)||rn!=22u||r[0]!=COMM_CUSTOM_APP_DATA||r[5]!=0u) return fail("custom set limits");
         int32_t ci=6; (void)buffer_get_int32(r,&ci); (void)buffer_get_int32(r,&ci);
-        if(buffer_get_int32(r,&ci)!=-1000000 || buffer_get_int32(r,&ci)!=2000000) return fail("custom limits values");
+        if(buffer_get_int32(r,&ci)!=-1000000 || buffer_get_int32(r,&ci)!=1000000) return fail("custom limits values");
 
         uint8_t ct[12]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,4u};
         k=5; buffer_append_int32(ct,-345678,&k);

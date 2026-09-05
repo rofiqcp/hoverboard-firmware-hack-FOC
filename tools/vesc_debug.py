@@ -690,7 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
     p.add_argument("command", nargs="?", default="info",
                    choices=("selftest","info","diag","rt","hall","hall-phase","wiring-check","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
-    p.add_argument("--baud", type=int, default=2000000)
+    p.add_argument("--baud", type=int, default=1000000)
     p.add_argument("--motor", default="both", choices=("left","right","both"))
     p.add_argument("--hz", type=float, default=50.0)
     p.add_argument("--seconds", type=float, default=5.0)

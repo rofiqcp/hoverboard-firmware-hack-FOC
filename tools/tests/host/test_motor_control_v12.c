@@ -139,10 +139,10 @@ int main(void){
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0)
         return fail("mode2 zero-vector must zero speed states");
 
-    /* VESC boundary: 750 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
+    /* VESC boundary: 200 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
-    mcpwm_foc_set_pid_speed(750.0f,false);
+    mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC speed mode entry");
@@ -154,12 +154,12 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
     for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0)return fail("VESC zero ERPM zero-vector hold");
-    mcpwm_foc_set_pid_speed(750.0f,false);
+    mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_rpm=50;
     mc_values vals;
     mcpwm_foc_get_values(&vals,false);
-    if(fabsf(vals.rpm-750.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
+    if(fabsf(vals.rpm-200.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
 
     /* VESC speed STOP: once the ramp enters s_pid_min_erpm, command duty=0 and
      * zero the Iq reference while retaining SPEED mode. */

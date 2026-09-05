@@ -1089,11 +1089,18 @@ void mcpwm_foc_set_pid_speed(float erpm, bool second) {
     }
 }
 void mcpwm_foc_set_pid_pos(float position_deg,bool second){
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    /* Incremental ABI cannot safely close the position loop until electrical
+     * phase has been established for this boot. Reject torque rather than
+     * guessing phase from a reset counter. */
+    if(!second && encoder_feedback_selected(m,false) && !m->m_encoder_synced){
+        mcpwm_foc_release_motor(false);
+        return;
+    }
     /* Match vedderb/bldc foc_run_pid_control_pos: without a dedicated encoder,
      * VESC uses the live FOC electrical rotor phase as m_pos_pid_now and closes
      * a shortest-path angular PID on that continuous phase. Do NOT quantize the
      * command to Hall transition counts. */
-    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     while(position_deg>=360.0f)position_deg-=360.0f;
     while(position_deg<0.0f)position_deg+=360.0f;
     uint32_t ph=(uint32_t)(position_deg*(65536.0f/360.0f)+0.5f);
@@ -1317,11 +1324,6 @@ static float encoder_detect_angle_diff(float a, float b) {
     return d;
 }
 
-static void encoder_detect_circular_add(float deg, float *sum_s, float *sum_c) {
-    const float rad=deg*(3.14159265358979323846f/180.0f);
-    *sum_s+=sinf(rad); *sum_c+=cosf(rad);
-}
-
 static bool encoder_detect_move(mcpwm_foc_motor_t *m, float current,
                                 float *phase_cont, float target_cont) {
     if(!m || !phase_cont)return false;
@@ -1347,15 +1349,26 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     mcpwm_foc_motor_t *m=&m_motor_1;
     if(!encoder_port_active(m,false) || !m->m_encoder_configured)return false;
     if(current<0.20f)current=0.20f;
-    if(current>2.0f)current=2.0f;
+    if(current>1.0f)current=1.0f;
     if(current>m->m_conf.l_current_max)current=m->m_conf.l_current_max;
     for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
     if(!mcpwm_foc_dc_cal_done())return false;
 
-    /* Adaptasi langsung mcpwm_foc_encoder_detect VESC untuk ABI tanpa I.
-     * Upstream mencari index; di board ini electrical phase 0 membentuk zero
-     * software yang deterministik, lalu ratio/inversion dan offset diukur dengan
-     * repeated +/-120 electrical degree dan circular averaging. */
+    /* Steering-safe VESC ABI detection.
+     *
+     * A generic VESC encoder detect can rotate through several electrical
+     * revolutions. That is appropriate for a free motor, but the LEFT motor is
+     * mechanically constrained steering. Align the rotor to electrical phase 0
+     * first, define that physical point as the incremental-ABI software zero,
+     * then probe only +/-60 electrical degrees around zero. With the expected
+     * 4 pole-pairs this is about +/-15 mechanical degrees, safely inside the
+     * calibrated +/-30 degree steering envelope.
+     *
+     * Incremental A/B has no absolute index, therefore a persistent absolute
+     * encoder offset is meaningless across power cycles. The VESC-equivalent
+     * reference is re-established by mcpwm_foc_encoder_startup_align() on every
+     * boot: physical phase 0 <-> ABI software zero. Detection therefore returns
+     * offset=0 and measures ratio/inversion from the bounded symmetric probes. */
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     for(uint32_t t=1u;t<=250u;++t){
@@ -1368,65 +1381,49 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
         mcpwm_foc_vesc_override_touch(false); HAL_Delay(1u);
         if(m->m_fault!=FAULT_CODE_NONE)goto detect_fail;
     }
+
     encoder_runtime_set_deg(m,0.0f);
     float phase_cont=0.0f;
-    if(!encoder_detect_move(m,current,&phase_cont,360.0f))goto detect_fail;
-    HAL_Delay(300u);
+    float plus_sum=0.0f, minus_sum=0.0f;
+    const int samples=3;
+    for(int pass=0;pass<samples;++pass){
+        if(!encoder_detect_move(m,current,&phase_cont,60.0f))goto detect_fail;
+        HAL_Delay(150u);
+        plus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        if(!encoder_detect_move(m,current,&phase_cont,0.0f))goto detect_fail;
+        HAL_Delay(150u);
+        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f)goto detect_fail;
 
-    float sum_s=0.0f,sum_c=0.0f;
-    float first=encoder_read_deg();
-    float prev=first;
-    for(int i=0;i<30;++i){
-        if(!encoder_detect_move(m,current,&phase_cont,phase_cont+120.0f))goto detect_fail;
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(300u);
-        const float now=encoder_read_deg();
-        const float diff=encoder_detect_angle_diff(now,prev);
-        encoder_detect_circular_add(diff,&sum_s,&sum_c);
-        prev=now;
-        if(i>3 && fabsf(encoder_detect_angle_diff(now,first))<fabsf(diff*0.5f))break;
+        if(!encoder_detect_move(m,current,&phase_cont,-60.0f))goto detect_fail;
+        HAL_Delay(150u);
+        minus_sum+=encoder_detect_angle_diff(encoder_read_deg(),0.0f);
+        if(!encoder_detect_move(m,current,&phase_cont,0.0f))goto detect_fail;
+        HAL_Delay(150u);
+        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f)goto detect_fail;
     }
-    first=encoder_read_deg(); prev=first;
-    for(int i=0;i<30;++i){
-        if(!encoder_detect_move(m,current,&phase_cont,phase_cont-120.0f))goto detect_fail;
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(300u);
-        const float now=encoder_read_deg();
-        const float diff=encoder_detect_angle_diff(prev,now);
-        encoder_detect_circular_add(diff,&sum_s,&sum_c);
-        prev=now;
-        if(i>3 && fabsf(encoder_detect_angle_diff(now,first))<fabsf(diff*0.5f))break;
-    }
-    const float diff_avg=atan2f(sum_s,sum_c)*(180.0f/3.14159265358979323846f);
-    if(fabsf(diff_avg)<0.10f)goto detect_fail;
-    const bool inv=diff_avg<0.0f;
-    float rat=roundf(120.0f/fabsf(diff_avg));
+
+    const float plus=plus_sum/(float)samples;
+    const float minus=minus_sum/(float)samples;
+    /* The two probes must move in opposite directions with similar magnitude. */
+    if(fabsf(plus)<0.5f || fabsf(minus)<0.5f || plus*minus>=0.0f)goto detect_fail;
+    const float mag=0.5f*(fabsf(plus)+fabsf(minus));
+    if(fabsf(fabsf(plus)-fabsf(minus))>mag*0.35f)goto detect_fail;
+    float rat=roundf(60.0f/mag);
     if(!(rat>=1.0f && rat<=100.0f))goto detect_fail;
+    /* Positive electrical command causing negative ABI motion means inversion. */
+    const bool inv=plus<0.0f;
 
-    /* Offset VESC: sampling tiga titik per electrical revolution, forward dan
-     * reverse, lalu circular mean corrected_encoder - commanded_phase. */
-    const int it_ofs=(int)(rat*3.0f);
-    sum_s=0.0f; sum_c=0.0f;
-    for(int i=0;i<it_ofs;++i){
-        if(!encoder_detect_move(m,current,&phase_cont,phase_cont+120.0f))goto detect_fail;
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(100u);
-        float raw=encoder_read_deg();
-        float corr=(inv?(360.0f-raw):raw)*rat;
-        corr=encoder_norm_deg(corr);
-        encoder_detect_circular_add(encoder_detect_angle_diff(corr,encoder_norm_deg(phase_cont)),&sum_s,&sum_c);
-    }
-    for(int i=0;i<it_ofs;++i){
-        if(!encoder_detect_move(m,current,&phase_cont,phase_cont-120.0f))goto detect_fail;
-        mcpwm_foc_vesc_override_touch(false); HAL_Delay(100u);
-        float raw=encoder_read_deg();
-        float corr=(inv?(360.0f-raw):raw)*rat;
-        corr=encoder_norm_deg(corr);
-        encoder_detect_circular_add(encoder_detect_angle_diff(corr,encoder_norm_deg(phase_cont)),&sum_s,&sum_c);
-    }
-    float ofs=atan2f(sum_s,sum_c)*(180.0f/3.14159265358979323846f);
-    ofs=encoder_norm_deg(ofs);
-    if(offset)*offset=ofs;
+    /* Cross-check the detected pole-pair ratio against the configured motor
+     * poles. This catches phase/open-wire slip before closed-loop torque is
+     * armed, while still allowing a fresh config to correct a stale value. */
+    const float configured=(float)MCCONF_POLE_PAIRS_LEFT;
+    if(configured>=1.0f && fabsf(rat-configured)>2.0f)goto detect_fail;
+
+    encoder_runtime_set_deg(m,0.0f);
+    if(offset)*offset=0.0f;
     if(ratio)*ratio=rat;
     if(inverted)*inverted=inv;
-    m->m_encoder_synced=0u; /* hasil baru harus di-apply lalu alignment ulang */
+    m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
     return true;
@@ -2164,7 +2161,15 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
      * The custom long-range Hall-count API remains a separate branch. */
     int32_t error_mdeg;
     int32_t count_error=0;
-    const int32_t limit_q4=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
+    int32_t limit_q4=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
+    if(m->m_pos_pid_phase_mode && !second && encoder_feedback_selected(m,false)){
+        /* Steering-specific torque ceiling. The wire command remains standard
+         * COMM_SET_POS, but a 30-deg command must never inherit a 15-A traction
+         * current limit. This ceiling is tuned from real steering tests. */
+        const int32_t steering_cap=((int32_t)FOC_CURRENT_Q4_PER_A*
+            (int32_t)MCCONF_STEERING_POSITION_CURRENT_MAX_MA)/1000;
+        if(limit_q4>steering_cap)limit_q4=steering_cap;
+    }
     if(m->m_pos_pid_phase_mode){
         /* VESC foc_run_pid_control_pos: shortest-path angular PID langsung
          * terhadap posisi rotor yang tersedia. Pada board hoverboard tanpa

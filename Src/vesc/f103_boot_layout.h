@@ -8,10 +8,17 @@
 #define F103_FLASH_PAGE_SIZE      0x00000800u /* 2 KiB for STM32F103xE */
 
 /* Native VESC transport: F103 USART3 PB10/PB11 <-> F411 USART1 PB6/PB7.
- * APB1 is 32 MHz on this firmware; 2 Mbaud is an exact divider and is the
- * maximum rate for USART3 with 16x oversampling. It is accepted only after
- * hardware stress/CRC validation; 1 Mbaud is the fallback if link errors appear. Keep app, bootloader and host tools identical. */
-#define F103_VESC_UART_BAUD       2000000u
+ * Production rate is 1 Mbaud. Hardware testing showed 2 Mbaud could lose the
+ * final byte of a VESC frame; 1 Mbaud is CRC-clean while still ~8.7x faster
+ * than the former USB-TTL-limited 115200 path. */
+#define F103_VESC_UART_BAUD       1000000u
+
+/* Top 16 bytes of SRAM are reserved in BOTH linker scripts. A two-word magic
+ * makes application -> resident-bootloader entry independent of flash writes.
+ * SRAM survives NVIC_SystemReset but not a real power loss, which is desired. */
+#define F103_BOOT_REQUEST_ADDR       0x2000BFF0u
+#define F103_BOOT_REQUEST_MAGIC      0x46574F54u /* 'FWOT' */
+#define F103_BOOT_REQUEST_MAGIC_INV  ((uint32_t)~F103_BOOT_REQUEST_MAGIC)
 
 #define F103_BOOT_BASE_ADDR       0x08000000u
 #define F103_BOOT_SIZE            0x00002800u /* 10 KiB / 5 pages */

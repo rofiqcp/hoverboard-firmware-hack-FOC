@@ -33,7 +33,7 @@
 ENTRY(Reset_Handler)
 
 /* Highest address of the user mode stack */
-_estack = 0x2000C000;    /* end of RAM */
+_estack = 0x2000BFF0;    /* top 16 bytes reserved for boot request */
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
@@ -41,7 +41,7 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Specify the memory areas */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 48K
+RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 0xBFF0
 FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 10K /* immutable recovery bootloader */
 }
 
@@ -120,6 +120,7 @@ SECTIONS
     _sdata = .;        /* create a global symbol at data start */
     *(.data)           /* .data sections */
     *(.data*)          /* .data* sections */
+    *(.ramfunc*)        /* flash primitives copied to RAM before main */
 
     . = ALIGN(4);
     _edata = .;        /* define a global symbol at data end */

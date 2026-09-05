@@ -39,7 +39,7 @@ def main():
     motors=[]
     if a.motor in ('left','both'): motors.append((False,'left'))
     if a.motor in ('right','both'): motors.append((True,'right'))
-    link=VescDual(a.port,2000000,timeout=.5)
+    link=VescDual(a.port,1000000,timeout=.5)
     rows=[]
     try:
         stop_all(link); time.sleep(.25)

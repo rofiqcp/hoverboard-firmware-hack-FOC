@@ -23,6 +23,7 @@
 #define VESC_LINK_HOLD_MS        2000u
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
+#define VESC_RX_INTERBYTE_TIMEOUT_MS 50u
 #define VESC_RX_QUEUE_DEPTH          8u
 #define VESC_TX_QUEUE_DEPTH          8u
 
@@ -39,6 +40,7 @@
 #define HB_CUSTOM_GET_TUNING             6u
 #define HB_CUSTOM_SET_TUNING             7u
 #define HB_CUSTOM_SET_ID_TEST            8u
+#define HB_CUSTOM_SET_STEERING_DEG        9u /* ROS/Web signed mechanical millidegree */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -88,6 +90,8 @@ static volatile uint32_t s_link_last_ms = 0u;
 static int64_t s_odometer_offset_m[2] = {0, 0};
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
+static volatile uint32_t s_rx_last_byte_ms = 0u;
+static volatile uint32_t s_rx_timeout_reset = 0u;
 /* Realtime setpoint mailbox. SET_* packets have no reply and repeated packets
  * supersede older setpoints. Coalescing them here prevents stale RPM/current/
  * position commands from filling the generic request FIFO while VESC Tool is
@@ -328,12 +332,20 @@ static void complete_frame(void) {
 }
 
 bool vesc_protocol_rx_byte(uint8_t byte) {
+    const uint32_t now_ms = HAL_GetTick();
+    if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
+        /* A truncated/corrupt long frame must never poison all later traffic.
+         * F411 upload chunks are paced at ~5 ms, so 50 ms leaves ample margin. */
+        rx_reset();
+        s_rx_timeout_reset++;
+    }
+    s_rx_last_byte_ms = now_ms;
     if (!s_rx_active) {
         if (byte != 2u && byte != 3u && byte != 4u) return false;
         s_rx_active = 1u;
         s_rx_frame[0] = byte;
         s_rx_index = 1u;
-        s_link_last_ms = HAL_GetTick(); /* suppress unsolicited terminal telemetry immediately */
+        s_link_last_ms = now_ms; /* suppress unsolicited terminal telemetry immediately */
         return true;
     }
 
@@ -503,6 +515,10 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
 }
 
 void vesc_protocol_periodic(uint32_t now_ms) {
+    if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
+        rx_reset();
+        s_rx_timeout_reset++;
+    }
     const uint32_t detector_now = detect_time_now();
     hall_detect_periodic(detector_now);
     detect_all_periodic(detector_now);
@@ -1759,6 +1775,19 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         reply_custom_pos_state(second, op, 0u);
         return;
     }
+    if (op == HB_CUSTOM_SET_STEERING_DEG) {
+        /* ROS/Web runtime path: signed mechanical steering degrees with 0=center.
+         * Keep this separate from stock COMM_SET_POS, whose VESC Tool widget is
+         * intentionally mapped 0..360 -> -30..+30 on LEFT. No per-cycle ACK is
+         * emitted; normal GET_VALUES telemetry is the feedback/health channel. */
+        if (second || n < 4u) return;
+        int32_t mdeg=buffer_get_int32(d,&k);
+        if(mdeg>30000)mdeg=30000;
+        if(mdeg< -30000)mdeg=-30000;
+        touch_motor(false);
+        mc_interface_set_pid_pos((float)mdeg/1000.0f);
+        return;
+    }
     if (op == HB_CUSTOM_GET_TUNING || op == HB_CUSTOM_SET_TUNING) {
         mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
         if (op == HB_CUSTOM_SET_TUNING) {
@@ -2091,7 +2120,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     }
     case COMM_JUMP_TO_BOOTLOADER:
-        if (!second && f103_fw_mark_pending_or_recovery()) {
+        if (!second) {
+            /* Enter resident recovery without touching flash. The application
+             * stores a dual-word SRAM request then performs NVIC reset. */
             f103_fw_reset_to_bootloader();
         }
         break;
@@ -2159,7 +2190,20 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_SET_POS:
         if (hall_detect_motor_locked(second)) break;
-        if(n>=4u){const float pos=(float)buffer_get_int32(d,&k)/1000000.0f;touch_motor(second);mc_interface_set_pid_pos(pos);}
+        if(n>=4u){
+            float pos=(float)buffer_get_int32(d,&k)/1000000.0f;
+            if(!second){
+                /* VESC Tool exposes SET_POS as 0..360 deg. For the physical
+                 * LEFT steering axis map that UI range linearly onto the
+                 * signed mechanical envelope: 0 -> -30, 180 -> 0, 360 -> +30.
+                 * Values outside the widget range are clamped, never wrapped. */
+                if(pos<0.0f)pos=0.0f;
+                if(pos>360.0f)pos=360.0f;
+                pos=MCCONF_STEERING_POS_MIN_DEG +
+                    (pos/360.0f)*(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+            }
+            touch_motor(second); mc_interface_set_pid_pos(pos);
+        }
         break;
     case COMM_ALIVE:
         touch_motor(second);
