@@ -288,6 +288,8 @@ HB_SET_TUNING = 7
 HB_SET_ID_TEST = 8
 HB_SET_STEERING_DEG = 9
 HB_GET_STEERING_CAL = 10
+HB_STEERING_HOME = 13
+HB_ENCODER_DEBUG = 14
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -699,20 +701,39 @@ class VescDual:
         self.ser.reset_input_buffer()
         self.timeout = timeout
         self.dec = PacketDecoder()
+        # io_lock serializes request/reply readers. tx_lock is intentionally
+        # separate so no-reply watchdog/setpoint frames can still be transmitted
+        # while a slow telemetry reply is pending. This is safe because only one
+        # thread reads/decodes replies, while every physical write is serialized.
         self.io_lock = threading.Lock()
+        self.tx_lock = threading.Lock()
 
     def close(self):
         self.ser.close()
 
     def send(self, payload: bytes):
         packet = frame(payload)
-        written = self.ser.write(packet)
-        if written != len(packet):
-            raise IOError(f"short serial write {written}/{len(packet)}")
-        # The reply timeout starts only after the full VESC frame has reached
-        # the OS/USB-UART transmit path. This matters especially immediately
-        # after COMM_REBOOT when a fresh tty session is opened.
-        self.ser.flush()
+        lock = getattr(self, "tx_lock", None)
+        if lock is None:
+            self.tx_lock = threading.Lock()
+            lock = self.tx_lock
+        with lock:
+            written = self.ser.write(packet)
+            if written != len(packet):
+                raise IOError(f"short serial write {written}/{len(packet)}")
+            # The reply timeout starts only after the full VESC frame has reached
+            # the OS/USB-UART transmit path. This matters especially immediately
+            # after COMM_REBOOT when a fresh tty session is opened.
+            self.ser.flush()
+
+    def send_no_reply(self, payload: bytes, right: bool = False) -> None:
+        """Send one command that is defined to produce no reply.
+
+        Unlike transact(), this does not acquire io_lock, so motor watchdog and
+        setpoint refresh traffic is not starved by a slow GET_VALUES response.
+        tx_lock inside send() still guarantees frame writes never interleave.
+        """
+        self.send(self.fwd(payload) if right else payload)
 
     def recv(self, expected_cmd: int, timeout: float | None = None) -> bytes:
         end = time.monotonic() + (self.timeout if timeout is None else timeout)
@@ -745,9 +766,7 @@ class VescDual:
     def alive(self, right: bool = False) -> None:
         """Commands::sendAlive: refresh timeout without changing the setpoint."""
         req=bytes((COMM_ALIVE,))
-        with self.io_lock:
-            self.send(self.fwd(req) if right else req)
-            self.ser.flush()
+        self.send_no_reply(req, right)
 
     def set_detect(self, mode: int, right: bool = False) -> None:
         """Commands::setDetect: select VESC Tool rotor-position display mode."""
@@ -1046,7 +1065,19 @@ class VescDual:
     def custom_transact(self, op: int, data: bytes = b"", right: bool = False,
                         timeout: float | None = None) -> bytes:
         req = self._custom(op, data)
-        return self.transact(self.fwd(req) if right else req, COMM_CUSTOM_APP_DATA, timeout)
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        with self.io_lock:
+            self.send(self.fwd(req) if right else req)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"no custom reply for op {op}")
+                p = self.recv(COMM_CUSTOM_APP_DATA, remaining)
+                # COMM_CUSTOM_APP_DATA multiplexes all Hoverboard extension ops.
+                # Ignore a delayed reply from another op instead of letting it
+                # poison tuning/diagnostic transactions.
+                if len(p) >= 6 and p[1:3] == HB_MAGIC and p[3] == HB_VERSION and p[4] == op:
+                    return p
 
     def get_tuning(self, right: bool = False) -> Tuning:
         p=self.custom_transact(HB_GET_TUNING, right=right)
@@ -1091,11 +1122,44 @@ class VescDual:
     def reset_position(self, right: bool = False) -> PositionState:
         return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
 
+    def home_steering(self):
+        """Bounded LEFT ABI startup alignment + persisted-span homing."""
+        p=self.custom_transact(HB_STEERING_HOME,right=False,timeout=20.0)
+        status=parse_custom_header(p,HB_STEERING_HOME)
+        if len(p)<11:
+            raise ValueError(f"short steering home reply: {len(p)}")
+        flags=p[6]
+        span=struct.unpack_from(">i",p,7)[0]
+        return {"status":status,"calibrated":bool(flags&1),"homed":bool(flags&2),
+                "encoder_synced":bool(flags&4),"span":span}
+
+    def encoder_debug(self):
+        """Read-only LEFT ABI alignment/detect black-box diagnostics."""
+        p=self.custom_transact(HB_ENCODER_DEBUG,right=False,timeout=2.0)
+        status=parse_custom_header(p,HB_ENCODER_DEBUG)
+        if status or len(p)<80:
+            raise ValueError(f"encoder_debug status={status} len={len(p)}")
+        q=6
+        align_stage,steer_stage,detect_stage,inverted,configured,synced=p[q:q+6]; q+=6
+        offset_mdeg,ratio_milli=struct.unpack_from(">ii",p,q); q+=8
+        raw,before,jog,back=struct.unpack_from(">IIII",p,q); q+=16
+        dj,db,plus_mdeg,minus_mdeg=struct.unpack_from(">iiii",p,q); q+=16
+        edge_a,edge_b,edge_pb5,samples=struct.unpack_from(">IIII",p,q); q+=16
+        current_ma=struct.unpack_from(">H",p,q)[0]; q+=2
+        span,pos,target=struct.unpack_from(">iii",p,q); q+=12
+        return {"align_stage":align_stage,"steering_stage":steer_stage,"detect_stage":detect_stage,
+                "inverted":bool(inverted),"configured":bool(configured),"synced":bool(synced),
+                "offset_deg":offset_mdeg/1000.0,"ratio":ratio_milli/1000.0,"raw":raw,
+                "before":before,"jog":jog,"back":back,"dj":dj,"db":db,
+                "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
+                "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
+                "span":span,"position":pos,"target":target}
+
     def set_steering_deg(self, deg: float):
         """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""
         deg=max(-30.0,min(30.0,float(deg)))
-        payload=self.custom_payload(HB_SET_STEERING_DEG,struct.pack(">i",round(deg*1000.0)))
-        self._send_frame(payload)
+        payload=self._custom(HB_SET_STEERING_DEG,struct.pack(">i",round(deg*1000.0)))
+        self.send(payload)
 
 
     def diag(self, right: bool = False) -> Diag:

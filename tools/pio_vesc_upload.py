@@ -249,17 +249,26 @@ def upload(link,fw:bytes):
         time.sleep(.002)
     link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
     print('[VESC] staged CRC complete; bootloader copy requested', flush=True)
+    # A pre-reset FW_VERSION frame can still be buffered by the F411/USB path.
+    # Never declare update success from one response: require two fresh,
+    # consecutive application probes after the bootloader copy/reset.
+    link.buf.clear()
+    if hasattr(link, 'linebuf'): link.linebuf.clear()
     deadline=time.monotonic()+45
-    last=''
+    last=''; stable_app_probes=0
     while time.monotonic()<deadline:
         time.sleep(.4)
         try:
             last=fw_version(link,1.2)
             if last and 'bootloader' not in last.lower():
-                print(f'[VESC] application returned: {last}', flush=True); return
+                stable_app_probes += 1
+                if stable_app_probes >= 2:
+                    print(f'[VESC] application returned stable: {last}', flush=True); return
+            else:
+                stable_app_probes = 0
         except Exception:
-            pass
-    raise RuntimeError(f'application did not return after update; last={last!r}')
+            stable_app_probes = 0
+    raise RuntimeError(f'application did not return stably after update; last={last!r}')
 
 def selftest():
     p=b'\x00\x06\x00test\x00'; f=frame(p)

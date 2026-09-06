@@ -44,11 +44,28 @@
 #define HB_CUSTOM_GET_STEERING_CAL       10u
 #define HB_CUSTOM_SET_OPENLOOP_TEST       11u /* bounded commissioning, either motor */
 #define HB_CUSTOM_HALL_PIN_TEST            12u /* passive RIGHT Hall electrical test */
+#define HB_CUSTOM_STEERING_HOME             13u /* bounded LEFT ABI startup alignment + home */
+#define HB_CUSTOM_ENCODER_DEBUG             14u /* read-only LEFT ABI alignment/detect black box */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
 extern volatile adc_buf_t adc_buffer;
 extern volatile uint32_t buzzerTimer;
+extern volatile uint8_t steering_detect_stage;
+extern volatile uint8_t encoder_detect_stage;
+extern volatile uint8_t encoder_align_stage;
+extern volatile uint32_t encoder_align_before_count;
+extern volatile uint32_t encoder_align_jog_count;
+extern volatile uint32_t encoder_align_back_count;
+extern volatile int32_t encoder_align_jog_delta;
+extern volatile int32_t encoder_align_back_delta;
+extern volatile uint16_t encoder_align_current_ma;
+extern volatile int32_t encoder_detect_plus_mdeg;
+extern volatile int32_t encoder_detect_minus_mdeg;
+extern volatile uint32_t encoder_gpio_edge_a;
+extern volatile uint32_t encoder_gpio_edge_b;
+extern volatile uint32_t encoder_gpio_edge_pb5;
+extern volatile uint32_t encoder_gpio_samples;
 #ifdef STM32F103xE
 extern volatile uint32_t main_prof_vesc_max_cycles;
 extern volatile uint32_t main_prof_house_max_cycles;
@@ -551,15 +568,19 @@ void vesc_protocol_periodic(uint32_t now_ms) {
     const disp_pos_mode mode = s_display_pos_mode;
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
+    /* COMM_SET_DETECT enables the same unsolicited rotor-position stream used
+     * by VESC Tool. Unlike the old implementation, do not require an idle UART
+     * before sampling: that reduced a nominal 100-Hz stream to ~60 Hz whenever
+     * 50-Hz RT values for two motors were also being requested.
+     *
+     * Rotor telemetry is low priority and latest-sample by construction. Service
+     * the DMA queue first, then enqueue only while at least one slot remains
+     * reserved for solicited GET_VALUES/config replies. If the link is truly
+     * saturated we simply retry the newest rotor sample on the next main-loop
+     * pass instead of queueing stale positions. */
+    vesc_tx_service();
+    if (s_tx_count >= (VESC_TX_QUEUE_DEPTH - 1u)) return;
     s_display_prev_ms = now_ms;
-    /* COMM_SET_DETECT explicitly enables VESC Tool rotor-position streaming.
-     * Upstream keeps display_position_mode active until another SET_DETECT
-     * changes/disables it; do not couple this stream to the generic UART
-     * link-hold timeout. Solicited traffic is still protected below. */
-    /* Do not delay a solicited VESC Tool reply. Upstream uses a separate packet
-     * transport thread; on this small bare-metal target we skip one 10-ms rotor
-     * sample whenever RX/TX is busy instead of blocking realtime traffic. */
-    if (s_rx_active || s_pending_count != 0u || huart3.gState != HAL_UART_STATE_READY) return;
     const bool second = s_display_second != 0u;
     float pos = 0.0f;
     if (!display_rotor_pos(second, mode, &pos)) return;
@@ -698,7 +719,14 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
         if(mask&(1u<<15)) b[i++]=v.fault;
         if(mask&(1u<<16)) {
             uint32_t pv2=DWT->CYCCNT;
-            buffer_append_float32(b, mc_interface_get_pid_pos_now_motor(second), 1e6f, &i);
+            /* Keep the F103 integer fast-path semantically identical to the
+             * generic VESC values path. LEFT is a calibrated steering axis,
+             * therefore position is signed physical wheel degrees (-30..+30),
+             * not raw motor/ABI shaft angle. Otherwise frequent GET_VALUES
+             * overwrites the correct steering-calibration feedback in ROS. */
+            const float pos = (!second && mc_interface_steering_calibration_valid()) ?
+                mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
+            buffer_append_float32(b, pos, 1e6f, &i);
             uint32_t pv3=DWT->CYCCNT;
             dt=(uint32_t)(pv3-pv2);
             if(dt>s_prof_values_position_max_cycles)s_prof_values_position_max_cycles=dt;
@@ -1822,6 +1850,51 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_uint32(b,mcpwm_foc_get_motor_const(false)->m_encoder_raw_count,&j);
         uart_send_payload(b,(uint16_t)j); return;
     }
+    if (op == HB_CUSTOM_STEERING_HOME) {
+        uint8_t status=0u;
+        if(second) status=1u;
+        else if(!mc_interface_steering_calibration_valid()) status=2u;
+        else if(!mc_interface_steering_boot_home()) status=3u;
+        uint8_t b[16]; int32_t j=0; uint8_t flags=0u;
+        if(mc_interface_steering_calibration_valid())flags|=0x01u;
+        if(mcpwm_foc_steering_is_homed())flags|=0x02u;
+        if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=status; b[j++]=flags;
+        buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
+        uart_send_payload(b,(uint16_t)j);
+        return;
+    }
+    if (op == HB_CUSTOM_ENCODER_DEBUG) {
+        if(second)return;
+        const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(false);
+        uint8_t b[96]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        b[j++]=encoder_align_stage; b[j++]=steering_detect_stage; b[j++]=encoder_detect_stage;
+        b[j++]=m->m_conf.foc_encoder_inverted?1u:0u;
+        b[j++]=m->m_encoder_configured?1u:0u; b[j++]=m->m_encoder_synced?1u:0u;
+        buffer_append_int32(b,(int32_t)lroundf(m->m_conf.foc_encoder_offset*1000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(m->m_conf.foc_encoder_ratio*1000.0f),&j);
+        buffer_append_uint32(b,m->m_encoder_raw_count,&j);
+        buffer_append_uint32(b,encoder_align_before_count,&j);
+        buffer_append_uint32(b,encoder_align_jog_count,&j);
+        buffer_append_uint32(b,encoder_align_back_count,&j);
+        buffer_append_int32(b,encoder_align_jog_delta,&j);
+        buffer_append_int32(b,encoder_align_back_delta,&j);
+        buffer_append_int32(b,encoder_detect_plus_mdeg,&j);
+        buffer_append_int32(b,encoder_detect_minus_mdeg,&j);
+        buffer_append_uint32(b,encoder_gpio_edge_a,&j);
+        buffer_append_uint32(b,encoder_gpio_edge_b,&j);
+        buffer_append_uint32(b,encoder_gpio_edge_pb5,&j);
+        buffer_append_uint32(b,encoder_gpio_samples,&j);
+        buffer_append_uint16(b,encoder_align_current_ma,&j);
+        buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
+        buffer_append_int32(b,m->m_position_counts,&j);
+        buffer_append_int32(b,m->m_position_target_counts,&j);
+        uart_send_payload(b,(uint16_t)j);
+        return;
+    }
     if (op == HB_CUSTOM_SET_STEERING_DEG) {
         /* ROS/Web runtime path: signed mechanical steering degrees with 0=center.
          * Keep this separate from stock COMM_SET_POS, whose VESC Tool widget is
@@ -1873,12 +1946,18 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_SET_ID_TEST) {
-        if (n < 8u) { uint8_t e[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,1u}; uart_send_payload(e,6u); return; }
-        const int32_t ma=buffer_get_int32(d,&k); const int32_t mdeg=buffer_get_int32(d,&k);
+        uint8_t status=0u;
+        if (n < 8u) status=1u;
+        int32_t ma=0,mdeg=0;
+        if(status==0u){
+            ma=buffer_get_int32(d,&k); mdeg=buffer_get_int32(d,&k);
+            if(ma<0)ma=-ma;
+            if(ma>5000 || mdeg>360000 || mdeg<-360000)status=2u;
+        }
         touch_motor(second);
-        if (ma == 0) mc_interface_release_motor();
-        else mcpwm_foc_set_openloop_phase((float)(ma<0?-ma:ma)/1000.0f,(float)mdeg/1000.0f,second);
-        { uint8_t a[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u}; uart_send_payload(a,6u); }
+        if(status!=0u || ma==0)mc_interface_release_motor();
+        else mcpwm_foc_set_openloop_phase((float)ma/1000.0f,(float)mdeg/1000.0f,second);
+        { uint8_t a[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,status}; uart_send_payload(a,6u); }
         return;
     }
     if (op == HB_CUSTOM_SET_OPENLOOP_TEST) {

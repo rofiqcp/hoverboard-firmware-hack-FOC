@@ -4,7 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import argparse,csv,json,math,statistics,struct,time
+import argparse,csv,json,math,statistics,struct,time,threading
 from dataclasses import asdict,replace
 from vesc_dual import VescDual,Tuning,COMM_SET_CURRENT,COMM_SET_RPM
 
@@ -12,7 +12,7 @@ class AbortRun(RuntimeError): pass
 
 def send_scalar(link,right,cmd,value):
     p=bytes((cmd,))+struct.pack('>i',int(round(value)))
-    with link.io_lock: link.send(link.fwd(p) if right else p)
+    link.send_no_reply(p,right)
 
 def release(link,right):
     link.set_id_test(0.0,0.0,right)
@@ -70,47 +70,74 @@ def safety(v,max_erpm,max_current,max_duty):
     if not (20.0<=v.vin<=60.0): raise AbortRun(f'Vin={v.vin:.1f}V')
 
 def capture_step(link,right,loop,target,duration,hz,guard,position_target=None):
-    rows=[]; t0=time.monotonic(); next_cmd=0.0; abort=''
+    rows=[]; t0=time.monotonic(); abort=''; stop_evt=threading.Event(); writer_errors=[]
+
+    def issue_command():
+        if loop=='speed': send_scalar(link,right,COMM_SET_RPM,target)
+        elif loop=='currentq': send_scalar(link,right,COMM_SET_CURRENT,target*1000.0)
+        elif loop=='currentd': link.set_id_test(abs(target),0.0,right)
+        elif loop=='position': link.set_position_counts(int(position_target),right)
+
+    # SET_RPM/SET_CURRENT have no reply. Keep them refreshed independently from
+    # telemetry so a slow F411/USB GET_VALUES transaction can never exhaust the
+    # 500-ms motor watchdog. Other loops use request/reply commands and stay
+    # single-threaded to preserve response correlation.
+    def writer():
+        if loop not in ('speed','currentq'): return
+        next_t=time.monotonic()
+        while not stop_evt.is_set():
+            try:
+                issue_command()
+            except Exception as e:
+                writer_errors.append(repr(e)); return
+            next_t += 0.10
+            stop_evt.wait(max(0.0,next_t-time.monotonic()))
+
+    th=threading.Thread(target=writer,name='vesc-setpoint-refresh',daemon=True)
     try:
+        if loop in ('speed','currentq'): th.start()
         while True:
             now=time.monotonic(); elapsed=now-t0
             if elapsed>=duration: break
-            if elapsed>=next_cmd:
-                if loop=='speed': send_scalar(link,right,COMM_SET_RPM,target)
-                elif loop=='currentq': send_scalar(link,right,COMM_SET_CURRENT,target*1000.0)
-                elif loop=='currentd': link.set_id_test(abs(target),0.0,right)
-                elif loop=='position': link.set_position_counts(int(position_target),right)
-                next_cmd+=0.05
-            v=link.values(right); safety(v,*guard)
+            if loop not in ('speed','currentq'): issue_command()
+            try:
+                v=link.values(right)
+            except TimeoutError:
+                # A single telemetry miss is diagnostic, not a motor failure;
+                # the background command refresher keeps the watchdog alive.
+                if writer_errors: raise AbortRun('setpoint writer failed: '+writer_errors[-1])
+                time.sleep(0.02); continue
+            safety(v,*guard)
             d=link.diag(right) if loop=='position' else None
-            rows.append(dict(phase='run',t=elapsed,erpm=v.rpm,iq=v.iq,id=v.id,imotor=v.current_motor,
+            rows.append(dict(phase='run',t=time.monotonic()-t0,erpm=v.rpm,iq=v.iq,id=v.id,imotor=v.current_motor,
                              ibat=v.current_in,duty=v.duty,vd=v.vd,vq=v.vq,vin=v.vin,fault=v.fault,
                              position=(d.position if d else 0),position_target=(d.position_target if d else 0)))
-            time.sleep(max(0.0,1.0/hz))
+            if writer_errors: raise AbortRun('setpoint writer failed: '+writer_errors[-1])
+            time.sleep(max(0.02,1.0/max(hz,1.0)))
     except AbortRun as e: abort=str(e)
     finally:
+        stop_evt.set()
+        if th.is_alive(): th.join(timeout=.4)
         try: release(link,right)
         except Exception: pass
     ts=time.monotonic()
-    while time.monotonic()-ts<0.6:
+    while time.monotonic()-ts<0.8:
         try:
             v=link.values(right); d=link.diag(right) if loop=='position' else None
             rows.append(dict(phase='stop',t=time.monotonic()-ts,erpm=v.rpm,iq=v.iq,id=v.id,imotor=v.current_motor,
                              ibat=v.current_in,duty=v.duty,vd=v.vd,vq=v.vq,vin=v.vin,fault=v.fault,
                              position=(d.position if d else 0),position_target=(d.position_target if d else 0)))
         except Exception: pass
-        time.sleep(max(.02,1.0/hz))
+        time.sleep(max(.05,1.0/max(hz,1.0)))
     key={'speed':'erpm','currentq':'iq','currentd':'id','position':'position'}[loop]
     mt=position_target if loop=='position' else target
-    m=metrics(rows,float(mt),key); m['abort']=abort; m['loop']=loop; m['motor']=motor_name(right)
+    m=metrics(rows,float(mt),key); m['abort']=abort; m['loop']=loop; m['motor']=motor_name(right); m['writer_errors']=writer_errors
     if rows:
         run_rows=[r for r in rows if r['phase']=='run']
         coast_rows=[r for r in rows if r['phase']=='stop']
         if run_rows:
             m['peak_current_a']=max(abs(r['imotor']) for r in run_rows)
             m['peak_duty']=max(abs(r['duty']) for r in run_rows)
-        # Low-side phase shunts are not observable with MOE/high-impedance OFF.
-        # Preserve coast samples for diagnosis, but never let them contaminate PID scoring.
         if coast_rows:
             m['coast_peak_current_untrusted_a']=max(abs(r['imotor']) for r in coast_rows)
     return rows,m

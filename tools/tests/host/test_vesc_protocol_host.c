@@ -18,6 +18,14 @@
 
 UART_HandleTypeDef huart3 = {0};
 volatile adc_buf_t adc_buffer = {0};
+volatile uint8_t steering_detect_stage=0u;
+volatile uint8_t encoder_detect_stage=0u;
+volatile uint8_t encoder_align_stage=0u;
+volatile uint32_t encoder_align_before_count=0u, encoder_align_jog_count=0u, encoder_align_back_count=0u;
+volatile int32_t encoder_align_jog_delta=0, encoder_align_back_delta=0;
+volatile uint16_t encoder_align_current_ma=0u;
+volatile int32_t encoder_detect_plus_mdeg=0, encoder_detect_minus_mdeg=0;
+volatile uint32_t encoder_gpio_edge_a=0u, encoder_gpio_edge_b=0u, encoder_gpio_edge_pb5=0u, encoder_gpio_samples=0u;
 int16_t board_temp_deg_c = 31;
 static uint32_t tick_ms = 1000u;
 static uint8_t tx_capture[1024];
@@ -102,6 +110,7 @@ void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c;
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
 bool mc_interface_steering_calibration_valid(void){return true;}
+bool mc_interface_steering_boot_home(void){diag_motors[0].m_encoder_synced=1u;return true;}
 float mc_interface_get_steering_deg(void){return 12.5f;}
 bool mc_interface_set_steering_deg(float p){set_pos[0]=p;return true;}
 bool mc_interface_steering_detect_calibrate(float current,float *offset,float *ratio,bool *inverted,

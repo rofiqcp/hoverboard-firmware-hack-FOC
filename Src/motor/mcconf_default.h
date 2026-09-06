@@ -40,17 +40,24 @@
  * therefore Hall and ABI are mutually exclusive sensor-port modes. */
 #define MCCONF_ENCODER_COUNTS_DEFAULT             4096u
 #define MCCONF_ENCODER_OFFSET_DEFAULT             0.0f
-#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.80f
-#define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       250u
-#define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       500u
+#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.50f /* adaptive Id alignment starts low */
+#define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       0.50f /* rise gradually until ABI motion is proven */
+#define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A        2.00f /* commissioning ceiling: steering hardware */
+#define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
+#define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
 /* Physical LEFT steering envelope. VESC COMM_SET_POS is still the wire API,
  * but the user coordinate is signed mechanical degrees around center. 330 deg
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   1000u
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   1500u /* measured LEFT Iq breakaway ~1 A; steering-only ceiling */
+#define MCCONF_STEERING_POSITION_KP_MULTIPLIER        6u /* 0.025 VESC base -> 0.15 effective on calibrated steering */
+#define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       2000u /* bounded one-shot assist; commissioning-safe ceiling */
+#define MCCONF_STEERING_BREAKAWAY_MAX_MS             300u
+#define MCCONF_STEERING_BREAKAWAY_DELAY_MS            20u
+#define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        2000u /* no 2-A assist inside +/-2 degrees */
 #define MCCONF_STEERING_HOME_CURRENT_A             0.70f
-#define MCCONF_STEERING_CAL_CURRENT_MAX_A          1.00f
+#define MCCONF_STEERING_CAL_CURRENT_MAX_A          2.00f /* commissioning ceiling; normal steering <=1.5 A */
 #define MCCONF_STEERING_STALL_MS                    350u
 #define MCCONF_STEERING_SEEK_TIMEOUT_MS            8000u
 #define MCCONF_STEERING_MIN_SPAN_COUNTS              32
@@ -88,6 +95,9 @@
  * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
 #define MCCONF_SPEED_RAMP_ERPMS_S             1500u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
+#define MCCONF_SPEED_BREAKAWAY_CURRENT_MA      1000u /* one-shot startup torque, bounded below normal 3 A limit */
+#define MCCONF_SPEED_BREAKAWAY_MAX_MS            450u /* never hold breakaway torque on a blocked rotor */
+#define MCCONF_SPEED_BREAKAWAY_EXIT_ERPM          150u /* first reliable Hall motion ends the startup kick */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */

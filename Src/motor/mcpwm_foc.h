@@ -265,6 +265,8 @@ typedef struct {
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
     uint16_t m_speed_release_rpm;
+    uint16_t m_speed_breakaway_ticks;
+    uint8_t m_speed_breakaway_done;
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;

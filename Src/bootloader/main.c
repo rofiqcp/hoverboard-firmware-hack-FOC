@@ -24,8 +24,6 @@ static uint8_t rx_payload[RX_MAX_PAYLOAD];
  * every flash operation bounded. 120 KiB / 2 KiB = 60 pages. */
 static bool stage_session_active = false;
 static uint32_t stage_session_total = 0u;
-static uint32_t stage_erased_lo = 0u;
-static uint32_t stage_erased_hi = 0u;
 
 /* SWD-readable recovery diagnostics; no protocol or motor-side effect. */
 volatile uint32_t boot_diag_rx_bytes = 0u;
@@ -34,6 +32,12 @@ volatile uint32_t boot_diag_packets_ok = 0u;
 volatile uint32_t boot_diag_crc_errors = 0u;
 volatile uint32_t boot_diag_tx_replies = 0u;
 volatile uint32_t boot_diag_uart_errors = 0u;
+volatile uint32_t boot_diag_copy_code = 0u;
+volatile uint32_t boot_diag_copy_page = 0u;
+volatile uint32_t boot_diag_copy_addr = 0u;
+volatile uint32_t boot_diag_copy_size = 0u;
+volatile uint32_t boot_diag_copy_crc_stage = 0u;
+volatile uint32_t boot_diag_copy_crc_app = 0u;
 
 static uint16_t crc16(const uint8_t *data, uint32_t len) {
     uint16_t crc = 0u;
@@ -195,32 +199,6 @@ static bool erase_one_page(uint32_t address) {
     return erase_pages(address, F103_FLASH_PAGE_SIZE);
 }
 
-static bool stage_page_is_erased(uint32_t page) {
-    if (page < 32u) return (stage_erased_lo & (1u << page)) != 0u;
-    if (page < 64u) return (stage_erased_hi & (1u << (page - 32u))) != 0u;
-    return false;
-}
-
-static void mark_stage_page_erased(uint32_t page) {
-    if (page < 32u) stage_erased_lo |= (1u << page);
-    else if (page < 64u) stage_erased_hi |= (1u << (page - 32u));
-}
-
-static bool ensure_stage_pages_erased(uint32_t offset, uint32_t len) {
-    if (len == 0u || offset >= F103_STAGE_REGION_SIZE || len > F103_STAGE_REGION_SIZE - offset) return false;
-    const uint32_t first = offset / F103_FLASH_PAGE_SIZE;
-    const uint32_t last = (offset + len - 1u) / F103_FLASH_PAGE_SIZE;
-    const uint32_t page_count = F103_STAGE_REGION_SIZE / F103_FLASH_PAGE_SIZE;
-    if (last >= page_count) return false;
-    for (uint32_t page = first; page <= last; ++page) {
-        if (!stage_page_is_erased(page)) {
-            if (!erase_one_page(F103_STAGE_BASE_ADDR + page * F103_FLASH_PAGE_SIZE)) return false;
-            mark_stage_page_erased(page);
-        }
-    }
-    return true;
-}
-
 static bool stage_valid(uint32_t *size_out, uint16_t *crc_out) {
     const uint8_t *s = (const uint8_t *)F103_STAGE_BASE_ADDR;
     uint32_t size = be32(s); uint16_t wanted = be16(s + 4u);
@@ -266,32 +244,44 @@ static bool stage_to_pending_meta(void) {
 
 static bool copy_pending_image(void) {
     const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
+    boot_diag_copy_code = 1u;
     if (!meta_valid(m) || m->state != F103_UPDATE_STATE_PENDING) return false;
     uint32_t size = 0u; uint16_t wanted = 0u;
-    if (!stage_valid(&size, &wanted) || size != m->size || wanted != m->crc16) return false;
+    boot_diag_copy_code = 2u;
+    if (!stage_valid(&size, &wanted)) return false;
+    boot_diag_copy_size = size;
+    boot_diag_copy_crc_stage = crc16((const uint8_t *)(F103_STAGE_BASE_ADDR + F103_VESC_IMAGE_HEADER_SIZE), size);
+    boot_diag_copy_code = 3u;
+    if (size != m->size || wanted != m->crc16) return false;
 
     /* Copy page-by-page. PENDING metadata stays intact until the complete app
      * CRC and vector are valid, so a power loss retries from page zero safely. */
     /* STM32F103 is single-bank flash. Never use the staging flash address as
      * the source while erasing/programming another page in that same bank.
-     * Snapshot one page into SRAM first, then erase and program from SRAM.
-     * This also makes the copy deterministic if the flash interface stalls
-     * instruction/data reads while BSY is asserted. */
+     * Snapshot one page into SRAM first, then erase and program from SRAM. */
     static uint8_t page_buf[F103_FLASH_PAGE_SIZE];
     uint32_t copied = 0u;
+    uint32_t page = 0u;
     while (copied < size) {
         const uint32_t remain = size - copied;
         const uint32_t chunk = remain < F103_FLASH_PAGE_SIZE ? remain : F103_FLASH_PAGE_SIZE;
         const uint32_t dst = F103_APP_BASE_ADDR + copied;
         const uint8_t *src = (const uint8_t *)(F103_STAGE_BASE_ADDR + F103_VESC_IMAGE_HEADER_SIZE + copied);
+        boot_diag_copy_page = page;
+        boot_diag_copy_addr = dst;
+        boot_diag_copy_code = 100u + page;
         memcpy(page_buf, src, chunk);
-        if (!erase_one_page(dst)) return false;
-        if (!program_halfwords(dst, page_buf, chunk)) return false;
+        if (!erase_one_page(dst)) { boot_diag_copy_code = 1000u + page; return false; }
+        if (!program_halfwords(dst, page_buf, chunk)) { boot_diag_copy_code = 2000u + page; return false; }
         copied += chunk;
+        ++page;
     }
-    if (crc16((const uint8_t *)F103_APP_BASE_ADDR, size) != wanted) return false;
-    if (!app_vector_valid()) return false;
-    return erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE);
+    boot_diag_copy_crc_app = crc16((const uint8_t *)F103_APP_BASE_ADDR, size);
+    if (boot_diag_copy_crc_app != wanted) { boot_diag_copy_code = 3000u; return false; }
+    if (!app_vector_valid()) { boot_diag_copy_code = 4000u; return false; }
+    if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) { boot_diag_copy_code = 5000u; return false; }
+    boot_diag_copy_code = 6000u;
+    return true;
 }
 
 __attribute__((naked, noreturn)) static void branch_to_app(uint32_t sp, uint32_t rv) {
@@ -419,11 +409,10 @@ static bool recovery_command(uint16_t len) {
         if (n >= 4u) {
             const uint32_t size = be32(d);
             if (size > 0u && size <= F103_MAX_FW_IMAGE_SIZE &&
-                erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) {
+                erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE) &&
+                erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)) {
                 stage_session_active = true;
                 stage_session_total = size + F103_VESC_IMAGE_HEADER_SIZE;
-                stage_erased_lo = 0u;
-                stage_erased_hi = 0u;
                 r[1] = 1u;
             }
         }
@@ -442,7 +431,7 @@ static bool recovery_command(uint16_t len) {
                  * to reprogram an already-programmed halfword. */
                 if (memcmp((const void *)dst, d + 4u, dl) == 0) {
                     r[1] = 1u;
-                } else if (ensure_stage_pages_erased(off, dl)) {
+                } else {
                     r[1] = program_halfwords(dst, d + 4u, dl) ? 1u : 0u;
                 }
             }

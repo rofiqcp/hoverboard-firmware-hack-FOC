@@ -44,8 +44,10 @@ assert 'void SysTick_Handler(void)' in boot and 'HAL_IncTick();' in boot
 assert 'SystemCoreClockUpdate();' in boot and boot.index('SystemCoreClockUpdate();') < boot.index('HAL_Init();')
 assert 'boot_clock_init()' in boot and 'RCC_PLL_MUL16' in boot and 'RCC_HCLK_DIV2' in boot
 assert boot.index('boot_clock_init()') < boot.index('uart_init();')
-assert 'ensure_stage_pages_erased' in boot and 'erase_one_page(dst)' in boot
-assert 'erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)' not in boot
+assert 'erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)' in boot
+assert 'ensure_stage_pages_erased' not in boot
+assert 'erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)' in upd
+assert 'ensure_stage_pages_erased' not in upd
 assert 'erase_pages(F103_APP_BASE_ADDR, F103_APP_REGION_SIZE)' not in boot
 print('BOOTLOADER_LAYOUT_STATIC_PASS app=120K stage=120K boot=10K meta=2K eeprom=4K powerloss_retry=1')
 

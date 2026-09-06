@@ -37,6 +37,15 @@ volatile int32_t positionCommandR = 0;
 
 volatile uint32_t foc_isr_cycles = 0;
 volatile uint8_t encoder_detect_stage = 0u;
+/* Startup-align black box. Kept separate from full encoder detect so HOME
+ * failures after reboot can be diagnosed without repeating hard-stop calibration. */
+volatile uint8_t encoder_align_stage = 0u;
+volatile uint32_t encoder_align_before_count = 0u;
+volatile uint32_t encoder_align_jog_count = 0u;
+volatile uint32_t encoder_align_back_count = 0u;
+volatile int32_t encoder_align_jog_delta = 0;
+volatile int32_t encoder_align_back_delta = 0;
+volatile uint16_t encoder_align_current_ma = 0u;
 volatile int32_t encoder_detect_plus_mdeg = 0;
 volatile int32_t encoder_detect_minus_mdeg = 0;
 volatile uint32_t encoder_detect_plus_count = 0u;
@@ -1124,8 +1133,20 @@ void mcpwm_foc_set_pid_speed(float erpm, bool second) {
     if (erpm > m->m_conf.l_max_erpm) erpm=m->m_conf.l_max_erpm;
     if (erpm < m->m_conf.l_min_erpm) erpm=m->m_conf.l_min_erpm;
     const int16_t mech_rpm = erpm_to_mech_rpm(erpm, second);
+    const int32_t old_target_q16 = m->m_speed_target_rpm_q16;
+    const int32_t new_target_q16 = erpm_to_mech_rpm_q16(erpm, second);
+    const bool new_start = old_target_q16 == 0 && new_target_q16 != 0;
+    const bool direction_change = (old_target_q16 < 0 && new_target_q16 > 0) ||
+                                  (old_target_q16 > 0 && new_target_q16 < 0);
+    if (new_start || direction_change) {
+        m->m_speed_breakaway_ticks = 0u;
+        m->m_speed_breakaway_done = 0u;
+    } else if (new_target_q16 == 0) {
+        m->m_speed_breakaway_ticks = 0u;
+        m->m_speed_breakaway_done = 0u;
+    }
     m->m_speed_target_rpm = mech_rpm;
-    m->m_speed_target_rpm_q16 = erpm_to_mech_rpm_q16(erpm, second);
+    m->m_speed_target_rpm_q16 = new_target_q16;
     if (m->m_speed_target_rpm_q16 != 0 || m->m_control_mode == CONTROL_MODE_SPEED) {
         speed_mode_enter(m);
     } else {
@@ -1170,8 +1191,13 @@ void mcpwm_foc_set_position_counts(int32_t pc,bool second){
     if(pc<m->m_position_min_counts)pc=m->m_position_min_counts;
     if(pc>m->m_position_max_counts)pc=m->m_position_max_counts;
     const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode!=0u);
+    const bool target_changed=(pc!=m->m_position_target_counts);
     set_control_mode(m,CONTROL_MODE_POS);
     if(branch_change) reset_position_pid(m);
+    if(target_changed && !branch_change){
+        m->m_position_breakaway_ticks=0u; m->m_position_no_motion_ticks=0u;
+        m->m_position_last_motion_count=m->m_position_counts;
+    }
     m->m_pos_pid_phase_mode=0u;
     m->m_position_target_counts=pc;
 }
@@ -1322,88 +1348,148 @@ void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     m->m_phase_openloop=(uint16_t)(phase*(65536.0f/360.0f)); m->m_phase_override=1;
 }
 bool mcpwm_foc_encoder_startup_align(bool second) {
-    if(second) return false;
+    encoder_align_stage=1u;
+    encoder_align_before_count=encoder_align_jog_count=encoder_align_back_count=0u;
+    encoder_align_jog_delta=encoder_align_back_delta=0; encoder_align_current_ma=0u;
+    if(second){encoder_align_stage=0xE1u;return false;}
     mcpwm_foc_motor_t *m=&m_motor_1;
-    if(!encoder_port_active(m,false)) return true;
+    if(!encoder_port_active(m,false)){encoder_align_stage=9u;return true;}
     if(!m->m_encoder_configured) encoder_runtime_configure(m,false,true);
-    if(!m->m_encoder_configured) return false;
+    if(!m->m_encoder_configured){encoder_align_stage=0xE2u;return false;}
+    encoder_align_stage=2u;
 
-    /* Incremental A/B has no absolute rotor zero after reset. Align electrical
-     * phase 0 with low Id, then choose the ABI counter value that satisfies the
-     * persisted VESC equation: phase=(inverted?360-raw:raw)*ratio-offset. */
+    /* Incremental ABI has no absolute index. Lock the rotor to a known
+     * electrical phase with D-axis current, but do not assume a fixed current
+     * can overcome steering tyre/linkage stiction. Increase Id gradually and
+     * probe only +/-60 electrical degrees. The first level that produces a
+     * plausible ABI delta becomes the alignment current for this boot. */
     for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t) foc_bounded_delay_ms(1u);
-    if(!mcpwm_foc_dc_cal_done()) return false;
+    if(!mcpwm_foc_dc_cal_done()){encoder_align_stage=0xE3u;return false;}
+    encoder_align_stage=3u;
 
+    float ceiling=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
+    if(ceiling>MCCONF_STEERING_CAL_CURRENT_MAX_A)ceiling=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+    if(ceiling>m->m_conf.l_current_max)ceiling=m->m_conf.l_current_max;
+    if(ceiling<0.10f)ceiling=0.10f;
     float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
-    if(current>m->m_conf.l_current_max)current=m->m_conf.l_current_max;
     if(current<0.10f)current=0.10f;
-    for(uint32_t t=1u;t<=MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;++t){
-        const float i=current*(float)t/(float)MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;
-        mcpwm_foc_set_openloop_phase(i,0.0f,false);
-        mcpwm_foc_vesc_override_touch(false);
-        foc_bounded_delay_ms(1u);
-        if(m->m_fault!=FAULT_CODE_NONE) goto align_fail;
-    }
-    for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS;++t){
-        mcpwm_foc_set_openloop_phase(current,0.0f,false);
-        mcpwm_foc_vesc_override_touch(false);
-        foc_bounded_delay_ms(1u);
-        if(m->m_fault!=FAULT_CODE_NONE) goto align_fail;
-    }
-
-    float ratio=m->m_conf.foc_encoder_ratio;
-    if(!(ratio>=0.01f))ratio=(float)motor_pole_pairs(false);
-    float raw=m->m_conf.foc_encoder_offset/ratio;
-    raw=encoder_norm_deg(raw);
-    if(m->m_conf.foc_encoder_inverted && raw>0.0f) raw=360.0f-raw;
-    encoder_runtime_set_deg(m,raw);
-
-    /* A/B tanpa index tidak dapat membedakan counter software yang baru ditulis
-     * dari encoder fisik yang kabelnya putus. Verifikasi dengan jog kecil: +30
-     * electrical degree harus menghasilkan gerakan count mechanical dengan arah
-     * yang sesuai inversion, lalu kembali mendekati zero. Closed-loop tidak
-     * pernah di-arm bila verifikasi ini gagal. */
-    const uint32_t counts=m->m_encoder_counts;
-    const uint32_t before=encoder_read_raw_count();
-    for(uint32_t t=1u;t<=100u;++t){
-        mcpwm_foc_set_openloop_phase(current,30.0f*(float)t/100.0f,false);
-        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
-        if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-    }
-    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-    const uint32_t jog=encoder_read_raw_count();
-    int32_t dj=(int32_t)jog-(int32_t)before;
+    float previous=0.0f;
+    const float ratio=(float)MCCONF_POLE_PAIRS_LEFT;
+    const uint32_t counts=m->m_encoder_counts>=4u?m->m_encoder_counts:MCCONF_ENCODER_COUNTS_DEFAULT;
     const int32_t half=(int32_t)(counts/2u);
-    if(dj>half)dj-=(int32_t)counts; else if(dj<-half)dj+=(int32_t)counts;
-    const float expected_f=(float)counts*30.0f/(360.0f*ratio);
-    int32_t min_move=(int32_t)(expected_f*0.20f); if(min_move<2)min_move=2;
+    const float expected_f=(float)counts*60.0f/(360.0f*ratio);
+    /* A tiny ABI twitch is not enough to establish electrical zero under steering
+     * load. Hardware measurements gave ~18 counts at 1.5 A (borderline/no useful
+     * torque afterwards) and ~38 counts at 2.5 A. Require >=40% of the ideal
+     * +30 electrical-degree excursion before accepting phase lock. */
+    int32_t min_move=(int32_t)(expected_f*0.40f); if(min_move<4)min_move=4;
     int32_t max_move=(int32_t)(expected_f*3.0f)+4;
-    const int32_t abs_dj=dj<0?-dj:dj;
-    const int32_t expected_sign=m->m_conf.foc_encoder_inverted?-1:1;
-    if(abs_dj<min_move || abs_dj>max_move ||
-       (dj>0?1:-1)!=expected_sign)goto align_fail;
-    for(int32_t t=99;t>=0;--t){
-        mcpwm_foc_set_openloop_phase(current,30.0f*(float)t/100.0f,false);
-        mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(1u);
-        if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-    }
-    for(uint32_t t=0u;t<50u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-    const uint32_t back=encoder_read_raw_count();
-    int32_t db=(int32_t)back-(int32_t)before;
-    if(db>half)db-=(int32_t)counts; else if(db<-half)db+=(int32_t)counts;
-    if((db<0?-db:db)>max_move)goto align_fail;
+    bool aligned=false;
+    bool detected_inverted=false;
 
-    /* Re-establish exact software zero after the physical plausibility jog. */
-    encoder_runtime_set_deg(m,raw);
-    m->m_position_counts=0; m->m_position_abs_counts=0u;
+    m->m_encoder_synced=0u;
+    mcpwm_foc_release_motor(false);
+    while(current<=ceiling+0.001f){
+        encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
+        encoder_align_stage=4u;
+        /* Hold phase zero while ramping Id from the previous level. */
+        for(uint32_t t=1u;t<=MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;++t){
+            const float f=(float)t/(float)MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;
+            const float i=previous+(current-previous)*f;
+            mcpwm_foc_set_openloop_phase(i,0.0f,false);
+            mcpwm_foc_vesc_override_touch(false);
+            foc_bounded_delay_ms(1u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS;++t){
+            mcpwm_foc_set_openloop_phase(current,0.0f,false);
+            mcpwm_foc_vesc_override_touch(false);
+            foc_bounded_delay_ms(1u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+
+        /* Phase zero is now the physical electrical reference. Rebase the
+         * incremental counter and test +60 degrees first. */
+        encoder_runtime_set_deg(m,0.0f);
+        const uint32_t before=encoder_read_raw_count();
+        encoder_align_before_count=before;
+        for(uint32_t t=1u;t<=60u;++t){
+            mcpwm_foc_set_openloop_phase(current,60.0f*(float)t/60.0f,false);
+            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
+        uint32_t probe=encoder_read_raw_count();
+        encoder_align_jog_count=probe;
+        int32_t dp=(int32_t)probe-(int32_t)before;
+        if(dp>half)dp-=(int32_t)counts; else if(dp<-half)dp+=(int32_t)counts;
+        encoder_align_jog_delta=dp;
+        for(int32_t t=59;t>=0;--t){
+            mcpwm_foc_set_openloop_phase(current,60.0f*(float)t/60.0f,false);
+            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
+        int32_t adp=dp<0?-dp:dp;
+        if(adp>=min_move && adp<=max_move){
+            detected_inverted=dp<0;
+            aligned=true; encoder_align_stage=5u;
+            break;
+        }
+
+        /* A mechanical stop can block the + direction. Retry the same bounded
+         * probe in the negative direction before increasing current. */
+        encoder_runtime_set_deg(m,0.0f);
+        const uint32_t before_neg=encoder_read_raw_count();
+        for(uint32_t t=1u;t<=60u;++t){
+            mcpwm_foc_set_openloop_phase(current,-60.0f*(float)t/60.0f,false);
+            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
+        probe=encoder_read_raw_count();
+        encoder_align_back_count=probe;
+        int32_t dm=(int32_t)probe-(int32_t)before_neg;
+        if(dm>half)dm-=(int32_t)counts; else if(dm<-half)dm+=(int32_t)counts;
+        encoder_align_back_delta=dm;
+        for(int32_t t=59;t>=0;--t){
+            mcpwm_foc_set_openloop_phase(current,-60.0f*(float)t/60.0f,false);
+            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
+        const int32_t adm=dm<0?-dm:dm;
+        if(adm>=min_move && adm<=max_move){
+            /* Negative electrical phase producing positive count means the ABI
+             * direction must be inverted for the VESC phase equation. */
+            detected_inverted=dm>0;
+            aligned=true; encoder_align_stage=6u;
+            break;
+        }
+
+        previous=current;
+        current+=MCCONF_ENCODER_STARTUP_ALIGN_STEP_A;
+    }
+    if(!aligned){encoder_align_stage=0xA1u;goto align_fail;}
+
+    /* The motor pole count is known and ABI offset is meaningless across power
+     * cycles. Learn only direction from the bounded phase probe, then define
+     * electrical phase 0 as ABI software zero for this boot. */
+    m->m_conf.foc_encoder_offset=0.0f;
+    m->m_conf.foc_encoder_ratio=ratio;
+    m->m_conf.foc_encoder_inverted=detected_inverted;
     encoder_runtime_configure(m,false,false);
+    encoder_runtime_set_deg(m,0.0f);
+    m->m_position_counts=0; m->m_position_abs_counts=0u;
     encoder_feedback_update(m,false);
     m->m_encoder_synced=1u;
+    encoder_align_stage=9u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
     return true;
 
 align_fail:
+    if(encoder_align_stage<0x80u)encoder_align_stage=(uint8_t)(0xB0u | (encoder_align_stage&0x0Fu));
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
@@ -1457,7 +1543,7 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     if(!encoder_port_active(m,false) || !m->m_encoder_configured){encoder_stage_set(0xE2u);return false;}
     encoder_stage_set(2u);
     if(current<0.20f)current=0.20f;
-    if(current>1.0f)current=1.0f;
+    if(current>MCCONF_STEERING_CAL_CURRENT_MAX_A)current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
     if(current>m->m_conf.l_current_max)current=m->m_conf.l_current_max;
     for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)foc_bounded_delay_ms(1u);
     if(!mcpwm_foc_dc_cal_done()){encoder_stage_set(0xE3u);return false;}
@@ -1506,8 +1592,12 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
         encoder_detect_plus_count=encoder_read_raw_count();
         encoder_detect_plus_id_q4=m->m_id_q4; encoder_detect_plus_iq_q4=m->m_iq_q4;
         if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=4u; goto detect_fail;}
-        foc_bounded_delay_ms(150u);
-        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=5u; goto detect_fail;}
+        foc_bounded_delay_ms(200u);
+        /* Steering gearbox backlash and tyre load can prevent an exact return
+         * to the first incremental count even though electrical phase 0 is
+         * actively held. ABI has no absolute index, so rebase the software
+         * counter at this known electrical reference before the opposite probe. */
+        encoder_runtime_set_deg(m,0.0f);
 
         if(!encoder_detect_move(m,current,&phase_cont,-60.0f)){fail_code=6u; goto detect_fail;}
         foc_bounded_delay_ms(150u);
@@ -1517,27 +1607,35 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
         encoder_detect_minus_count=encoder_read_raw_count();
         encoder_detect_minus_id_q4=m->m_id_q4; encoder_detect_minus_iq_q4=m->m_iq_q4;
         if(!encoder_detect_move(m,current,&phase_cont,0.0f)){fail_code=7u; goto detect_fail;}
-        foc_bounded_delay_ms(150u);
-        if(fabsf(encoder_detect_angle_diff(encoder_read_deg(),0.0f))>6.0f){fail_code=8u; goto detect_fail;}
+        foc_bounded_delay_ms(200u);
+        encoder_runtime_set_deg(m,0.0f);
     }
 
     encoder_stage_set(5u);
     const float plus=plus_sum/(float)samples;
     const float minus=minus_sum/(float)samples;
-    /* The two probes must move in opposite directions with similar magnitude. */
-    if(fabsf(plus)<0.5f || fabsf(minus)<0.5f || plus*minus>=0.0f){fail_code=9u; goto detect_fail;}
-    const float mag=0.5f*(fabsf(plus)+fabsf(minus));
-    if(fabsf(fabsf(plus)-fabsf(minus))>mag*0.35f){fail_code=10u; goto detect_fail;}
-    float rat=roundf(60.0f/mag);
-    if(!(rat>=1.0f && rat<=100.0f)){fail_code=11u; goto detect_fail;}
-    /* Positive electrical command causing negative ABI motion means inversion. */
-    const bool inv=plus<0.0f;
-
-    /* Cross-check the detected pole-pair ratio against the configured motor
-     * poles. This catches phase/open-wire slip before closed-loop torque is
-     * armed, while still allowing a fresh config to correct a stale value. */
+    /* A steering axis is not a free rotor: one probe can be shortened by a
+     * hard-stop, tyre scrub or gearbox backlash. The motor pole count is known
+     * independently, so use it as the VESC encoder ratio and use the probe only
+     * to prove A/B motion and determine inversion. At least one direction must
+     * move by >=25% of the ideal 60-electrical-degree mechanical excursion. */
     const float configured=(float)MCCONF_POLE_PAIRS_LEFT;
-    if(configured>=1.0f && fabsf(rat-configured)>2.0f){fail_code=12u; goto detect_fail;}
+    if(configured<1.0f || configured>100.0f){fail_code=11u; goto detect_fail;}
+    const float ideal=60.0f/configured;
+    const float min_motion=ideal*0.25f;
+    const float max_motion=ideal*2.0f;
+    const float ap=fabsf(plus), am=fabsf(minus);
+    const bool plus_ok=ap>=min_motion && ap<=max_motion;
+    const bool minus_ok=am>=min_motion && am<=max_motion;
+    if(!plus_ok && !minus_ok){fail_code=9u; goto detect_fail;}
+    bool inv=false;
+    if(plus_ok) inv=plus<0.0f;
+    if(minus_ok){
+        const bool inv_minus=minus>0.0f; /* negative electrical target */
+        if(plus_ok && inv_minus!=inv){fail_code=10u; goto detect_fail;}
+        inv=inv_minus;
+    }
+    const float rat=configured;
 
     encoder_runtime_set_deg(m,0.0f);
     if(offset)*offset=0.0f;
@@ -2400,17 +2498,33 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     const bool encoder_count_mode=encoder_port_active(m,second) && m->m_encoder_configured &&
                                   m->m_encoder_counts>=4u;
     if(encoder_count_mode){
-        /* Satu custom count ABI adalah satu quadrature count, bukan satu Hall
-         * edge. 4096 count = tepat 360 mechanical degree. */
-        error_mdeg=(int32_t)(((int64_t)count_error*360000LL)/(int64_t)m->m_encoder_counts);
-        error_mdeg*=position_error_sign(m,second);
+        if(!second && m->m_steering_calibrated && m->m_steering_span_counts!=0){
+            /* Steering user coordinates are calibrated independently from the
+             * motor-shaft ABI CPR. The measured hard-stop span represents the
+             * complete -30..+30 degree wheel envelope, so using 4096 CPR here
+             * can understate steering error by the gearbox/linkage ratio and
+             * leave the position loop below static breakaway torque. The signed
+             * span already maps count direction to LEFT/RIGHT user direction. */
+            error_mdeg=(int32_t)(((int64_t)count_error*60000LL)/
+                                 (int64_t)m->m_steering_span_counts);
+        }else{
+            /* Generic ABI position: one custom count is one quadrature count. */
+            error_mdeg=(int32_t)(((int64_t)count_error*360000LL)/(int64_t)m->m_encoder_counts);
+            error_mdeg*=position_error_sign(m,second);
+        }
     }else{
         const int32_t mdeg_per_count=360000/(6*pp);
         error_mdeg=count_error*mdeg_per_count;
     }
     m->m_position_prev_error=(int16_t)count_error;
     const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
-    const uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
+    const bool steering_count_mode=encoder_count_mode && !second && m->m_steering_calibrated;
+    uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
+    if(steering_count_mode){
+        uint32_t boosted=kp_eff*(uint32_t)MCCONF_STEERING_POSITION_KP_MULTIPLIER;
+        if(boosted>65535u)boosted=65535u;
+        kp_eff=boosted;
+    }
     const uint32_t ki_eff=((uint32_t)m->m_kip_q16*gain_scale+16384u)>>15;
     const uint32_t kd_eff=((uint32_t)m->m_kdp_q11*gain_scale+16384u)>>15;
 
@@ -2478,13 +2592,46 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
      * limit and clipping afterwards. Post-clipping turns small position errors
      * into bang-bang current; pre-scaling preserves proportional authority near
      * the target while still providing enough breakaway torque at large error. */
-    int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+    const int32_t pos_current_ma=steering_count_mode ?
+        (int32_t)MCCONF_STEERING_POSITION_CURRENT_MAX_MA : (int32_t)MCCONF_POSITION_CURRENT_MAX_MA;
+    int32_t pos_lim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*pos_current_ma)/1000;
     if(pos_lim_q4>limit_q4)pos_lim_q4=limit_q4;
     int32_t iq_cmd_q4=(int32_t)(((int64_t)out_q15*pos_lim_q4)/32768LL);
 
     if(encoder_count_mode){
-        /* Resolusi ABI sudah cukup tinggi; jangan jalankan kick/brake khusus
-         * satu sektor Hall karena itu akan merusak closed-loop encoder. */
+        if(steering_count_mode){
+            /* Static steering friction is higher than the small-error PID torque.
+             * Apply at most one bounded assist pulse per stationary target. A
+             * verified encoder count toward target re-arms the assist, allowing
+             * progress through several sticky points without continuous 2-A
+             * pressure at a hard stop. */
+            const int32_t delta=m->m_position_counts-m->m_position_last_motion_count;
+            const bool toward=(count_error>0 && delta>0) || (count_error<0 && delta<0);
+            if(toward){
+                m->m_position_last_motion_count=m->m_position_counts;
+                m->m_position_no_motion_ticks=0u;
+                m->m_position_breakaway_ticks=0u;
+            }else if(m->m_position_no_motion_ticks<65535u){
+                m->m_position_no_motion_ticks++;
+            }
+            const int32_t ae=error_mdeg<0?-error_mdeg:error_mdeg;
+            if(count_error==0 || ae<(int32_t)MCCONF_STEERING_BREAKAWAY_ERROR_MDEG){
+                m->m_position_breakaway_ticks=0u;
+                m->m_position_no_motion_ticks=0u;
+            }else{
+                const uint32_t kick_max=((uint32_t)MCCONF_STEERING_BREAKAWAY_MAX_MS*(uint32_t)PWM_FREQ)/
+                                        (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+                const uint32_t kick_delay=((uint32_t)MCCONF_STEERING_BREAKAWAY_DELAY_MS*(uint32_t)PWM_FREQ)/
+                                          (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+                if(m->m_position_no_motion_ticks>=kick_delay && m->m_position_breakaway_ticks<kick_max){
+                    int32_t assist_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_STEERING_BREAKAWAY_CURRENT_MA)/1000;
+                    if(assist_q4>limit_q4)assist_q4=limit_q4;
+                    const int32_t ai=iq_cmd_q4<0?-iq_cmd_q4:iq_cmd_q4;
+                    if(ai<assist_q4)iq_cmd_q4=(error_mdeg>=0)?assist_q4:-assist_q4;
+                    m->m_position_breakaway_ticks++;
+                }
+            }
+        }
         return (int16_t)iq_cmd_q4;
     }
 
@@ -2622,7 +2769,32 @@ static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m,bool second){
     if(target64>INT32_MAX)target64=INT32_MAX;
     if(target64<INT32_MIN)target64=INT32_MIN;
     const int32_t full_limit=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
-    return speed_pid_iq_target_erpm_step(m,second,(int32_t)target64,full_limit);
+    int32_t out_q4=speed_pid_iq_target_erpm_step(m,second,(int32_t)target64,full_limit);
+
+    /* Hall traction motors need finite breakaway torque from some rotor sectors.
+     * Do not solve this by an aggressive speed integrator: one bounded startup
+     * kick is deterministic and cannot keep heating a mechanically blocked motor. */
+    const int32_t target_erpm=(int32_t)(target64/65536LL);
+    const int32_t measured_erpm=(int32_t)m->m_rpm*pp;
+    const int32_t at=target_erpm<0?-target_erpm:target_erpm;
+    const int32_t am=measured_erpm<0?-measured_erpm:measured_erpm;
+    const uint32_t kick_max_ticks=((uint32_t)MCCONF_SPEED_BREAKAWAY_MAX_MS*(uint32_t)PWM_FREQ)/
+                                  (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
+    if(at < (int32_t)MCCONF_SPEED_RELEASE_ERPM){
+        m->m_speed_breakaway_ticks=0u;
+    }else if(!m->m_speed_breakaway_done){
+        if(am >= (int32_t)MCCONF_SPEED_BREAKAWAY_EXIT_ERPM ||
+           m->m_speed_breakaway_ticks >= kick_max_ticks){
+            m->m_speed_breakaway_done=1u;
+        }else{
+            int32_t min_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_SPEED_BREAKAWAY_CURRENT_MA)/1000;
+            if(min_q4>full_limit)min_q4=full_limit;
+            const int32_t ao=out_q4<0?-out_q4:out_q4;
+            if(ao<min_q4)out_q4=target_erpm>=0?min_q4:-min_q4;
+            if(m->m_speed_breakaway_ticks<UINT16_MAX)m->m_speed_breakaway_ticks++;
+        }
+    }
+    return (int16_t)CLAMP(out_q4,-full_limit,full_limit);
 }
 
 static int16_t duty_control_iq_target_step(mcpwm_foc_motor_t *m) {

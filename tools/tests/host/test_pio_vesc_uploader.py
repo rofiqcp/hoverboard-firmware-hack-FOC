@@ -34,7 +34,7 @@ def recv_frame(c,buf):
     raise TimeoutError
 
 fw=bytes((i*37+11)&255 for i in range(2049))
-state={'stage':bytearray(), 'boot':False, 'updated':False, 'writes':0, 'error':None}
+state={'stage':bytearray(), 'boot':False, 'updated':False, 'app_probes':0, 'writes':0, 'error':None}
 with tempfile.TemporaryDirectory() as td:
     f=Path(td)/'fw.bin'; f.write_bytes(fw)
     srv=socket.socket(); srv.bind(('127.0.0.1',0)); srv.listen(1); port=srv.getsockname()[1]
@@ -48,7 +48,9 @@ with tempfile.TemporaryDirectory() as td:
                     elif state['boot']: name=b'f103rc_bootloader\0'
                     else: name=b'motor_left\0'
                     c.sendall(frame(bytes((0,6,0))+name))
-                    if state['updated']: break
+                    if state['updated']:
+                        state['app_probes'] += 1
+                        if state['app_probes'] >= 2: break
                 elif cmd==1:
                     if not state['boot']:
                         # Application -> resident bootloader via SRAM request/reset.
@@ -73,5 +75,6 @@ with tempfile.TemporaryDirectory() as td:
     if r.returncode: print(r.stdout+r.stderr); raise SystemExit(r.returncode)
     assert state['error'] is None,state['error']; assert state['updated']; assert state['writes']>=6
     assert 'bootloader ready: f103rc_bootloader' in r.stdout
-    assert 'application returned: motor_left_updated' in r.stdout
+    assert state['app_probes'] >= 2
+    assert 'application returned stable: motor_left_updated' in r.stdout
 print(f'PIO_VESC_UPLOADER_MOCK_PASS bytes={len(fw)} writes={state["writes"]} crc=0x{crc16(fw):04x}')

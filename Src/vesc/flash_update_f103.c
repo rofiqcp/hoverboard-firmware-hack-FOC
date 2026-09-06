@@ -5,10 +5,8 @@
 #include "stm32f1xx_hal.h"
 #include <string.h>
 
-#define F103_STAGE_PAGE_COUNT (F103_STAGE_REGION_SIZE / F103_FLASH_PAGE_SIZE)
 static bool stage_session_active = false;
 static uint32_t stage_session_total = 0u;
-static uint8_t stage_page_erased[F103_STAGE_PAGE_COUNT];
 
 static void release_both(void) {
     mcpwm_foc_release_motor(false);
@@ -29,24 +27,6 @@ static bool erase_pages(uint32_t base, uint32_t bytes) {
     const HAL_StatusTypeDef st = HAL_FLASHEx_Erase(&e, &page_error);
     HAL_FLASH_Lock();
     return st == HAL_OK && page_error == 0xFFFFFFFFu;
-}
-
-static bool erase_one_page(uint32_t address) {
-    return erase_pages(address, F103_FLASH_PAGE_SIZE);
-}
-
-static bool ensure_stage_pages_erased(uint32_t offset, uint32_t len) {
-    if (len == 0u || offset > F103_STAGE_REGION_SIZE || len > F103_STAGE_REGION_SIZE - offset) return false;
-    const uint32_t first = offset / F103_FLASH_PAGE_SIZE;
-    const uint32_t last = (offset + len - 1u) / F103_FLASH_PAGE_SIZE;
-    if (last >= F103_STAGE_PAGE_COUNT) return false;
-    for (uint32_t page = first; page <= last; ++page) {
-        if (stage_page_erased[page] == 0u) {
-            if (!erase_one_page(F103_STAGE_BASE_ADDR + page * F103_FLASH_PAGE_SIZE)) return false;
-            stage_page_erased[page] = 1u;
-        }
-    }
-    return true;
 }
 
 static bool program_halfwords(uint32_t base, const uint8_t *data, uint32_t len) {
@@ -75,12 +55,15 @@ static bool program_halfwords(uint32_t base, const uint8_t *data, uint32_t len) 
 bool f103_fw_erase_staging(uint32_t fw_size) {
     if (fw_size == 0u || fw_size > F103_MAX_FW_IMAGE_SIZE) return false;
     release_both();
-    memset(stage_page_erased, 0, sizeof(stage_page_erased));
-    stage_session_active = true;
+    stage_session_active = false;
     stage_session_total = fw_size + F103_VESC_IMAGE_HEADER_SIZE;
-    /* Do not block for a 120-KiB mass erase while USART is live. Metadata is
-     * cleared immediately; staging pages are erased lazily before first write. */
-    return erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE);
+    /* Deterministic full staging erase. This removes all per-page RAM state:
+     * each chunk can only program/verify an already-erased page, and duplicate
+     * retries are accepted by program_halfwords without another erase. */
+    if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) return false;
+    if (!erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)) return false;
+    stage_session_active = true;
+    return true;
 }
 
 bool f103_fw_write_staging(uint32_t offset, const uint8_t *data, uint32_t len) {
@@ -91,7 +74,6 @@ bool f103_fw_write_staging(uint32_t offset, const uint8_t *data, uint32_t len) {
     /* ACK loss is recoverable: duplicate chunks are accepted without touching
      * flash again. */
     if (memcmp((const void *)dst, data, len) == 0) return true;
-    if (!ensure_stage_pages_erased(offset, len)) return false;
     return program_halfwords(dst, data, len);
 }
 
