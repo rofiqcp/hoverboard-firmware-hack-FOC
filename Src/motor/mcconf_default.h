@@ -51,7 +51,7 @@
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   1500u /* measured LEFT Iq breakaway ~1 A; steering-only ceiling */
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   3000u /* tuned steering position ceiling; 20% of 15-A motor limit */
 #define MCCONF_STEERING_POSITION_KP_MULTIPLIER        6u /* 0.025 VESC base -> 0.15 effective on calibrated steering */
 #define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       2000u /* bounded one-shot assist; commissioning-safe ceiling */
 #define MCCONF_STEERING_BREAKAWAY_MAX_MS             300u

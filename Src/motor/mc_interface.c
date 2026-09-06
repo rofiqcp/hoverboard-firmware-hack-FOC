@@ -486,17 +486,19 @@ bool mc_interface_set_steering_deg(float deg){return mcpwm_foc_set_steering_deg(
 
 bool mc_interface_steering_boot_home(void){
     if(!mcpwm_foc_steering_is_calibrated())return false;
-    /* Power-cycle policy: the operator places the wheel at center before power.
-     * Only synchronize electrical phase/ABI using adaptive Id. startup_align()
-     * preserves the relative displacement caused by that phase lock and sets
-     * the original boot point to span/2 == logical 180 degrees. No hard-stop
-     * sweep is allowed during ordinary boot. */
+    const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(false);
+    const bool encoder_selected=m && m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
+        (m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER ||
+         m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
+    /* Saved steering calibration contains only the measured hard-stop span.
+     * The operator always powers up with the wheel physically centered. Hall
+     * selection requires no encoder synchronization. Incremental ABI selection
+     * synchronizes electrical phase first, then the boot point is assigned
+     * directly to span/2 (VESC logical 180 deg). No boot hard-stop search and no
+     * position-control move are performed. */
+    if(!encoder_selected)return true;
     if(!mcpwm_foc_encoder_startup_align(false))return false;
-    const int32_t center=mcpwm_foc_steering_span_counts()/2;
-    if(!mcpwm_foc_set_steering_deg(0.0f))return false;
-    const bool ok=steering_wait_target(center,6000u);
-    mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
-    return ok;
+    return mcpwm_foc_steering_rebase_center();
 }
 
 bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,

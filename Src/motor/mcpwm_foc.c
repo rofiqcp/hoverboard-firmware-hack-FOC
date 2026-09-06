@@ -1245,6 +1245,22 @@ bool mcpwm_foc_steering_rebase_left(void){
     return true;
 }
 
+bool mcpwm_foc_steering_rebase_center(void){
+    mcpwm_foc_motor_t *m=&m_motor_1;
+    if(!m->m_steering_calibrated || m->m_steering_span_counts==0 || !m->m_encoder_synced)
+        return false;
+    /* Only the calibrated span is persisted. The operator places the steering
+     * physically at center before each power-on, so after ABI/electrical phase
+     * synchronization this boot position is the absolute logical center. */
+    const int32_t center=m->m_steering_span_counts/2;
+    m->m_position_counts=center;
+    m->m_position_abs_counts=0u;
+    m->m_position_target_counts=center;
+    reset_position_pid(m);
+    m->m_steering_homed=1u;
+    return true;
+}
+
 bool mcpwm_foc_steering_is_calibrated(void){return m_motor_1.m_steering_calibrated!=0u;}
 bool mcpwm_foc_steering_is_homed(void){return m_motor_1.m_steering_calibrated&&m_motor_1.m_steering_homed;}
 int32_t mcpwm_foc_steering_span_counts(void){return m_motor_1.m_steering_span_counts;}
@@ -1523,6 +1539,12 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
                                         -boot_center_to_phase0_counts:boot_center_to_phase0_counts);
     encoder_feedback_update(m,false);
     m->m_encoder_synced=1u;
+    /* A persisted hard-stop span plus the explicit boot-at-center policy gives
+     * us an absolute logical reference for this power cycle. Mark homed only
+     * after phase/ABI synchronization is valid; without this, SET_POS remains
+     * correctly fail-closed forever after every reboot. */
+    if(m->m_steering_calibrated && m->m_steering_span_counts!=0)
+        m->m_steering_homed=1u;
     encoder_align_stage=9u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
@@ -2680,6 +2702,13 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
                 }
             }
         }
+        /* Count-domain steering bypasses mc_interface_set_pid_pos(), so apply
+         * the same standard VESC m_invert_direction transform here that
+         * COMM_SET_CURRENT/SET_RPM receive in mc_interface. Without this the
+         * calibrated count target is correct but torque runs away from it when
+         * LEFT direction inversion is enabled in MC configuration. */
+        if(steering_count_mode && m->m_conf.m_invert_direction)
+            iq_cmd_q4=-iq_cmd_q4;
         return (int16_t)iq_cmd_q4;
     }
 
