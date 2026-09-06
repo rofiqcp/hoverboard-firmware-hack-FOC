@@ -5,8 +5,8 @@ TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 """Hardware check for VESC COMM_SET_DETECT -> 100 Hz COMM_ROTOR_POSITION."""
-import argparse, statistics, struct, time, serial
-from vesc_dual import frame, PacketDecoder
+import argparse, statistics, struct, time
+from vesc_dual import frame, PacketDecoder, open_transport
 from test_vesc_tool_rt50 import parse_values
 COMM_SET_DETECT=11; COMM_ROTOR_POSITION=22; COMM_GET_VALUES=4; COMM_FORWARD_CAN=34
 MODE_OBSERVER=2; MODE_PID_POS=4
@@ -14,8 +14,8 @@ MODE_OBSERVER=2; MODE_PID_POS=4
 def wrapped_diff(a,b): return ((a-b+180.0)%360.0)-180.0
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--seconds',type=float,default=1.2)
-    a=ap.parse_args(); s=serial.Serial(a.port,1000000,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
+    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=1.2)
+    a=ap.parse_args(); s=open_transport(a.port,1000000,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
     def send(p): s.write(frame(bytes(p))); s.flush()
     ok=True
     try:

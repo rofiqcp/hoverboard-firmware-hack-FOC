@@ -17,7 +17,7 @@ def patch(raw,kp,ki,kd,ramp,min_erpm=75):
 
 def main():
     ap=argparse.ArgumentParser(description='Guarded speed-ramp hardware sweep.')
-    ap.add_argument('--port',default='/dev/ttyUSB0')
+    ap.add_argument('--port',default='auto')
     ap.add_argument('--arm',action='store_true',help='required to actuate the motor')
     a=ap.parse_args()
     if not a.arm: ap.error('motor actuation requires --arm')

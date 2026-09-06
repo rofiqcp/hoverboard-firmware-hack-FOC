@@ -77,7 +77,7 @@ def one_motor(link: VescDual, right: bool) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
+    ap.add_argument("port", nargs="?", default="auto")
     ap.add_argument("--reboot-check", action="store_true")
     args = ap.parse_args()
     link = VescDual(args.port, timeout=0.8)

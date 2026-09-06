@@ -73,7 +73,7 @@ def run_case(link,right,motor,kp,ki,kd,target,run_s,stop_s,hz,max_erpm,max_curre
     return m
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--target',type=float,default=300); ap.add_argument('--run-s',type=float,default=1.2); ap.add_argument('--stop-s',type=float,default=.8); ap.add_argument('--hz',type=float,default=18); ap.add_argument('--max-erpm',type=float,default=900); ap.add_argument('--max-current',type=float,default=1.2); ap.add_argument('--out',default='tools/results/speed_pid'); ap.add_argument('--quick',action='store_true'); ap.add_argument('--gains',default='',help='semicolon-separated kp,ki,kd triples'); ap.add_argument('--targets',default='',help='comma-separated positive ERPM magnitudes'); ap.add_argument('--repeats',type=int,default=1); a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--target',type=float,default=300); ap.add_argument('--run-s',type=float,default=1.2); ap.add_argument('--stop-s',type=float,default=.8); ap.add_argument('--hz',type=float,default=18); ap.add_argument('--max-erpm',type=float,default=900); ap.add_argument('--max-current',type=float,default=1.2); ap.add_argument('--out',default='tools/results/speed_pid'); ap.add_argument('--quick',action='store_true'); ap.add_argument('--gains',default='',help='semicolon-separated kp,ki,kd triples'); ap.add_argument('--targets',default='',help='comma-separated positive ERPM magnitudes'); ap.add_argument('--repeats',type=int,default=1); a=ap.parse_args()
     base=[(.002,.002,0),(.004,.004,0),(.006,.008,0),(.008,.015,0),(.010,.025,0)]
     if a.gains:
         base=[]

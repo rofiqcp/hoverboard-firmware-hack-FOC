@@ -150,7 +150,7 @@ def write_run(outdir,name,rows,summary):
 def main():
     ap=argparse.ArgumentParser(description='VESC dual FOC response measurement and PID tuning lab')
     ap.add_argument('mode',choices=['idle','step','sweep','max-erpm','show','apply'])
-    ap.add_argument('--port',default='/dev/ttyUSB0'); ap.add_argument('--motor',choices=['left','right'],default='left')
+    ap.add_argument('--port',default='auto'); ap.add_argument('--motor',choices=['left','right'],default='left')
     ap.add_argument('--loop',choices=['speed','currentq','currentd','position'],default='speed')
     ap.add_argument('--target',type=float,default=300); ap.add_argument('--duration',type=float,default=1.5); ap.add_argument('--hz',type=float,default=40)
     ap.add_argument('--max-erpm',type=float,default=3000); ap.add_argument('--max-current',type=float,default=1.25); ap.add_argument('--max-duty',type=float,default=.90)

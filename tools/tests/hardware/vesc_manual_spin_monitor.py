@@ -16,7 +16,7 @@ def sample(link, right):
 
 def main():
     ap=argparse.ArgumentParser(description='Passive/manual-spin VESC telemetry monitor')
-    ap.add_argument('--port',default='/dev/ttyUSB0')
+    ap.add_argument('--port',default='auto')
     ap.add_argument('--motor',choices=['left','right','both'],default='both')
     ap.add_argument('--seconds',type=float,default=10.0)
     ap.add_argument('--hz',type=float,default=20.0)

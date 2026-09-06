@@ -52,7 +52,7 @@ def run(port='/dev/ttyUSB0'):
 
 def main():
     ap = argparse.ArgumentParser(description='Low-duty guarded hardware smoke test.')
-    ap.add_argument('--port', default='/dev/ttyUSB0')
+    ap.add_argument('--port', default='auto')
     ap.add_argument('--arm', action='store_true', help='required to send motor duty commands')
     a = ap.parse_args()
     if not a.arm:

@@ -10,6 +10,8 @@ polls selective mc_values telemetry from both motors.
 """
 from __future__ import annotations
 import argparse
+import os
+import socket
 import struct
 import threading
 import time
@@ -68,6 +70,211 @@ STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
 # Keep normal request/reply deadlines short; only commands that explicitly store
 # configuration get this bounded hardware-aware deadline.
 PERSISTENT_WRITE_TIMEOUT = 8.0
+
+
+def _discover_f411_cdc() -> str:
+    """Return the BlackPill F411 USB CDC path, never an unrelated ttyUSB sensor."""
+    configured = os.environ.get("VESC_F411_USB", "").strip()
+    if configured:
+        return configured
+    by_id = "/dev/serial/by-id"
+    try:
+        for name in sorted(os.listdir(by_id)):
+            upper = name.upper()
+            if "STMICROELECTRONICS" in upper and "F411" in upper and "CDC" in upper:
+                return os.path.realpath(os.path.join(by_id, name))
+    except OSError:
+        pass
+    return "/dev/ttyACM0"
+
+
+class TcpSerialTransport:
+    """Small pyserial-compatible adapter for the ROS maintenance TCP bridge."""
+    def __init__(self, endpoint: str, timeout: float = 0.01):
+        target = endpoint.strip()
+        if target in {"maintenance", "ros", "python-maintenance"}:
+            target = os.environ.get("VESC_PYTHON_MAINTENANCE", "tcp://127.0.0.1:65101")
+        if not target.startswith("tcp://"):
+            raise ValueError(f"invalid TCP endpoint: {endpoint}")
+        host_port = target[6:]
+        host, sep, port_text = host_port.rpartition(":")
+        if not sep or not host or not port_text.isdigit():
+            raise ValueError(f"TCP endpoint must be tcp://HOST:PORT: {endpoint}")
+        self.sock = socket.create_connection((host, int(port_text)), timeout=2.0)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.timeout = max(0.0, float(timeout))
+        self.sock.settimeout(self.timeout)
+        self.endpoint = f"tcp://{host}:{int(port_text)}"
+
+    @property
+    def in_waiting(self) -> int:
+        try:
+            data = self.sock.recv(65535, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            return len(data)
+        except (BlockingIOError, InterruptedError, socket.timeout):
+            return 0
+
+    def write(self, data: bytes) -> int:
+        self.sock.sendall(data)
+        return len(data)
+
+    def read(self, size: int = 1) -> bytes:
+        try:
+            return self.sock.recv(max(1, int(size)))
+        except socket.timeout:
+            return b""
+
+    def flush(self) -> None:
+        return
+
+    def reset_input_buffer(self) -> None:
+        old = self.sock.gettimeout()
+        try:
+            self.sock.setblocking(False)
+            while True:
+                try:
+                    if not self.sock.recv(4096):
+                        break
+                except BlockingIOError:
+                    break
+        finally:
+            self.sock.settimeout(old)
+
+    def reset_output_buffer(self) -> None:
+        return
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class F411DirectTransport:
+    """VESC byte stream tunneled directly over the BlackPill F411 USB CDC gateway."""
+    def __init__(self, path: str | None = None, timeout: float = 0.01):
+        if serial is None:
+            raise RuntimeError("pyserial required for direct F411 USB mode")
+        self.path = path or _discover_f411_cdc()
+        self.timeout = max(0.0, float(timeout))
+        self.ser = serial.Serial(
+            self.path, 115200, timeout=0.01, write_timeout=2.0, exclusive=True)
+        self.linebuf = bytearray()
+        self.rawbuf = bytearray()
+        self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
+        self.ser.write(b"\n"); self.ser.flush(); time.sleep(0.03); self.ser.reset_input_buffer()
+        self._command("VESC:MODE:MAINTENANCE", "VESC:MODE:MAINTENANCE", 3.0)
+        self._command("VESC:STATUS", "mode=MAINTENANCE", 2.0)
+        time.sleep(0.30)
+
+    def _consume_line(self, line: str) -> None:
+        if line.startswith("VESC:ERR:"):
+            raise RuntimeError(line)
+        if line.startswith("VESC:RX:"):
+            hx = line[8:].strip()
+            if hx:
+                try:
+                    self.rawbuf.extend(bytes.fromhex(hx))
+                except ValueError as exc:
+                    raise RuntimeError(f"bad F411 VESC hex: {hx[:80]}") from exc
+
+    def _pump(self, deadline: float) -> None:
+        while time.monotonic() < deadline:
+            waiting = self.ser.in_waiting
+            chunk = self.ser.read(waiting or 1)
+            if not chunk:
+                return
+            self.linebuf.extend(chunk)
+            while b"\n" in self.linebuf:
+                raw, _, rest = self.linebuf.partition(b"\n")
+                self.linebuf[:] = rest
+                line = raw.decode(errors="replace").strip()
+                if line:
+                    self._consume_line(line)
+            if self.rawbuf:
+                return
+
+    def _command(self, text: str, expect: str, timeout: float) -> str:
+        self.ser.write((text + "\n").encode()); self.ser.flush()
+        deadline = time.monotonic() + timeout
+        collected = bytearray()
+        while time.monotonic() < deadline:
+            chunk = self.ser.read(self.ser.in_waiting or 1)
+            if not chunk:
+                continue
+            collected.extend(chunk)
+            while b"\n" in collected:
+                raw, _, rest = collected.partition(b"\n")
+                collected[:] = rest
+                line = raw.decode(errors="replace").strip()
+                if line.startswith("VESC:ERR:"):
+                    raise RuntimeError(line)
+                if expect in line:
+                    return line
+        raise TimeoutError(f"F411 command timeout: {text}")
+
+    @property
+    def in_waiting(self) -> int:
+        self._pump(time.monotonic() + 0.001)
+        return len(self.rawbuf)
+
+    def write(self, data: bytes) -> int:
+        for off in range(0, len(data), 48):
+            chunk = data[off:off + 48]
+            line = b"VESC:TX:M:" + chunk.hex().upper().encode() + b"\n"
+            self.ser.write(line); self.ser.flush(); time.sleep(0.002)
+        return len(data)
+
+    def read(self, size: int = 1) -> bytes:
+        if not self.rawbuf:
+            self._pump(time.monotonic() + self.timeout)
+        n = min(max(1, int(size)), len(self.rawbuf))
+        out = bytes(self.rawbuf[:n]); del self.rawbuf[:n]
+        return out
+
+    def flush(self) -> None:
+        self.ser.flush()
+
+    def reset_input_buffer(self) -> None:
+        self.linebuf.clear(); self.rawbuf.clear(); self.ser.reset_input_buffer()
+
+    def reset_output_buffer(self) -> None:
+        self.ser.reset_output_buffer()
+
+    def close(self) -> None:
+        try:
+            self._command("VESC:MODE:RUNTIME", "VESC:MODE:RUNTIME", 1.5)
+        except Exception:
+            pass
+        self.ser.close()
+
+
+def open_transport(port: str, baud: int = 1000000, timeout: float = 0.01):
+    """Open one of the supported VESC links.
+
+    - ``auto``: Python-maintenance TCP first, then direct F411 USB CDC.
+    - ``maintenance`` / ``tcp://...``: ROS maintenance bridge.
+    - ``direct`` / ``usb`` / ``f411``: exclusive F411 CDC gateway access.
+    - explicit ``/dev/...``: raw VESC UART for legacy USB-UART commissioning.
+    """
+    target = (port or "auto").strip()
+    if target == "auto":
+        endpoint = os.environ.get("VESC_PYTHON_MAINTENANCE", "tcp://127.0.0.1:65101")
+        try:
+            return TcpSerialTransport(endpoint, timeout=timeout)
+        except OSError:
+            return F411DirectTransport(_discover_f411_cdc(), timeout=timeout)
+    if target in {"maintenance", "ros", "python-maintenance"} or target.startswith("tcp://"):
+        return TcpSerialTransport(target, timeout=timeout)
+    if target in {"direct", "usb", "f411", "direct-usb"}:
+        return F411DirectTransport(_discover_f411_cdc(), timeout=timeout)
+    if target.startswith("f411:") or target.startswith("direct:"):
+        _, path = target.split(":", 1)
+        return F411DirectTransport(path or _discover_f411_cdc(), timeout=timeout)
+    if serial is None:
+        raise RuntimeError("pyserial required for direct serial: python -m pip install pyserial")
+    return serial.Serial(target, baud, timeout=timeout)
 
 HB_MAGIC = b"HB"
 HB_VERSION = 1
@@ -484,9 +691,7 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 class VescDual:
     def __init__(self, port: str, baud: int = 1000000, timeout: float = 0.15):
-        if serial is None:
-            raise RuntimeError("pyserial required: python -m pip install pyserial")
-        self.ser = serial.Serial(port, baud, timeout=0.01)
+        self.ser = open_transport(port, baud, timeout=0.01)
         # A software reboot can leave an incomplete pre-reset VESC frame in the
         # USB-UART driver's RX queue. Start each new host session at a packet
         # boundary; otherwise the fresh PacketDecoder can prepend stale bytes to
@@ -1005,7 +1210,8 @@ def parse_fw(p: bytes) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("port", nargs="?", default="/dev/ttyUSB0")
+    ap.add_argument("port", nargs="?", default="auto",
+                    help="auto | maintenance | direct | direct:/dev/ttyACM0 | raw /dev/ttyUSBx")
     ap.add_argument("--baud", type=int, default=1000000)
     ap.add_argument("--command-hz", type=float, default=50.0)
     ap.add_argument("--telemetry-hz", type=float, default=50.0,

@@ -26,7 +26,7 @@ def stop_all(link):
 
 def main():
     ap=argparse.ArgumentParser()
-    ap.add_argument('port',nargs='?',default='/dev/ttyUSB0')
+    ap.add_argument('port',nargs='?',default='auto')
     ap.add_argument('--motor',choices=['left','right','both'],default='both')
     ap.add_argument('--hold',type=float,default=0.8)
     ap.add_argument('--hz',type=float,default=20.0)

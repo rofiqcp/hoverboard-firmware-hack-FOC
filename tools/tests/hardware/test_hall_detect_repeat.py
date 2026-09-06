@@ -54,7 +54,7 @@ def test_motor(link: VescDual, name: str, right: bool,
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Repeatable VESC Hall detect + EEPROM verification")
-    p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
+    p.add_argument("port", nargs="?", default="auto")
     p.add_argument("--motor", choices=("left", "right", "both"), default="both")
     p.add_argument("--amps", type=float, default=1.0)
     p.add_argument("--repeats", type=int, default=3)

@@ -687,7 +687,7 @@ def cmd_all(args, link: VescDual) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="VESC 6.00 dual STM32F103 hardware/protocol debugger")
-    p.add_argument("port", nargs="?", default="/dev/ttyUSB0")
+    p.add_argument("port", nargs="?", default="auto")
     p.add_argument("command", nargs="?", default="info",
                    choices=("selftest","info","diag","rt","hall","hall-phase","wiring-check","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
     p.add_argument("--baud", type=int, default=1000000)

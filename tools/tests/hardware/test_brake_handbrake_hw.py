@@ -16,7 +16,7 @@ def sample(l,r,phase,t0,row):
  v=l.values(r); row.update(phase=phase,t=time.monotonic()-t0,erpm=v.rpm,iq=v.iq,imotor=v.current_motor,duty=v.duty,fault=v.fault);return v
 def main():
  ap=argparse.ArgumentParser(description='Guarded brake and handbrake hardware test.')
- ap.add_argument('--port',default='/dev/ttyUSB0')
+ ap.add_argument('--port',default='auto')
  ap.add_argument('--arm',action='store_true',help='required to actuate the motor')
  a=ap.parse_args()
  if not a.arm: ap.error('motor actuation requires --arm')

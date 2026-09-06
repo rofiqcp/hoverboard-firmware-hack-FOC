@@ -10,7 +10,7 @@ from vesc_debug import send_one,release_one
 
 def main():
  p=argparse.ArgumentParser(description='Staged VESC duty test with fault/Hall safety logging')
- p.add_argument('port',nargs='?',default='/dev/ttyUSB0'); p.add_argument('--motor',choices=['left','right'],default='left')
+ p.add_argument('port',nargs='?',default='auto'); p.add_argument('--motor',choices=['left','right'],default='left')
  p.add_argument('--stages',default='0.20,0.40,0.60,0.80,0.90,0.95'); p.add_argument('--stage-s',type=float,default=0.8)
  p.add_argument('--max-erpm',type=float,default=6000.0); p.add_argument('--max-current',type=float,default=3.0)
  p.add_argument('--hz',type=float,default=50.0); p.add_argument('--arm',action='store_true'); p.add_argument('--csv',default='')

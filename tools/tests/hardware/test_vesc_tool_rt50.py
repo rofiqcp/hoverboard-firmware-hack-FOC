@@ -7,8 +7,7 @@ if str(TOOLS_DIR) not in sys.path:
 """Hardware RT-data audit matching VESC Tool COMM_GET_VALUES parser semantics."""
 import argparse, math, statistics, struct, sys, time
 from dataclasses import dataclass
-import serial
-from vesc_dual import frame, PacketDecoder, parse_fw, parse_diag, HB_MAGIC, HB_VERSION, HB_GET_DIAG
+from vesc_dual import frame, PacketDecoder, parse_fw, parse_diag, open_transport, HB_MAGIC, HB_VERSION, HB_GET_DIAG
 
 COMM_FW_VERSION=0
 COMM_GET_VALUES=4
@@ -73,7 +72,7 @@ def parse_values(payload:bytes, selective=True)->RtValues:
 
 class Link:
     def __init__(self,port,baud=1000000,timeout=.06):
-        self.ser=serial.Serial(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
+        self.ser=open_transport(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
         self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
     def close(self): self.ser.close()
     @staticmethod
@@ -152,7 +151,7 @@ def poll_one(link,right,count,hz):
     return (replies[-1] if replies else None),lat,fail,d0,d1,finished-started,send_rate,reply_rate,len(replies)
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='/dev/ttyUSB0'); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
+    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
     a=ap.parse_args(); count=max(1,round(a.hz*a.seconds)); link=Link(a.port)
     try:
         print('FW:',link.fw(False),'|',link.fw(True))
