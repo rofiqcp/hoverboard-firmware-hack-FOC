@@ -129,7 +129,7 @@ static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
  * Production steering commands still fail closed until encoder sync/homing. */
 static uint8_t s_openloop_test_active = 0u;
 static uint8_t s_openloop_test_second = 0u;
-static uint32_t s_openloop_test_deadline_ms = 0u;
+static uint32_t s_openloop_test_deadline = 0u;
 #define HB_OPENLOOP_TEST_MAX_MA       2000
 #define HB_OPENLOOP_TEST_MAX_MERPM   20000 /* 20.000 electrical RPM */
 #define HB_OPENLOOP_TEST_MAX_MS       1000u
@@ -211,6 +211,7 @@ typedef struct {
 static detect_all_job_t s_detect_all;
 static int16_t s_detect_all_last_detail = 0;
 static uint32_t detect_time_now(void);
+static bool detect_time_due(uint32_t now, uint32_t deadline);
 static void hall_detect_periodic(uint32_t now_ms);
 static void detect_all_periodic(uint32_t now_ms);
 static void reply_mcconf(bool second, COMM_PACKET_ID id);
@@ -539,7 +540,7 @@ void vesc_protocol_periodic(uint32_t now_ms) {
     detect_all_periodic(detector_now);
     if (s_openloop_test_active) {
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(s_openloop_test_second != 0u);
-        const bool expired = (int32_t)(now_ms - s_openloop_test_deadline_ms) >= 0;
+        const bool expired = detect_time_due(detector_now, s_openloop_test_deadline);
         if (expired || !m || m->m_fault != FAULT_CODE_NONE) {
             mc_interface_select_motor_thread(s_openloop_test_second ? 2 : 1);
             mc_interface_release_motor();
@@ -1910,9 +1911,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
                 const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
                 if (!m || m->m_fault != FAULT_CODE_NONE) status = 3u;
                 else {
-                    mcpwm_foc_set_openloop_current((float)ma / 1000.0f, (float)merpm / 1000.0f, second);
+                    float applied_erpm=(float)merpm / 1000.0f;
+                    if(m->m_conf.m_invert_direction)applied_erpm=-applied_erpm;
+                    mcpwm_foc_set_openloop_current((float)ma / 1000.0f, applied_erpm, second);
                     s_openloop_test_second = second ? 1u : 0u;
-                    s_openloop_test_deadline_ms = HAL_GetTick() + (uint32_t)duration_ms;
+                    s_openloop_test_deadline = detect_time_after_ms(detect_time_now(), (uint32_t)duration_ms);
                     s_openloop_test_active = 1u;
                 }
                 mc_interface_select_motor_thread(1);
