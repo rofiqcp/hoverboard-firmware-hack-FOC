@@ -42,6 +42,8 @@
 #define HB_CUSTOM_SET_ID_TEST            8u
 #define HB_CUSTOM_SET_STEERING_DEG        9u /* ROS/Web signed mechanical millidegree */
 #define HB_CUSTOM_GET_STEERING_CAL       10u
+#define HB_CUSTOM_SET_OPENLOOP_TEST       11u /* bounded commissioning, either motor */
+#define HB_CUSTOM_HALL_PIN_TEST            12u /* passive RIGHT Hall electrical test */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -120,6 +122,18 @@ static uint32_t s_prof_values_serialize_max_cycles = 0u;
 static uint32_t s_prof_values_tx_max_cycles = 0u;
 #endif
 static volatile uint8_t s_last_hall_store_ok[2] = {0u, 0u};
+
+/* Bounded commissioning-only open-loop spin. This is deliberately separate
+ * from normal VESC position/current control: it may run while the incremental
+ * steering encoder is unsynchronised, but it can never stay armed indefinitely.
+ * Production steering commands still fail closed until encoder sync/homing. */
+static uint8_t s_openloop_test_active = 0u;
+static uint8_t s_openloop_test_second = 0u;
+static uint32_t s_openloop_test_deadline_ms = 0u;
+#define HB_OPENLOOP_TEST_MAX_MA       2000
+#define HB_OPENLOOP_TEST_MAX_MERPM   20000 /* 20.000 electrical RPM */
+#define HB_OPENLOOP_TEST_MAX_MS       1000u
+#define HB_OPENLOOP_TEST_MIN_MS         50u
 
 /* Stock VESC handles COMM_DETECT_HALL_FOC as a blocking command in a dedicated
  * worker thread. This F103 target is bare-metal, so reproduce the same external
@@ -523,6 +537,16 @@ void vesc_protocol_periodic(uint32_t now_ms) {
     const uint32_t detector_now = detect_time_now();
     hall_detect_periodic(detector_now);
     detect_all_periodic(detector_now);
+    if (s_openloop_test_active) {
+        const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(s_openloop_test_second != 0u);
+        const bool expired = (int32_t)(now_ms - s_openloop_test_deadline_ms) >= 0;
+        if (expired || !m || m->m_fault != FAULT_CODE_NONE) {
+            mc_interface_select_motor_thread(s_openloop_test_second ? 2 : 1);
+            mc_interface_release_motor();
+            mc_interface_select_motor_thread(1);
+            s_openloop_test_active = 0u;
+        }
+    }
     const disp_pos_mode mode = s_display_pos_mode;
     if (mode == DISP_POS_MODE_NONE) return;
     if ((uint32_t)(now_ms - s_display_prev_ms) < 10u) return;
@@ -1855,6 +1879,85 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         else mcpwm_foc_set_openloop_phase((float)(ma<0?-ma:ma)/1000.0f,(float)mdeg/1000.0f,second);
         { uint8_t a[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u}; uart_send_payload(a,6u); }
         return;
+    }
+    if (op == HB_CUSTOM_SET_OPENLOOP_TEST) {
+        uint8_t status = 0u;
+        int32_t ma = 0, merpm = 0;
+        uint16_t duration_ms = 0u;
+        if (n < 10u) status = 1u;
+        if (status == 0u) {
+            ma = buffer_get_int32(d,&k);
+            merpm = buffer_get_int32(d,&k);
+            duration_ms = buffer_get_uint16(d,&k);
+            if (ma < 0) ma = -ma;
+            if (ma > HB_OPENLOOP_TEST_MAX_MA || merpm > HB_OPENLOOP_TEST_MAX_MERPM ||
+                merpm < -HB_OPENLOOP_TEST_MAX_MERPM || duration_ms > HB_OPENLOOP_TEST_MAX_MS ||
+                (ma != 0 && duration_ms < HB_OPENLOOP_TEST_MIN_MS)) status = 2u;
+        }
+        if (status == 0u) {
+            if (s_openloop_test_active) {
+                mc_interface_select_motor_thread(s_openloop_test_second ? 2 : 1);
+                mc_interface_release_motor();
+                s_openloop_test_active = 0u;
+            }
+            mc_interface_select_motor_thread(second ? 2 : 1);
+            touch_motor(second);
+            if (ma == 0 || merpm == 0 || duration_ms == 0u) {
+                mc_interface_release_motor();
+                mc_interface_select_motor_thread(1);
+                s_openloop_test_active = 0u;
+            } else {
+                const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
+                if (!m || m->m_fault != FAULT_CODE_NONE) status = 3u;
+                else {
+                    mcpwm_foc_set_openloop_current((float)ma / 1000.0f, (float)merpm / 1000.0f, second);
+                    s_openloop_test_second = second ? 1u : 0u;
+                    s_openloop_test_deadline_ms = HAL_GetTick() + (uint32_t)duration_ms;
+                    s_openloop_test_active = 1u;
+                }
+                mc_interface_select_motor_thread(1);
+            }
+        }
+        if (status != 0u) {
+            mc_interface_select_motor_thread(second ? 2 : 1);
+            mc_interface_release_motor();
+            mc_interface_select_motor_thread(1);
+            s_openloop_test_active = 0u;
+        }
+        uint8_t a[18]; int32_t j=0;
+        a[j++]=COMM_CUSTOM_APP_DATA; a[j++]=HB_CUSTOM_MAGIC0; a[j++]=HB_CUSTOM_MAGIC1; a[j++]=HB_CUSTOM_VERSION; a[j++]=op; a[j++]=status;
+        buffer_append_int32(a,ma,&j); buffer_append_int32(a,merpm,&j); buffer_append_uint16(a,duration_ms,&j);
+        uart_send_payload(a,(uint16_t)j);
+        return;
+    }
+    if (op == HB_CUSTOM_HALL_PIN_TEST) {
+        uint8_t status=0u, raw0=0u, raw_dn=0u, raw_up=0u;
+        if(!second) status=1u;
+        const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(true);
+        if(status==0u && (!m || m->m_state!=MC_STATE_OFF))status=2u;
+        if(status==0u){
+#ifdef STM32F103xE
+            volatile uint32_t *const crh=(volatile uint32_t *)0x40011004u;
+            volatile uint32_t *const idr=(volatile uint32_t *)0x40011008u;
+            volatile uint32_t *const odr=(volatile uint32_t *)0x4001100Cu;
+            const uint32_t saved_crh=*crh, saved_odr=*odr;
+            raw0=(uint8_t)((*idr>>10)&7u);
+            *crh=(saved_crh & ~0x000FFF00u) | 0x00088800u; /* PC10..12 input pull */
+            *odr=saved_odr & ~(7u<<10);                   /* internal pull-down */
+            for(volatile uint32_t z=0;z<10000u;++z){}
+            raw_dn=(uint8_t)((*idr>>10)&7u);
+            *odr=saved_odr | (7u<<10);                    /* internal pull-up */
+            for(volatile uint32_t z=0;z<10000u;++z){}
+            raw_up=(uint8_t)((*idr>>10)&7u);
+            *crh=saved_crh; *odr=saved_odr;
+#else
+            status=3u;
+#endif
+        }
+        uint8_t a[10]; int32_t j=0;
+        a[j++]=COMM_CUSTOM_APP_DATA; a[j++]=HB_CUSTOM_MAGIC0; a[j++]=HB_CUSTOM_MAGIC1; a[j++]=HB_CUSTOM_VERSION; a[j++]=op; a[j++]=status;
+        a[j++]=raw0; a[j++]=raw_dn; a[j++]=raw_up;
+        uart_send_payload(a,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_GET_DIAG) {
         /* Payload diagnostic bertambah lintas revisi. Sisakan headroom besar dan
