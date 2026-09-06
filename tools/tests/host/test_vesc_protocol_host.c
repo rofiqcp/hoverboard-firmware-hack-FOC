@@ -672,9 +672,9 @@ int main(void){
         if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
         if(confs[0].m_sensor_port_mode!=SENSOR_PORT_MODE_ABI ||
            confs[0].foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
-           fabsf(confs[0].foc_encoder_offset-12.0f)>0.01f ||
-           fabsf(confs[0].foc_encoder_ratio-15.0f)>0.01f ||
-           confs[0].foc_encoder_inverted || confs[0].si_motor_poles!=30u)
+           fabsf(confs[0].foc_encoder_offset-0.0f)>0.01f ||
+           fabsf(confs[0].foc_encoder_ratio-4.0f)>0.01f ||
+           confs[0].foc_encoder_inverted || confs[0].si_motor_poles!=8u)
             return fail("detect all left encoder apply");
         {
             int valid=0;

@@ -1309,46 +1309,33 @@ static void detect_all_prepare_hall(uint8_t mi) {
 }
 
 static bool detect_all_prepare_encoder_left(void) {
+    /* Detect-All uses the same complete LEFT commissioning path as the VESC
+     * Tool Detect Encoder button: ABI phase/inversion detect, adaptive current,
+     * both mechanical hard stops, logical 0..360 mapping, center return and
+     * persistence. Automatic detection starts at 3 A and can rise only as far
+     * as the configured/board 15-A motor-current ceiling. */
+    float off=1001.0f, ratio=0.0f; bool inv=false;
+    int32_t raw_neg=0,raw_pos=0,span=0;
+    if(!mc_interface_steering_detect_calibrate(MCCONF_STEERING_DETECT_CURRENT_START_A,
+                                                &off,&ratio,&inv,
+                                                &raw_neg,&raw_pos,&span))return false;
+    (void)raw_neg; (void)raw_pos; (void)span;
+
     mc_configuration *c=&s_detect_all.result[0];
-    *c=s_detect_all.backup[0];
+    *c=*mc_interface_get_configuration_motor(false);
     detect_all_apply_common_limits(c);
     c->motor_type=MOTOR_TYPE_FOC;
     c->sensor_mode=SENSOR_MODE_SENSORED;
     c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
     c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
-    /* Vehicle hardware is fixed: LEFT uses a 1024-PPR quadrature encoder.
-     * VESC m_encoder_counts is CPR after x4 decoding, therefore it must be
-     * 4096. Do not inherit a stale GUI value (e.g. 1024/65536) into the
-     * detector because encoder_read_deg() would then under/over-scale the
-     * mechanical probe and falsely report encoder/flux detection failure. */
     c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
     c->si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
-    c->foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
-    c->foc_encoder_offset=0.0f;
-
-    mc_interface_select_motor_thread(1);
-    mc_interface_set_configuration(c);
-    float off=1001.0f, ratio=0.0f; bool inv=false;
-    /* 1 A was insufficient on the real steering linkage and reproducibly
-     * returned detect detail 9 even though both ABI channels were toggling.
-     * Use the bounded steering commissioning ceiling (2 A on this vehicle),
-     * still clamped by the configured motor current limit. */
-    float detect_current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
-    if(c->l_current_max>0.20f && detect_current>c->l_current_max)detect_current=c->l_current_max;
-    if(!mcpwm_foc_encoder_detect(detect_current,false,&off,&ratio,&inv))return false;
-    const int poles=(int)lroundf(ratio*2.0f);
-    if(!(off>=0.0f && off<360.0f) || !(ratio>=1.0f && ratio<=100.0f) ||
-       poles<2 || poles>200 || (poles&1))return false;
-
     c->foc_encoder_offset=off;
     c->foc_encoder_ratio=ratio;
     c->foc_encoder_inverted=inv;
-    c->si_motor_poles=(uint8_t)poles;
     s_detect_all.encoder_offset=off;
     s_detect_all.encoder_ratio=ratio;
     s_detect_all.encoder_inverted=inv?1u:0u;
-    mc_interface_set_configuration(c);
-    if(!mcpwm_foc_encoder_startup_align(false))return false;
     return true;
 }
 
@@ -1399,12 +1386,18 @@ static void detect_all_start_rl(uint8_t mi, uint32_t now_time) {
     detect_all_apply_runtime(mi);
     const bool second=mi!=0u;
     const float max_i=s_detect_all.result[mi].l_current_max>0.5f ? s_detect_all.result[mi].l_current_max : (float)I_MOT_MAX;
-    float lo=0.60f, hi=2.00f;
-    if(hi>max_i*0.50f)hi=max_i*0.50f;
-    if(hi>(float)I_MOT_MAX*0.25f)hi=(float)I_MOT_MAX*0.25f;
-    if(hi<0.80f)hi=0.80f;
-    if(lo>hi*0.50f)lo=hi*0.50f;
-    if(lo<0.30f)lo=0.30f;
+    /* R/L identification also starts at a useful 3-A Id level on this
+     * low-side-shunt board. The old 0.6-A point was below reliable driven
+     * current observability and produced lowI=0 even though the detector later
+     * surfaced the generic flux-linkage error in VESC Tool. */
+    float lo=MCCONF_STEERING_DETECT_CURRENT_START_A;
+    float hi=lo+2.0f;
+    if(lo>max_i*0.60f)lo=max_i*0.60f;
+    if(hi>max_i*0.85f)hi=max_i*0.85f;
+    if(hi>(float)I_MOT_MAX)hi=(float)I_MOT_MAX;
+    if(lo<0.50f)lo=0.50f;
+    if(hi<lo+0.50f)hi=lo+0.50f;
+    if(hi>max_i)hi=max_i;
     s_detect_all.current_low=lo; s_detect_all.current_high=hi;
     mcpwm_foc_set_openloop_phase(lo,0.0f,second);
     mcpwm_foc_vesc_override_touch(second);
@@ -1734,10 +1727,14 @@ static void detect_all_periodic(uint32_t now_time) {
             s_detect_all.high_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.high_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
             if(!detect_all_compute_rl(mi)){s_detect_all_last_detail=4;detect_all_finish(-10);return;}
-            s_detect_all.flux_current=0.70f;
-            if(s_detect_all.flux_current>s_detect_all.imax[mi]*0.25f)
-                s_detect_all.flux_current=s_detect_all.imax[mi]*0.25f;
-            if(s_detect_all.flux_current<0.30f)s_detect_all.flux_current=0.30f;
+            s_detect_all.flux_current=MCCONF_STEERING_DETECT_CURRENT_START_A;
+            {
+                float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
+                if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
+                if(fmax>(float)I_MOT_MAX)fmax=(float)I_MOT_MAX;
+                if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
+            }
+            if(s_detect_all.flux_current<0.50f)s_detect_all.flux_current=0.50f;
             s_detect_all.flux_target_erpm=600.0f;
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
@@ -1752,6 +1749,20 @@ static void detect_all_periodic(uint32_t now_time) {
         mcpwm_foc_set_openloop_current(s_detect_all.flux_current,erpm,second);
         mcpwm_foc_vesc_override_touch(second);
         if(elapsed>=1200u){
+            const float actual_erpm=fabsf(mcpwm_foc_get_erpm_motor(second));
+            float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
+            if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
+            if(fmax>(float)I_MOT_MAX)fmax=(float)I_MOT_MAX;
+            /* If the rotor still has not broken away, increase torque current in
+             * 1-A steps and retry the speed ramp. Stop increasing immediately
+             * once motion is established. */
+            if(actual_erpm<s_detect_all.flux_target_erpm*0.20f &&
+               s_detect_all.flux_current<fmax-0.01f){
+                s_detect_all.flux_current+=MCCONF_STEERING_DETECT_CURRENT_STEP_A;
+                if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
+                s_detect_all.stage_start_time=now_time;
+                break;
+            }
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_SAMPLE;
             s_detect_all.stage_start_time=now_time;

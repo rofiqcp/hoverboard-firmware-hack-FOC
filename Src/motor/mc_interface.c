@@ -353,38 +353,94 @@ static void steering_bounded_delay_ms(uint32_t ms) {
     }
 }
 
-static bool steering_seek_stop_user(float current_a, int8_t user_dir, int32_t *stop_counts) {
+static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int32_t *stop_counts) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
     if(!m || !mcpwm_foc_encoder_is_synced(false) || user_dir==0)return false;
-    if(current_a<0.30f)current_a=0.30f;
-    if(current_a>MCCONF_STEERING_CAL_CURRENT_MAX_A)current_a=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+
+    float max_current=m->m_conf.l_current_max*m->m_conf.l_current_max_scale;
+    if(!(max_current>0.0f))max_current=m->m_conf.l_current_max;
+    if(max_current>MCCONF_STEERING_CAL_CURRENT_MAX_A)max_current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+    if(max_current>(float)I_MOT_MAX)max_current=(float)I_MOT_MAX;
+    if(max_current<0.30f)return false;
+
+    float current=start_current_a;
+    if(current<0.30f)current=0.30f;
+    if(current>max_current)current=max_current;
+    const float step=MCCONF_STEERING_DETECT_CURRENT_STEP_A;
+
     uint32_t age=0u;
+    uint32_t level_age=0u;
     uint32_t last_move_age=0u;
     int32_t last=m->m_position_counts;
-    bool any_motion=false;
+    bool direction_has_moved=false;
+
     while(age<MCCONF_STEERING_SEEK_TIMEOUT_MS){
-        float ramp=(float)age/300.0f; if(ramp>1.0f)ramp=1.0f;
         mc_interface_select_motor_thread(1);
-        mc_interface_set_current((float)user_dir*current_a*ramp);
+        mc_interface_set_current((float)user_dir*current); /* Iq torque after Id/phase sync */
         mcpwm_foc_vesc_override_touch(false);
         steering_bounded_delay_ms(5u);
-        age += 5u;
+        age+=5u; level_age+=5u;
         if(m->m_fault!=FAULT_CODE_NONE)break;
+
         const int32_t now=m->m_position_counts;
         int32_t d=now-last; if(d<0)d=-d;
-        if(d>=1){last=now;last_move_age=age;any_motion=true;}
-        if(age>500u && (uint32_t)(age-last_move_age)>=MCCONF_STEERING_STALL_MS){
-            if(stop_counts)*stop_counts=now;
+        if(d>=1){
+            last=now;
+            last_move_age=age;
+            direction_has_moved=true;
+        }
+
+        /* If the selected current cannot break static friction, follow the VESC
+         * commissioning idea: increase one ampere at a time, but never above
+         * the configured/board 15-A ceiling. This path is only used before any
+         * motion has been proven in this direction. */
+        if(!direction_has_moved && level_age>=MCCONF_STEERING_MOVE_PROBE_MS){
+            if(current>=max_current-0.01f)break;
+            current+=step;
+            if(current>max_current)current=max_current;
+            level_age=0u;
+            continue;
+        }
+
+        if(direction_has_moved && (uint32_t)(age-last_move_age)>=MCCONF_STEERING_STALL_MS){
+            /* Candidate hard-stop. Raise current by one step only to distinguish
+             * a true mechanical stop from a local friction peak. If motion
+             * resumes, continue travelling with that higher current. If it does
+             * not, accept this count as the endpoint instead of forcing 15 A
+             * continuously into the stop. */
+            if(current<max_current-0.01f){
+                float confirm=current+step;
+                if(confirm>max_current)confirm=max_current;
+                const int32_t confirm_start=m->m_position_counts;
+                bool resumed=false;
+                uint32_t confirm_ms=0u;
+                while(confirm_ms<MCCONF_STEERING_STOP_CONFIRM_MS){
+                    mc_interface_set_current((float)user_dir*confirm);
+                    mcpwm_foc_vesc_override_touch(false);
+                    steering_bounded_delay_ms(5u);
+                    age+=5u; confirm_ms+=5u;
+                    if(m->m_fault!=FAULT_CODE_NONE)goto seek_fail;
+                    int32_t md=m->m_position_counts-confirm_start; if(md<0)md=-md;
+                    if(md>=2){resumed=true;break;}
+                }
+                if(resumed){
+                    current=confirm;
+                    last=m->m_position_counts;
+                    last_move_age=age;
+                    level_age=0u;
+                    continue;
+                }
+            }
+            if(stop_counts)*stop_counts=m->m_position_counts;
             mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(false);
             steering_bounded_delay_ms(120u);
-            /* Starting already at a stop is valid; phase-detect already proved
-             * encoder wiring/motion before this function is called. */
-            (void)any_motion;
             return true;
         }
     }
-    mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(false);
+seek_fail:
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(false);
     return false;
 }
 
@@ -430,15 +486,15 @@ bool mc_interface_set_steering_deg(float deg){return mcpwm_foc_set_steering_deg(
 
 bool mc_interface_steering_boot_home(void){
     if(!mcpwm_foc_steering_is_calibrated())return false;
+    /* Power-cycle policy: the operator places the wheel at center before power.
+     * Only synchronize electrical phase/ABI using adaptive Id. startup_align()
+     * preserves the relative displacement caused by that phase lock and sets
+     * the original boot point to span/2 == logical 180 degrees. No hard-stop
+     * sweep is allowed during ordinary boot. */
     if(!mcpwm_foc_encoder_startup_align(false))return false;
-    int32_t left=0;
-    if(!steering_seek_stop_user(MCCONF_STEERING_HOME_CURRENT_A,-1,&left))return false;
-    (void)left;
-    if(!mcpwm_foc_steering_rebase_left())return false;
-    const int32_t span=mcpwm_foc_steering_span_counts();
-    const int32_t center=span/2;
+    const int32_t center=mcpwm_foc_steering_span_counts()/2;
     if(!mcpwm_foc_set_steering_deg(0.0f))return false;
-    const bool ok=steering_wait_target(center,5000u);
+    const bool ok=steering_wait_target(center,6000u);
     mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
     return ok;
 }
@@ -448,54 +504,89 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     steering_stage_set(1u);
     float off=1001.0f, rat=0.0f; bool inv=false;
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
-    /* Encoder detect itself is fail-closed unless the ABI port is already
-     * configured. Put LEFT into the intended sensor mode before the bounded
-     * phase probe; otherwise a fresh/legacy Hall configuration returns the
-     * VESC failure sentinel (offset=1001, ratio=0) without moving at all. */
     mc_configuration c=m->m_conf;
     c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
     c.sensor_mode=SENSOR_MODE_SENSORED;
     c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
     c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    c.si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
+    c.foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
     mcpwm_foc_set_configuration(&c,false);
-    if(!mcpwm_foc_encoder_detect(current,false,&off,&rat,&inv)){steering_stage_set(0xE1u);return false;}
+
+    float ceiling=c.l_current_max*c.l_current_max_scale;
+    if(!(ceiling>0.0f))ceiling=c.l_current_max;
+    if(ceiling>MCCONF_STEERING_CAL_CURRENT_MAX_A)ceiling=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+    if(ceiling>(float)I_MOT_MAX)ceiling=(float)I_MOT_MAX;
+    float detect_current=current;
+    if(detect_current<=0.0f)detect_current=MCCONF_STEERING_DETECT_CURRENT_START_A;
+    if(detect_current<0.30f)detect_current=0.30f;
+    if(detect_current>ceiling)detect_current=ceiling;
+
+    /* VESC Tool's Detect Encoder current is the starting commissioning current.
+     * If it is insufficient to produce a plausible A/B excursion, raise it one
+     * ampere at a time until motion is proven or the configured ceiling is hit. */
+    bool encoder_ok=false;
+    for(;;){
+        if(mcpwm_foc_encoder_detect(detect_current,false,&off,&rat,&inv)){
+            encoder_ok=true; break;
+        }
+        if(m->m_fault!=FAULT_CODE_NONE || detect_current>=ceiling-0.01f)break;
+        detect_current+=MCCONF_STEERING_DETECT_CURRENT_STEP_A;
+        if(detect_current>ceiling)detect_current=ceiling;
+    }
+    if(!encoder_ok){steering_stage_set(0xE1u);return false;}
     steering_stage_set(2u);
+
     c=m->m_conf;
-    c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI; c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    c.m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+    c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
     c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    c.si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
     c.foc_encoder_offset=off; c.foc_encoder_ratio=rat; c.foc_encoder_inverted=inv;
     mcpwm_foc_set_configuration(&c,false);
     if(!mcpwm_foc_encoder_startup_align(false)){steering_stage_set(0xE2u);return false;}
     steering_stage_set(3u);
 
-    int32_t l=0,r=0;
+    int32_t stop_neg=0,stop_pos=0;
     steering_stage_set(4u);
-    if(!steering_seek_stop_user(current,-1,&l)){steering_stage_set(0xE3u);return false;}
+    if(!steering_seek_stop_user(detect_current,-1,&stop_neg)){steering_stage_set(0xE3u);return false;}
     steering_stage_set(5u);
-    if(!steering_seek_stop_user(current,+1,&r)){steering_stage_set(0xE4u);return false;}
+    if(!steering_seek_stop_user(detect_current,+1,&stop_pos)){steering_stage_set(0xE4u);return false;}
     steering_stage_set(6u);
-    const int32_t span=r-l; int32_t aspan=span<0?-span:span;
+
+    /* Logical VESC steering coordinate is always 0..360. Without encoder
+     * inversion the negative-current stop is 0 and positive-current stop 360.
+     * With foc_encoder_inverted the endpoint labels are intentionally swapped,
+     * exactly as requested. The signed span keeps raw ABI count direction. */
+    const int32_t endpoint_zero=inv?stop_pos:stop_neg;
+    const int32_t endpoint_full=inv?stop_neg:stop_pos;
+    const int32_t span=endpoint_full-endpoint_zero;
+    int32_t aspan=span<0?-span:span;
     if(aspan<MCCONF_STEERING_MIN_SPAN_COUNTS){steering_stage_set(0xE5u);return false;}
 
-    /* We are physically at RIGHT stop. Rebase runtime count domain so LEFT=0
-     * and RIGHT=span regardless of encoder A/B numerical direction. */
     mcpwm_foc_release_motor(false);
-    m->m_position_counts=span; m->m_position_abs_counts=0u; m->m_position_target_counts=span;
+    const int32_t current_logical=inv?0:span; /* second seek ended at +current stop */
+    m->m_position_counts=current_logical;
+    m->m_position_abs_counts=0u;
+    m->m_position_target_counts=current_logical;
     if(!mcpwm_foc_steering_set_span(span,true)){steering_stage_set(0xE6u);return false;}
     steering_stage_set(7u);
-    if(!mc_interface_store_configuration_motor(false) || !mc_interface_store_steering_calibration()){steering_stage_set(0xE7u);return false;}
+    if(!mc_interface_store_configuration_motor(false) || !mc_interface_store_steering_calibration()){
+        steering_stage_set(0xE7u);return false;
+    }
     steering_stage_set(8u);
 
+    /* COMM_SET_POS 180 maps to signed steering 0 deg, i.e. span/2. */
     if(!mcpwm_foc_set_steering_deg(0.0f)){steering_stage_set(0xE8u);return false;}
-    const bool centered=steering_wait_target(span/2,6000u);
+    const bool centered=steering_wait_target(span/2,8000u);
     mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
     if(!centered){steering_stage_set(0xE9u);return false;}
     steering_stage_set(9u);
     if(offset)*offset=off;
     if(ratio)*ratio=rat;
     if(inverted)*inverted=inv;
-    if(raw_left)*raw_left=l;
-    if(raw_right)*raw_right=r;
+    if(raw_left)*raw_left=stop_neg;
+    if(raw_right)*raw_right=stop_pos;
     if(span_out)*span_out=span;
     return true;
 }

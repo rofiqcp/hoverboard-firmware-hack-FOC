@@ -894,7 +894,7 @@ class VescDual:
     def detect_encoder(self, current_a: float = 1.0, right: bool = False):
         """Commands::measureEncoder packet/reply format from VESC Tool."""
         req=bytes((COMM_DETECT_ENCODER,))+struct.pack(">i",round(current_a*1000.0))
-        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_ENCODER,30.0)
+        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_ENCODER,90.0)
         if len(p)!=10:
             raise ValueError(f"unexpected encoder detect reply length {len(p)}")
         off=struct.unpack_from(">i",p,1)[0]/1_000_000.0

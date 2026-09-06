@@ -177,12 +177,17 @@ int main(void) {
    * after GPIO/TIM/ADC/UART/DMA are configured and their state is valid. */
   __enable_irq();
 
-  /* Incremental ABI has no absolute index. Boot must never move steering before
-   * the VESC protocol is alive: keep LEFT high-Z and responsive. A persisted
-   * span is only geometry; absolute position is intentionally not trusted after
-   * reset. Detect Encoder performs phase detect + hard-stop calibration + center
-   * and arms signed steering for this power cycle. */
+  /* Incremental ABI has no absolute index. If a steering hard-stop span has
+   * already been calibrated, normal power-up assumes the wheel was placed at
+   * center by the operator. Wait for the ADC zero calibration, perform only the
+   * adaptive Id electrical-phase/ABI synchronization, then return to the exact
+   * boot point and define it as logical VESC position 180 degrees. No hard-stop
+   * sweep is performed on an ordinary power cycle. */
   mcpwm_foc_release_motor(false);
+  if(mc_interface_steering_calibration_valid()){
+    for(uint32_t t=0u;t<2500u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
+    if(mcpwm_foc_dc_cal_done())(void)mc_interface_steering_boot_home();
+  }
 
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);

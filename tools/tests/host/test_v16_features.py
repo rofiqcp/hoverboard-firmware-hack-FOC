@@ -106,7 +106,7 @@ assert 'stable non-adjacent Hall transition' in mc and 'mcpwm_foc_release_motor(
 assert vp.count('const float sl_erpm=buffer_get_float32(data,1e3f,&k);') == 1, 'Detect-All must consume exactly one sl_erpm field from VESC Tool packet'
 assert 'detect_all_compute_rl' in vp and 'foc_current_kp=c->foc_motor_l*1000.0f' in vp and 'foc_current_ki=c->foc_motor_r*1000.0f' in vp, 'Detect-All must identify R/L and derive VESC current gains'
 assert 'DETECT_ALL_ENCODER' in vp and 'detect_all_prepare_encoder_left' in vp and 'detect_all_prepare_hall(1u)' in vp, 'Detect-All must use LEFT ABI encoder and RIGHT Hall'
-assert 'c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT' in vp and 'float detect_current=MCCONF_STEERING_CAL_CURRENT_MAX_A' in vp, 'Detect-All LEFT must force 1024-PPR x4 CPR and use bounded commissioning current'
+assert 'mc_interface_steering_detect_calibrate(MCCONF_STEERING_DETECT_CURRENT_START_A' in vp and 'c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT' in vp, 'Detect-All LEFT must run complete adaptive ABI + hard-stop commissioning at 3A start'
 assert 'hall_detect_start_current(true,2.0f)' in vp and 's_detect_all_last_detail = !second ? 11 : 10' in vp, 'Detect-All RIGHT Hall must use validated 2A excitation and expose stage-specific failure detail'
 assert 'DETECT_ALL_FLUX_SAMPLE' in vp and 'foc_motor_flux_linkage' in vp, 'Detect-All flux-linkage stage missing'
 assert 'mcpwm_foc_hall_table_sane(table)' in vp, 'VESC Tool Hall-detect reply must reject unsafe table geometry'

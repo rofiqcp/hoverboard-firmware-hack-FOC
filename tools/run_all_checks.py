@@ -111,7 +111,7 @@ def check_static():
     assert 'while (huart3.gState != HAL_UART_STATE_READY)' not in vp, 'VESC reply path must never busy-wait on UART TX'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
     assert 'COMM_DETECT_HALL_FOC' in vp and 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp, 'VESC-standard async Hall detect command missing'
-    assert 'case COMM_DETECT_ENCODER:' in vp and 'mcpwm_foc_encoder_detect' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect command missing'
+    assert 'case COMM_DETECT_ENCODER:' in vp and 'mc_interface_steering_detect_calibrate' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect + steering commissioning command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
     assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'

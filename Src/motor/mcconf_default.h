@@ -41,9 +41,9 @@
 #define MCCONF_ENCODER_COUNTS_DEFAULT             4096u
 #define MCCONF_ENCODER_RATIO_MAX                  10000.0f
 #define MCCONF_ENCODER_OFFSET_DEFAULT             0.0f
-#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.50f /* adaptive Id alignment starts low */
-#define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       0.50f /* rise gradually until ABI motion is proven */
-#define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A        2.00f /* commissioning ceiling: steering hardware */
+#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    3.00f /* Detect-All/boot Id starts at 3 A */
+#define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       1.00f /* VESC-style adaptive rise until motion */
+#define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard board/config ceiling; never exceeded */
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
 /* Physical LEFT steering envelope. VESC COMM_SET_POS is still the wire API,
@@ -57,10 +57,14 @@
 #define MCCONF_STEERING_BREAKAWAY_MAX_MS             300u
 #define MCCONF_STEERING_BREAKAWAY_DELAY_MS            20u
 #define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        2000u /* no 2-A assist inside +/-2 degrees */
-#define MCCONF_STEERING_HOME_CURRENT_A             0.70f
-#define MCCONF_STEERING_CAL_CURRENT_MAX_A          2.00f /* commissioning ceiling; normal steering <=1.5 A */
-#define MCCONF_STEERING_STALL_MS                    350u
-#define MCCONF_STEERING_SEEK_TIMEOUT_MS            8000u
+#define MCCONF_STEERING_HOME_CURRENT_A             3.00f
+#define MCCONF_STEERING_CAL_CURRENT_MAX_A         15.00f /* commissioning only; runtime steering stays capped separately */
+#define MCCONF_STEERING_DETECT_CURRENT_START_A      3.00f
+#define MCCONF_STEERING_DETECT_CURRENT_STEP_A       1.00f
+#define MCCONF_STEERING_MOVE_PROBE_MS                450u
+#define MCCONF_STEERING_STOP_CONFIRM_MS              300u
+#define MCCONF_STEERING_STALL_MS                     350u
+#define MCCONF_STEERING_SEEK_TIMEOUT_MS            20000u
 #define MCCONF_STEERING_MIN_SPAN_COUNTS              32
 #define MCCONF_STEERING_SETTLE_COUNTS                 6
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */

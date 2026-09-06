@@ -1385,9 +1385,11 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     if(!mcpwm_foc_dc_cal_done()){encoder_align_stage=0xE3u;return false;}
     encoder_align_stage=3u;
 
-    float ceiling=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
+    float ceiling=m->m_conf.l_current_max*m->m_conf.l_current_max_scale;
+    if(!(ceiling>0.0f))ceiling=m->m_conf.l_current_max;
+    if(ceiling>MCCONF_ENCODER_STARTUP_ALIGN_MAX_A)ceiling=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
     if(ceiling>MCCONF_STEERING_CAL_CURRENT_MAX_A)ceiling=MCCONF_STEERING_CAL_CURRENT_MAX_A;
-    if(ceiling>m->m_conf.l_current_max)ceiling=m->m_conf.l_current_max;
+    if(ceiling>(float)I_MOT_MAX)ceiling=(float)I_MOT_MAX;
     if(ceiling<0.10f)ceiling=0.10f;
     float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
     if(current<0.10f)current=0.10f;
@@ -1404,10 +1406,16 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     int32_t max_move=(int32_t)(expected_f*3.0f)+4;
     bool aligned=false;
     bool detected_inverted=false;
+    /* On power-up the operator places the wheel at mechanical center. TIM4 is
+     * incremental only, so remember how far the rotor moves while Id locks the
+     * first electrical phase. After synchronization we can drive that exact
+     * relative displacement back and call the original boot point 180 degrees. */
+    int32_t boot_center_to_phase0_counts=0;
 
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
     while(current<=ceiling+0.001f){
+        const uint32_t level_ref_raw=encoder_read_raw_count();
         encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
         encoder_align_stage=4u;
         /* Hold phase zero while ramping Id from the previous level. */
@@ -1424,6 +1432,12 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
             mcpwm_foc_vesc_override_touch(false);
             foc_bounded_delay_ms(1u);
             if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+        }
+        {
+            const uint32_t held_raw=encoder_read_raw_count();
+            int32_t dd=(int32_t)held_raw-(int32_t)level_ref_raw;
+            if(dd>half)dd-=(int32_t)counts; else if(dd<-half)dd+=(int32_t)counts;
+            boot_center_to_phase0_counts+=dd;
         }
 
         /* Phase zero is now the physical electrical reference. Rebase the
@@ -1498,7 +1512,15 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     m->m_conf.foc_encoder_inverted=detected_inverted;
     encoder_runtime_configure(m,false,false);
     encoder_runtime_set_deg(m,0.0f);
-    m->m_position_counts=0; m->m_position_abs_counts=0u;
+    /* If a hard-stop span is already calibrated, the boot position is assumed
+     * to be center (180 deg) as requested. We are currently at electrical
+     * phase-zero, displaced by boot_center_to_phase0_counts from that point. */
+    const int32_t boot_center=(m->m_steering_calibrated && m->m_steering_span_counts!=0)?
+                              (m->m_steering_span_counts/2):0;
+    m->m_position_counts=boot_center+boot_center_to_phase0_counts;
+    m->m_position_target_counts=boot_center;
+    m->m_position_abs_counts=(uint32_t)(boot_center_to_phase0_counts<0?
+                                        -boot_center_to_phase0_counts:boot_center_to_phase0_counts);
     encoder_feedback_update(m,false);
     m->m_encoder_synced=1u;
     encoder_align_stage=9u;
@@ -1562,7 +1584,10 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
     encoder_stage_set(2u);
     if(current<0.20f)current=0.20f;
     if(current>MCCONF_STEERING_CAL_CURRENT_MAX_A)current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
-    if(current>m->m_conf.l_current_max)current=m->m_conf.l_current_max;
+    float enc_ceiling=m->m_conf.l_current_max*m->m_conf.l_current_max_scale;
+    if(!(enc_ceiling>0.0f))enc_ceiling=m->m_conf.l_current_max;
+    if(enc_ceiling>(float)I_MOT_MAX)enc_ceiling=(float)I_MOT_MAX;
+    if(current>enc_ceiling)current=enc_ceiling;
     for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)foc_bounded_delay_ms(1u);
     if(!mcpwm_foc_dc_cal_done()){encoder_stage_set(0xE3u);return false;}
     encoder_stage_set(3u);
@@ -2523,8 +2548,13 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
              * can understate steering error by the gearbox/linkage ratio and
              * leave the position loop below static breakaway torque. The signed
              * span already maps count direction to LEFT/RIGHT user direction. */
+            const int32_t steering_span_abs=m->m_steering_span_counts<0?
+                                            -m->m_steering_span_counts:m->m_steering_span_counts;
+            /* Keep torque sign in raw ABI count space. A negative logical span
+             * only swaps the 0/360 endpoint labels; it must never invert the
+             * position controller itself. */
             error_mdeg=(int32_t)(((int64_t)count_error*60000LL)/
-                                 (int64_t)m->m_steering_span_counts);
+                                 (int64_t)steering_span_abs);
         }else{
             /* Generic ABI position: one custom count is one quadrature count. */
             error_mdeg=(int32_t)(((int64_t)count_error*360000LL)/(int64_t)m->m_encoder_counts);
