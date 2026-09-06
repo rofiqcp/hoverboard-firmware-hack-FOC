@@ -44,15 +44,11 @@ static uint8_t debugIndex = 0;
 #ifdef __GNUC__
 int _write(int file, char *data, int len) {
   (void)file;
+  (void)data;
   if (len <= 0) return 0;
-  /* USART3 is the VESC binary transport. Raw printf text between framed VESC
-   * packets corrupts the host decoder and previously caused intermittent
-   * COMM_GET_VALUES timeouts / "Could not read firmware version" while a motor
-   * was active. Keep the legacy ASCII terminal available only when no VESC
-   * session is active; during a VESC session debug text is intentionally dropped. */
-  if (vesc_protocol_link_active()) return len;
-  while (huart3.gState != HAL_UART_STATE_READY) { }
-  return (HAL_UART_Transmit(&huart3, (uint8_t *)data, (uint16_t)len, 1000) == HAL_OK) ? len : 0;
+  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 transport at 1 Mbaud.
+   * Raw printf/debug bytes are never legal on this wire. */
+  return len;
 }
 #endif
 
@@ -157,7 +153,7 @@ static void debugAcceptByte(uint8_t byte) {
   }
 }
 
-static void serialAcceptLegacyByte(uint8_t byte) {
+static void __attribute__((unused)) serialAcceptLegacyByte(uint8_t byte) {
   const uint8_t startLo = (uint8_t)(SERIAL_START_FRAME & 0xffu);
   const uint8_t startHi = (uint8_t)(SERIAL_START_FRAME >> 8);
 
@@ -189,14 +185,9 @@ static void serialAcceptLegacyByte(uint8_t byte) {
 }
 
 static void serialAcceptByte(uint8_t byte) {
-  /* VESC packets use binary start markers 2/3/4. Never steal bytes that are
-   * already inside the legacy 0xABCD command frame. Once a VESC packet has
-   * started, all bytes go to its parser until the frame is complete/reset. */
-  if (frameIndex == 0u && (vesc_protocol_rx_in_progress() || byte == 2u || byte == 3u || byte == 4u)) {
-    (void)vesc_protocol_rx_byte(byte);
-    return;
-  }
-  serialAcceptLegacyByte(byte);
+  /* USART3 is VESC-exclusive. The VESC parser safely ignores non 2/3/4 start
+   * bytes while idle, so never fall back into the obsolete legacy parser. */
+  (void)vesc_protocol_rx_byte(byte);
 }
 
 void usart3_rx_check(void) {

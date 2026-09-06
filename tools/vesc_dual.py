@@ -158,8 +158,12 @@ class F411DirectTransport:
             raise RuntimeError("pyserial required for direct F411 USB mode")
         self.path = path or _discover_f411_cdc()
         self.timeout = max(0.0, float(timeout))
+        # Poll USB CDC at 1 ms. At 1 Mbaud the F411/F103 round-trip is normally
+        # sub-millisecond to a few milliseconds; a 10-ms tty read timeout turns
+        # an otherwise healthy request into artificial 10-ms latency whenever
+        # the reply is not already queued at the first read.
         self.ser = serial.Serial(
-            self.path, 115200, timeout=0.01, write_timeout=2.0, exclusive=True)
+            self.path, 1000000, timeout=0.001, write_timeout=2.0, exclusive=True)
         self.linebuf = bytearray()
         self.rawbuf = bytearray()
         self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
@@ -220,10 +224,19 @@ class F411DirectTransport:
         return len(self.rawbuf)
 
     def write(self, data: bytes) -> int:
-        for off in range(0, len(data), 48):
+        # USB CDC is packetized and the F411->F103 UART runs at 1 Mbaud. The
+        # old unconditional 2-ms sleep after every VESC frame was inherited from
+        # the 115200-baud bridge and alone added >=2 ms request latency. Normal
+        # realtime/setpoint frames fit in one chunk, so do not pace them. Only
+        # yield briefly between chunks of a genuinely large frame (MC/App config
+        # or firmware transfer) so the F411 command parser can drain CDC input.
+        chunks = list(range(0, len(data), 48))
+        for index, off in enumerate(chunks):
             chunk = data[off:off + 48]
             line = b"VESC:TX:M:" + chunk.hex().upper().encode() + b"\n"
-            self.ser.write(line); self.ser.flush(); time.sleep(0.002)
+            self.ser.write(line); self.ser.flush()
+            if index + 1 < len(chunks):
+                time.sleep(0.0002)
         return len(data)
 
     def read(self, size: int = 1) -> bytes:

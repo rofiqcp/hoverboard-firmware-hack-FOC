@@ -78,7 +78,7 @@ class Link:
 
     def _open_f411_direct(self):
         import serial
-        self.ser=serial.Serial(self.args.serial_port,115200,timeout=.05,write_timeout=2,exclusive=True)
+        self.ser=serial.Serial(self.args.serial_port,1000000,timeout=.05,write_timeout=2,exclusive=True)
         self.f411_direct=True; self.ser.reset_input_buffer(); self.ser.reset_output_buffer(); self.linebuf.clear()
         self.ser.write(b'\n'); self.ser.flush(); time.sleep(.03); self.ser.reset_input_buffer()
         line=self._f411_command('VESC:MODE:MAINTENANCE','VESC:MODE:MAINTENANCE',3.0)

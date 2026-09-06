@@ -78,6 +78,7 @@ void foc_sin_cos_q15(uint16_t phase, int16_t *sn, int16_t *cs) {
 }
 
 void mc_interface_select_motor_thread(int motor) { selected_motor=motor; }
+bool mc_interface_dccal_done(void){return true;}
 const volatile mc_configuration *mc_interface_get_configuration_motor(bool second) { return &confs[second?1:0]; }
 void mc_interface_set_configuration(mc_configuration *configuration) { confs[selected_motor==2?1:0]=*configuration; }
 void mc_interface_get_values_motor(mc_values *v, bool second) {
@@ -110,6 +111,7 @@ void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c;
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
 bool mc_interface_steering_calibration_valid(void){return true;}
+bool mc_interface_store_steering_calibration(void){return true;}
 bool mc_interface_steering_boot_home(void){diag_motors[0].m_encoder_synced=1u;return true;}
 float mc_interface_get_steering_deg(void){return 12.5f;}
 bool mc_interface_set_steering_deg(float p){set_pos[0]=p;return true;}
@@ -128,6 +130,9 @@ void mcpwm_foc_get_default_configuration(mc_configuration *c, bool second) {
     { const uint8_t t[8]={255u,83u,17u,50u,150u,117u,183u,255u}; for(int i=0;i<8;i++) c->foc_hall_table[i]=(int8_t)t[i]; }
 }
 void mc_interface_set_duty(float d) { set_duty[selected_motor==2?1:0]=d; }
+void mc_interface_set_openloop_phase(float current,float phase){mcpwm_foc_set_openloop_phase(current,phase,selected_motor==2);}
+void mc_interface_set_openloop_current(float current,float rpm){mcpwm_foc_set_openloop_current(current,rpm,selected_motor==2);}
+mc_state mc_interface_get_state_motor(bool second){return diag_motors[second?1:0].m_state;}
 mc_fault_code mc_interface_get_fault_motor(bool second) { (void)second; return FAULT_CODE_NONE; }
 void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float brake_current) {
     (void)second; (void)timeout_ms; (void)brake_current;
@@ -214,6 +219,7 @@ int32_t mcpwm_foc_get_position_max_user_counts(bool second){return pos_max_user[
 void mcpwm_foc_reset_position(bool second){const int j=second?1:0;pos_user[j]=0;pos_target_user[j]=0;}
 bool mc_interface_store_configuration_motor(bool second) { store_count[second?1:0]++; return store_ok; }
 bool mc_interface_load_configuration_motor(bool second) { (void)second; return load_ok; }
+void mc_interface_restore_default_motor(bool second,bool store){mc_configuration c; mcpwm_foc_get_default_configuration(&c,second); confs[second?1:0]=c; if(store)store_count[second?1:0]++;}
 bool mcpwm_foc_hall_table_sane(const uint8_t table[8]) {
     if(!table || table[0]!=255u || table[7]!=255u)return false;
     uint8_t a[6];

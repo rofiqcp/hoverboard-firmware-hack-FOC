@@ -278,14 +278,14 @@ int main(void) {
     right_dc_curr = -(m_motor_2.m_current_in_counts * 100) / A2BIT_CONV;
     dc_curr = left_dc_curr + right_dc_curr;
 
-    if (!vescLinkActive && (main_loop_counter % 25u) == 0u) process_debug();
+    /* USART3 is VESC-exclusive: no raw debug output on the motor link. */
 
     /* Legacy 72-byte telemetry is automatic at 50 Hz when no VESC binary link
      * owns USART3. There is intentionally no user-controlled live telemetry switch anymore.
      * When VESC Tool is connected, unsolicited legacy bytes are suppressed and
      * VESC realtime data is served by its standard GET_VALUES polling. */
     const uint32_t telemetryNowMs = HAL_GetTick();
-    if (!vescLinkActive && !timeoutFlgSerial &&
+    if (0 && !vescLinkActive && !timeoutFlgSerial &&
         (uint32_t)(telemetryNowMs - legacyTelemetryPrevMs) >= 20u &&
         huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
       legacyTelemetryPrevMs = telemetryNowMs;

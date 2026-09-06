@@ -5,6 +5,10 @@
 #include "config.h"
 #include "defines.h"
 #include "motor/mcpwm_foc.h"
+
+#ifndef VESC_EXTENDED_TERMINAL
+#define VESC_EXTENDED_TERMINAL 0
+#endif
 #include "motor/foc_math.h"
 #include "motor/mcconf_default.h"
 #include "motor/mc_interface.h"
@@ -23,8 +27,8 @@
 #define VESC_LINK_HOLD_MS        2000u
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
-#define VESC_RX_INTERBYTE_TIMEOUT_MS 50u
-#define VESC_RX_QUEUE_DEPTH          8u
+#define VESC_RX_INTERBYTE_TIMEOUT_MS 12u
+#define VESC_RX_QUEUE_DEPTH          16u
 #define VESC_TX_QUEUE_DEPTH          8u
 
 /* Project-specific extensions are transported inside standard
@@ -368,7 +372,7 @@ bool vesc_protocol_rx_byte(uint8_t byte) {
     const uint32_t now_ms = HAL_GetTick();
     if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
         /* A truncated/corrupt long frame must never poison all later traffic.
-         * F411 upload chunks are paced at ~5 ms, so 50 ms leaves ample margin. */
+         * F411 upload chunks are paced well below 12 ms at 1 Mbaud, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
         rx_reset();
         s_rx_timeout_reset++;
     }
@@ -504,9 +508,12 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
             mcpwm_foc_get_encoder_position_motor(false) : phase;
         return true;
     case DISP_POS_MODE_PID_POS:
-        /* Upstream main.c memakai mc_interface_get_pid_pos_now(): sudah
-         * dikembalikan ke koordinat user (encoder inversion, direction, offset). */
-        *out = mc_interface_get_pid_pos_now_motor(second);
+        /* Match COMM_GET_VALUES.position exactly. LEFT is a calibrated steering
+         * axis, so its public VESC position is physical steering degrees rather
+         * than the raw motor PID shaft coordinate. Keeping both streams on the
+         * same source prevents a false rotor-position jump in VESC Tool. */
+        *out = (!second && mc_interface_steering_calibration_valid()) ?
+            mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
         if(m->m_pos_pid_phase_mode){
@@ -1166,6 +1173,38 @@ static void reply_decoded_adc(void) {
     buffer_append_int32(b, (int32_t)(app_vesc_adc_voltage(false) * 1000000.0f), &i);
     buffer_append_int32(b, (int32_t)(app_vesc_adc_decoded(true) * 1000000.0f), &i);
     buffer_append_int32(b, (int32_t)(app_vesc_adc_voltage(true) * 1000000.0f), &i);
+    uart_send_payload(b, (uint16_t)i);
+}
+
+/* VESC Tool app-realtime polling always rotates PPM, ADC and Nunchuk.
+ * This board has no physical PPM/Nunchuk input, but the commands still need a
+ * standards-compatible response so the host-side per-command timeout state is
+ * cleared instead of generating a false transport timeout. */
+static void reply_decoded_ppm(void) {
+    uint8_t b[9];
+    int32_t i = 0;
+    b[i++] = COMM_GET_DECODED_PPM;
+    buffer_append_int32(b, 0, &i); /* decoded input */
+    buffer_append_int32(b, 0, &i); /* last pulse length */
+    uart_send_payload(b, (uint16_t)i);
+}
+
+static void reply_decoded_chuk(void) {
+    uint8_t b[5];
+    int32_t i = 0;
+    b[i++] = COMM_GET_DECODED_CHUK;
+    buffer_append_int32(b, 0, &i);
+    uart_send_payload(b, (uint16_t)i);
+}
+
+/* Firmware does not maintain the upstream accumulated STAT_VALUES structure.
+ * A zero returned mask is the protocol-safe way to report no optional stats
+ * fields while still acknowledging COMM_GET_STATS immediately. */
+static void reply_stats(void) {
+    uint8_t b[5];
+    int32_t i = 0;
+    b[i++] = COMM_GET_STATS;
+    buffer_append_uint32(b, 0u, &i);
     uart_send_payload(b, (uint16_t)i);
 }
 
@@ -2237,86 +2276,139 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
 }
 
-/** Kirim teks Terminal sebagai COMM_PRINT agar framing VESC Tool tetap utuh. */
+/** VESC Tool Terminal output. Keep one print below the normal payload limit. */
 static void terminal_send_text(const char *text) {
-    if (!text) return;
-    uint8_t b[192];
-    const size_t n = strlen(text);
-    const size_t copy = n > sizeof(b) - 1u ? sizeof(b) - 1u : n;
-    b[0] = COMM_PRINT;
-    memcpy(&b[1], text, copy);
-    uart_send_payload(b, (uint16_t)(copy + 1u));
+    static uint8_t b[VESC_MAX_PAYLOAD];
+    if(!text)return;
+    size_t n=strlen(text); if(n>sizeof(b)-1u)n=sizeof(b)-1u;
+    b[0]=COMM_PRINT; memcpy(&b[1],text,n); uart_send_payload(b,(uint16_t)(n+1u));
 }
 
-/**
- * Terminal minimum yang relevan untuk board dual-hoverboard.
- * Perintah tidak pernah meneruskan raw printf ke USART3; semua keluaran selalu
- * dibungkus COMM_PRINT sehingga VESC Tool tetap sinkron dengan CRC/framing.
- */
-static void process_terminal_command(bool second, const uint8_t *data, uint16_t len) {
-    char cmd[48];
-    const uint16_t copy = len >= sizeof(cmd) ? (uint16_t)(sizeof(cmd) - 1u) : len;
-    if (copy > 0u) memcpy(cmd, data, copy);
-    cmd[copy] = '\0';
-    /* Track the live length ourselves. The previous version re-tested the
-     * loop guard against the original `copy` count instead of the string's
-     * current length, so an all-CR/LF command (e.g. a bare Enter keypress in
-     * the VESC Tool terminal) stripped the buffer down to "" and then read
-     * cmd[strlen(cmd)-1] == cmd[(size_t)-1] -- an out-of-bounds underflow
-     * read/write one byte before the stack buffer. Reproduced with ASan. */
-    size_t cmd_len = copy;
-    while (cmd_len > 0u && (cmd[cmd_len - 1u] == '\r' || cmd[cmd_len - 1u] == '\n')) {
-        cmd[--cmd_len] = '\0';
-    }
+/* Tiny decimal parsers avoid pulling strtof/strtol into the 120-KiB app image. */
+static bool terminal_float(const char *s,float *out){
+    if(!s||!out||!*s)return false;
+    bool neg=false;
+    if(*s=='-'||*s=='+'){neg=*s=='-';s++;}
+    uint32_t ip=0u,fp=0u,fs=1u; bool any=false;
+    while(*s>='0'&&*s<='9'){any=true;ip=ip*10u+(uint32_t)(*s-'0');s++;}
+    if(*s=='.'){s++;while(*s>='0'&&*s<='9'){any=true;if(fs<1000000u){fp=fp*10u+(uint32_t)(*s-'0');fs*=10u;}s++;}}
+    if(!any||*s!='\0')return false;
+    float v=(float)ip+(float)fp/(float)fs;
+    *out=neg?-v:v;
+    return true;
+}
+static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)(*s-'A'+'a');}
 
-    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
-        terminal_send_text("Commands: help, status, detect, faults, stop, fw\n");
-        return;
+static void terminal_help(void){
+    terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. ALL: LEFT Id=3A adaptive<=15A, RIGHT Hall, then R/L/flux. Encoder: sync+2 stops+save span. Boot encoder: sync only; manual center=span/2=POS180. Hall uses entered A; RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
+}
+
+static void terminal_values(bool second){
+    mc_values v;get_values_normalized(second,&v);char o[260];
+    snprintf(o,sizeof(o),"id=%u fault=%u Vin=%.2f erpm=%.0f duty=%.3f Im=%.2f Iin=%.2f Id=%.2f Iq=%.2f Vd=%.2f Vq=%.2f pos=%.2f hall=%u state=%u mode=%u\n",
+        (unsigned)v.vesc_id,(unsigned)v.fault_code,(double)v.v_in,(double)v.rpm,(double)v.duty_now,
+        (double)v.current_motor,(double)v.current_in,(double)v.id,(double)v.iq,(double)v.vd,(double)v.vq,
+        (double)v.position,(unsigned)mcpwm_foc_get_motor_const(second)->m_hall_state,(unsigned)mc_interface_get_state_motor(second),(unsigned)mcpwm_foc_get_motor_const(second)->m_control_mode);
+    terminal_send_text(o);
+}
+static void terminal_detect_status(void){
+    char o[280];uint8_t mi=s_detect_all.motor_index<2u?s_detect_all.motor_index:0u;
+    snprintf(o,sizeof(o),"detect active=%u stage=%u motor=%u n=%lu detail=%d hall=%u:%u pass=%u deg=%d R=%ldmOhm L=%lduH flux=%ldmWb fault=%u/%u\n",
+        (unsigned)s_detect_all.active,(unsigned)s_detect_all.stage,(unsigned)s_detect_all.motor_index,(unsigned long)s_detect_all.sample_n,
+        (int)s_detect_all_last_detail,(unsigned)s_hall_detect.active,(unsigned)s_hall_detect.second,(unsigned)s_hall_detect.pass,(int)s_hall_detect.degree,
+        (long)(s_detect_all.r[mi]*1000.0f),(long)(s_detect_all.l[mi]*1000000.0f),(long)(s_detect_all.flux[mi]*1000.0f),
+        (unsigned)mcpwm_foc_get_motor_const(false)->m_fault,(unsigned)mcpwm_foc_get_motor_const(true)->m_fault);terminal_send_text(o);
+}
+static void terminal_cancel_detect(void){
+    if(s_detect_all.active){detect_all_release_all();detect_all_restore_backups();memset(&s_detect_all,0,sizeof(s_detect_all));}
+    if(s_hall_detect.active){bool r=s_hall_detect.second!=0u;mc_interface_select_motor_thread(r?2:1);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(r);memset(&s_hall_detect,0,sizeof(s_hall_detect));}
+    app_vesc_disable_output(0);mc_interface_select_motor_thread(1);
+}
+
+/* Return 1=changed, 0=unknown, -1=bad value. Numeric limits match the fixed
+ * point storage so Terminal never silently truncates a PID/config value. */
+static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const char *sv){
+    float v;if(!c||!k||!sv)return -1;
+    if(!strcmp(k,"sensor")){
+        if(!strcmp(sv,"hall")){c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;c->sensor_mode=SENSOR_MODE_SENSORED;c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;return 1;}
+        if(!second&&!strcmp(sv,"encoder")){c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;c->sensor_mode=SENSOR_MODE_SENSORED;c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;c->m_encoder_counts=MCCONF_ENCODER_COUNTS_DEFAULT;c->si_motor_poles=2u*MCCONF_POLE_PAIRS_LEFT;c->foc_encoder_ratio=MCCONF_POLE_PAIRS_LEFT;return 1;}return -1;
     }
-    if (strcmp(cmd, "detect") == 0) {
-        char out[220];
-        const uint8_t mi=s_detect_all.motor_index<2u?s_detect_all.motor_index:0u;
-        const int written=snprintf(out,sizeof(out),
-            "dall=%u st=%u mi=%u n=%lu det=%d hdet=%u:%u p=%u d=%d loI=%ld hiI=%ld loV=%ld hiV=%ld Rm=%ld Lu=%ld Fm=%ld fault=%u/%u\n",
-            (unsigned)s_detect_all.active,(unsigned)s_detect_all.stage,(unsigned)s_detect_all.motor_index,
-            (unsigned long)s_detect_all.sample_n,(int)s_detect_all_last_detail,
-            (unsigned)s_hall_detect.active,(unsigned)s_hall_detect.second,
-            (unsigned)s_hall_detect.pass,(int)s_hall_detect.degree,
-            (long)(s_detect_all.low_i[mi]*1000.0f),(long)(s_detect_all.high_i[mi]*1000.0f),
-            (long)(s_detect_all.low_v[mi]*1000.0f),(long)(s_detect_all.high_v[mi]*1000.0f),
-            (long)(s_detect_all.r[mi]*1000.0f),(long)(s_detect_all.l[mi]*1000000.0f),
-            (long)(s_detect_all.flux[mi]*1000.0f),
-            (unsigned)mcpwm_foc_get_motor_const(false)->m_fault,
-            (unsigned)mcpwm_foc_get_motor_const(true)->m_fault);
-        if(written>0)terminal_send_text(out);
-        return;
+    if(!terminal_float(sv,&v))return -1;
+    long i=(long)v;
+    if(!strcmp(k,"invert")){if(v!=(float)i||(i!=0&&i!=1))return -1;c->m_invert_direction=i!=0;return 1;}
+    if(!strcmp(k,"encoder_invert")){if(second||v!=(float)i||(i!=0&&i!=1))return -1;c->foc_encoder_inverted=i!=0;return 1;}
+    if(!strcmp(k,"poles")){if(v!=(float)i||i<2||i>254||(i&1))return -1;c->si_motor_poles=(uint8_t)i;return 1;}
+    if(!strcmp(k,"encoder_counts")){if(second||v!=(float)i||i<4||i>65536)return -1;c->m_encoder_counts=(uint32_t)i;return 1;}
+    if(!strcmp(k,"current_limit")){if(v<0.1f||v>I_MOT_MAX)return -1;c->l_current_max=v;c->l_current_min=-v;return 1;}
+    if(!strcmp(k,"gear")){if(v<0.01f||v>1000.0f)return -1;c->si_gear_ratio=v;return 1;}
+    if(!strcmp(k,"encoder_ratio")){if(second||v<0.01f||v>MCCONF_ENCODER_RATIO_MAX)return -1;c->foc_encoder_ratio=v;return 1;}
+    if(!strcmp(k,"encoder_offset")){if(second||fabsf(v)>100000.0f)return -1;c->foc_encoder_offset=v;return 1;}
+    if(!strncmp(k,"pos_k",5)){
+        if(!strcmp(k+5,"d_proc")){if(v<0||v>10.0f)return -1;c->p_pid_kd_proc=v;return 1;}
+        if(v<0||v>65.535f||k[6])return -1;
+        if(k[5]=='p')c->p_pid_kp=v;else if(k[5]=='i')c->p_pid_ki=v;else if(k[5]=='d')c->p_pid_kd=v;else return -1;return 1;
     }
-    if (strcmp(cmd, "stop") == 0) {
-        mc_interface_release_motor();
-        terminal_send_text(second ? "motor_right released\n" : "motor_left released\n");
-        return;
+    if(!strncmp(k,"speed_k",7)){if(v<0||v>65535.0f/MCCONF_SPEED_GAIN_SCALE||k[8])return -1;if(k[7]=='p')c->s_pid_kp=v;else if(k[7]=='i')c->s_pid_ki=v;else if(k[7]=='d')c->s_pid_kd=v;else return -1;return 1;}
+    if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
+    return 0;
+}
+
+static void process_terminal_command(bool second,const uint8_t *data,uint16_t len){
+    char line[112];uint16_t n=len>=sizeof(line)?sizeof(line)-1u:len;if(n)memcpy(line,data,n);line[n]='\0';
+    while(n&& (line[n-1]=='\r'||line[n-1]=='\n'||line[n-1]==' '||line[n-1]=='\t'))line[--n]='\0';
+    char *a[8];int ac=0;char *t=strtok(line," \t");while(t&&ac<8){a[ac++]=t;t=strtok(NULL," \t");}if(!ac)return;terminal_lower(a[0]);
+    mc_interface_select_motor_thread(second?2:1);mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);const mc_configuration *cc=(const mc_configuration *)mc_interface_get_configuration_motor(second);char o[420];
+
+    if(!strcmp(a[0],"help")||!strcmp(a[0],"?")){terminal_help();return;}
+    if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
+    if(!strcmp(a[0],"status")||!strcmp(a[0],"values")||!strcmp(a[0],"faults")){terminal_values(second);return;}
+    if(!strcmp(a[0],"encoder")||!strcmp(a[0],"enc")){
+        if(second){terminal_send_text("RIGHT Hall-only\n");return;}int32_t sp=mcpwm_foc_steering_span_counts();
+        snprintf(o,sizeof(o),"raw=%lu pos=%ld target=%ld span=%ld center=%ld deg=%ldm sync=%u cfg=%u cal=%u homed=%u inv=%u counts=%lu ratio=%.3f off=%.2f\n",
+            (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,(long)(sp/2),(long)(mc_interface_get_steering_deg()*1000.0f),
+            (unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)m->m_encoder_configured,(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)m->m_conf.foc_encoder_inverted,(unsigned long)m->m_conf.m_encoder_counts,(double)m->m_conf.foc_encoder_ratio,(double)m->m_conf.foc_encoder_offset);terminal_send_text(o);return;
     }
-    if (strcmp(cmd, "fw") == 0) {
-        terminal_send_text(second ? "motor_right FW 6.00\n" : "motor_left FW 6.00\n");
-        return;
+    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"perf")){snprintf(o,sizeof(o),"isr=%lu/%lu overrun=%lu rx=%lu crc=%lu rxdrop=%lu txdrop=%lu gap=%lums\n",(unsigned long)mcpwm_foc_get_isr_cycles(),(unsigned long)mcpwm_foc_get_isr_cycles_max(),(unsigned long)m->m_overrun_count,(unsigned long)s_rx_ok,(unsigned long)s_rx_crc_err,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,(unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
+
+    bool alias_enc=!strcmp(a[0],"foc_encoder_detect");
+    if(!strcmp(a[0],"detect")||alias_enc){
+        const char *sub=alias_enc?"encoder":(ac>1?a[1]:"status");int base=alias_enc?1:2;
+        if(!strcmp(sub,"status")){terminal_detect_status();return;}
+        if(!strcmp(sub,"cancel")){terminal_cancel_detect();terminal_send_text("OK detect cancelled\n");return;}
+        if(s_detect_all.active||s_hall_detect.active){terminal_send_text("ERR detect busy\n");return;}
+        if(!strcmp(sub,"hall")){float x=3.0f;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}hall_detect_start_current(second,x);terminal_send_text("OK Hall detect started; poll 'detect'\n");return;}
+        if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Encoder detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f inv=%u stops=%ld/%ld span=%ld center=%ld\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp,(long)(sp/2));terminal_send_text(o);return;}
+        if(!strcmp(sub,"all")){if(second){terminal_send_text("ERR start from LEFT/ID1\n");return;}float loss=50,minin=cc->l_in_current_min,maxin=cc->l_in_current_max,ol=cc->foc_openloop_rpm,sl=cc->foc_sl_erpm;if(ac-base==5){if(!terminal_float(a[base],&loss)||!terminal_float(a[base+1],&minin)||!terminal_float(a[base+2],&maxin)||!terminal_float(a[base+3],&ol)||!terminal_float(a[base+4],&sl)){terminal_send_text("ERR args\n");return;}}else if(ac!=base){terminal_send_text("ERR detect all [LOSS MIN MAX OPENRPM SLERPM]\n");return;}uint8_t d[21];int32_t k=0;d[k++]=1;buffer_append_float32(d,loss,1e3f,&k);buffer_append_float32(d,minin,1e3f,&k);buffer_append_float32(d,maxin,1e3f,&k);buffer_append_float32(d,ol,1e3f,&k);buffer_append_float32(d,sl,1e3f,&k);detect_all_begin(d,sizeof(d));terminal_send_text("OK Detect-All started; poll 'detect'\n");return;}
+        terminal_send_text("ERR detect status|hall|encoder|all|cancel\n");return;
     }
-    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "faults") == 0) {
-        mc_values v;
-        get_values_normalized(second, &v);
-        const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
-        char out[180];
-        const int written = snprintf(out, sizeof(out),
-            "id=%u fault=%u hall=%u erpm=%ld duty=%ld/1000 Vin=%ldmV Iq=%ldmA Id=%ldmA hdet=%u:%u p=%u d=%d w=%u\n",
-            (unsigned)v.vesc_id, (unsigned)v.fault_code, (unsigned)m->m_hall_state,
-            (long)v.rpm, (long)(v.duty_now * 1000.0f), (long)(v.v_in * 1000.0f),
-            (long)(v.iq * 1000.0f), (long)(v.id * 1000.0f),
-            (unsigned)s_hall_detect.active, (unsigned)s_hall_detect.second,
-            (unsigned)s_hall_detect.pass, (int)s_hall_detect.degree,
-            (unsigned)s_hall_detect.waiting_sample);
-        if (written > 0) terminal_send_text(out);
-        return;
+    if(!strcmp(a[0],"home")){if(second||cc->m_sensor_port_mode!=SENSOR_PORT_MODE_ABI){terminal_send_text("ERR LEFT encoder only\n");return;}terminal_send_text(mc_interface_steering_boot_home()?"PASS home\n":"FAIL home\n");return;}
+    if(!strcmp(a[0],"stop")){if(ac>1&&!strcmp(a[1],"all")){mc_interface_select_motor_thread(1);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(false);mc_interface_select_motor_thread(2);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(true);mc_interface_select_motor_thread(second?2:1);}else{mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);}terminal_send_text("OK stopped\n");return;}
+    if(!strcmp(a[0],"save")&&ac>1){if(!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_store_configuration_motor(second)?"OK saved\n":"ERR save\n");return;}if(!second&&!strcmp(a[1],"steering")){terminal_send_text(mc_interface_store_steering_calibration()?"OK saved\n":"ERR steering\n");return;}}
+    if(!strcmp(a[0],"load")&&ac>1&&!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_load_configuration_motor(second)?"OK loaded\n":"ERR load\n");return;}
+    if(!strcmp(a[0],"defaults")){bool sv=ac>1&&!strcmp(a[1],"save");mc_interface_restore_default_motor(second,sv);terminal_send_text(sv?"OK defaults saved\n":"OK defaults RAM\n");return;}
+    if(!strcmp(a[0],"set")){
+        if(ac<3){terminal_send_text("ERR set key value\n");return;}if(s_detect_all.active||hall_detect_motor_locked(second)){terminal_send_text("ERR detect busy\n");return;}terminal_lower(a[1]);float x,y;
+        if(!strcmp(a[1],"duty")&&terminal_float(a[2],&x)&&x>=-1&&x<=1){touch_motor(second);mc_interface_set_duty(x);goto setok;}
+        if(!strcmp(a[1],"current")&&terminal_float(a[2],&x)&&fabsf(x)<=I_MOT_MAX){touch_motor(second);mc_interface_set_current(x);goto setok;}
+        if(!strcmp(a[1],"current_rel")&&terminal_float(a[2],&x)&&x>=-1&&x<=1){touch_motor(second);mc_interface_set_current_rel(x);goto setok;}
+        if(!strcmp(a[1],"brake")&&terminal_float(a[2],&x)&&x>=0&&x<=I_MOT_MAX){touch_motor(second);mc_interface_set_brake_current(x);goto setok;}
+        if(!strcmp(a[1],"handbrake")&&terminal_float(a[2],&x)&&x>=0&&x<=I_MOT_MAX){touch_motor(second);mc_interface_set_handbrake(x);goto setok;}
+        if(!strcmp(a[1],"rpm")&&terminal_float(a[2],&x)&&x>=cc->l_min_erpm&&x<=cc->l_max_erpm){touch_motor(second);mc_interface_set_pid_speed(x);goto setok;}
+        if(!strcmp(a[1],"pos")&&terminal_float(a[2],&x)){if(!second){if(x<0||x>360)goto setbad;y=MCCONF_STEERING_POS_MIN_DEG+(x/360.0f)*(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);touch_motor(false);if(!mc_interface_set_steering_deg(y))goto setbad;}else{touch_motor(true);mc_interface_set_pid_pos(x);}goto setok;}
+        if(!strcmp(a[1],"steer")&&!second&&terminal_float(a[2],&x)&&x>=MCCONF_STEERING_POS_MIN_DEG&&x<=MCCONF_STEERING_POS_MAX_DEG){touch_motor(false);if(!mc_interface_set_steering_deg(x))goto setbad;goto setok;}
+        if(!strcmp(a[1],"id")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x>=0&&x<=I_MOT_MAX){touch_motor(second);mc_interface_set_openloop_phase(x,y);goto setok;}
+        if(!strcmp(a[1],"openloop")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&fabsf(x)<=I_MOT_MAX&&fabsf(y)<=MCCONF_L_MAX_ERPM){touch_motor(second);mc_interface_set_openloop_current(x,y);goto setok;}
+        if(!strcmp(a[1],"input_current")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<=-0.1f&&x>=-I_DC_MAX&&y>=0.1f&&y<=I_DC_MAX){mc_configuration c=*cc;c.l_in_current_min=x;c.l_in_current_max=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
+        if(!strcmp(a[1],"erpm_limit")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<0&&y>0&&x>=MCCONF_L_MIN_ERPM&&y<=MCCONF_L_MAX_ERPM){mc_configuration c=*cc;c.l_min_erpm=x;c.l_max_erpm=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
+        {mc_configuration c=*cc;int r=terminal_cfg_one(&c,second,a[1],a[2]);if(r==1){mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}if(r<0)goto setbad;}
+setbad: terminal_send_text("ERR set value/syntax; type help\n");return;
+setok: terminal_send_text("OK set\n");return;
     }
-    terminal_send_text("Unknown command. Type help.\n");
+    terminal_send_text("Unknown. Type help.\n");
 }
 
 static void process_command(const uint8_t *p, uint16_t len, bool second) {
@@ -2377,6 +2469,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     case COMM_GET_VALUES_SETUP_SELECTIVE:
         reply_values_setup(second, true, d, n);
+        break;
+    case COMM_GET_STATS:
+        reply_stats();
         break;
     case COMM_SET_DETECT:
         if (n >= 1u) {
@@ -2475,8 +2570,14 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_GET_APPCONF_DEFAULT:
         reply_appconf(second, id);
         break;
+    case COMM_GET_DECODED_PPM:
+        reply_decoded_ppm();
+        break;
     case COMM_GET_DECODED_ADC:
         reply_decoded_adc();
+        break;
+    case COMM_GET_DECODED_CHUK:
+        reply_decoded_chuk();
         break;
     case COMM_SET_ODOMETER:
         /* Tombol Set Odometer VESC Tool tidak punya ACK. Simpan offset terhadap
