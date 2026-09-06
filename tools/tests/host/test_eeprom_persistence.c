@@ -119,6 +119,11 @@ int main(void){
     m_motor_2.m_kps_q11=565u;  m_motor_2.m_kis_q16=676u; m_motor_2.m_kds_q11=87u;
     m_motor_2.m_kpp_q11=898u;  m_motor_2.m_kip_q16=909u; m_motor_2.m_kdp_q11=121u;
     m_motor_2.m_speed_ramp_rpm_s=234u; m_motor_2.m_speed_release_rpm=8u;
+    /* Raw/custom tuning is an explicit fixed-point API. Mirror it into the
+     * standard MC config before persistence, exactly like HB_CUSTOM_SET_TUNING
+     * and terminal SET callbacks do in production. */
+    mcpwm_foc_sync_tuning_to_conf(false);
+    mcpwm_foc_sync_tuning_to_conf(true);
     if(!mc_interface_store_configuration_motor(false)) return fail("store left");
     if(!mc_interface_store_configuration_motor(true)) return fail("store right");
 
@@ -226,6 +231,44 @@ int main(void){
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
     if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
     if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_rpm!=8u) return fail("right speed persistence");
+
+    /* Standard VESC SET_MCCONF keeps the requested float values authoritative.
+     * Runtime coefficients are quantized for the ISR, but GET_MCCONF and EEPROM
+     * must return these exact float32 shadows rather than reverse-converting the
+     * fixed-point coefficients. */
+    {
+        mc_configuration xl=m_motor_1.m_conf, xr=m_motor_2.m_conf;
+        xl.foc_current_kp=0.812345f; xl.foc_current_ki=267.12345f;
+        xl.s_pid_kp=0.0123456f; xl.s_pid_ki=0.0234567f; xl.s_pid_kd=0.0006789f;
+        xl.p_pid_kp=0.123456f; xl.p_pid_ki=0.023456f; xl.p_pid_kd=0.0034567f;
+        xr.foc_current_kp=0.923456f; xr.foc_current_ki=312.34567f;
+        xr.s_pid_kp=0.0135791f; xr.s_pid_ki=0.0246802f; xr.s_pid_kd=0.0007891f;
+        xr.p_pid_kp=0.234567f; xr.p_pid_ki=0.034567f; xr.p_pid_kd=0.0045678f;
+        mcpwm_foc_set_configuration(&xl,false); mcpwm_foc_set_configuration(&xr,true);
+        if(!mc_interface_store_configuration_motor(false) || !mc_interface_store_configuration_motor(true))
+            return fail("exact PID shadow store");
+        mcpwm_foc_init();
+        if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+            return fail("exact PID shadow load");
+        if(fabsf(m_motor_1.m_conf.foc_current_kp-xl.foc_current_kp)>1e-7f ||
+           fabsf(m_motor_1.m_conf.foc_current_ki-xl.foc_current_ki)>1e-5f ||
+           fabsf(m_motor_1.m_conf.s_pid_kp-xl.s_pid_kp)>1e-8f ||
+           fabsf(m_motor_1.m_conf.s_pid_ki-xl.s_pid_ki)>1e-8f ||
+           fabsf(m_motor_1.m_conf.s_pid_kd-xl.s_pid_kd)>1e-9f ||
+           fabsf(m_motor_1.m_conf.p_pid_kp-xl.p_pid_kp)>1e-7f ||
+           fabsf(m_motor_1.m_conf.p_pid_ki-xl.p_pid_ki)>1e-7f ||
+           fabsf(m_motor_1.m_conf.p_pid_kd-xl.p_pid_kd)>1e-8f)
+            return fail("left exact PID float32 persistence");
+        if(fabsf(m_motor_2.m_conf.foc_current_kp-xr.foc_current_kp)>1e-7f ||
+           fabsf(m_motor_2.m_conf.foc_current_ki-xr.foc_current_ki)>1e-5f ||
+           fabsf(m_motor_2.m_conf.s_pid_kp-xr.s_pid_kp)>1e-8f ||
+           fabsf(m_motor_2.m_conf.s_pid_ki-xr.s_pid_ki)>1e-8f ||
+           fabsf(m_motor_2.m_conf.s_pid_kd-xr.s_pid_kd)>1e-9f ||
+           fabsf(m_motor_2.m_conf.p_pid_kp-xr.p_pid_kp)>1e-7f ||
+           fabsf(m_motor_2.m_conf.p_pid_ki-xr.p_pid_ki)>1e-7f ||
+           fabsf(m_motor_2.m_conf.p_pid_kd-xr.p_pid_kd)>1e-8f)
+            return fail("right exact PID float32 persistence");
+    }
 
     /* V34 (0x6020) already has Hall-extra but not the R/L/flux model slots.
      * Migration must preserve every old field and append zero "not detected yet"

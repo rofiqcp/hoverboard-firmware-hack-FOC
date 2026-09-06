@@ -83,25 +83,28 @@ static float throttle_curve(float val, float curve_acc, float curve_brake, int m
 #define APP_EE_SIGNATURE         0xA601u
 #define APP_EE_KEY_SLOT          0u
 #define APP_EE_KEY_VALUE         FLASH_WRITE_KEY
+_Static_assert(APP_EE_BASE == 49u, "App Config base must stay after legacy MC slot 48");
+_Static_assert(APP_EE_STRIDE == 37u, "App Config stride changed");
+_Static_assert((APP_EE_BASE + (2u * APP_EE_STRIDE)) == 123u, "App Config must occupy exactly slots 49..122");
 extern uint16_t VirtAddVarTab[NB_OF_VAR];
 
-static bool app_ee_read(uint8_t slot, uint16_t *v) {
+static bool app_ee_read(uint16_t slot, uint16_t *v) {
     return slot < NB_OF_VAR && EE_ReadVariable(VirtAddVarTab[slot], v) == 0u;
 }
-static bool app_ee_write_if_changed(uint8_t slot, uint16_t v) {
+static bool app_ee_write_if_changed(uint16_t slot, uint16_t v) {
     uint16_t old = 0u;
     if (app_ee_read(slot, &old) && old == v) return true;
     return slot < NB_OF_VAR && EE_WriteVariable(VirtAddVarTab[slot], v) == HAL_OK;
 }
 static uint32_t float_bits(float f) { uint32_t u=0u; memcpy(&u,&f,sizeof(u)); return u; }
 static float bits_float(uint32_t u) { float f=0.0f; memcpy(&f,&u,sizeof(f)); return f; }
-static bool app_ee_write_u32(uint8_t slot, uint32_t v) {
+static bool app_ee_write_u32(uint16_t slot, uint32_t v) {
     return app_ee_write_if_changed(slot,(uint16_t)(v&0xffffu)) &&
-           app_ee_write_if_changed((uint8_t)(slot+1u),(uint16_t)(v>>16));
+           app_ee_write_if_changed((uint16_t)(slot+1u),(uint16_t)(v>>16));
 }
-static bool app_ee_read_u32(uint8_t slot, uint32_t *v) {
+static bool app_ee_read_u32(uint16_t slot, uint32_t *v) {
     uint16_t lo=0u,hi=0u;
-    if(!app_ee_read(slot,&lo)||!app_ee_read((uint8_t)(slot+1u),&hi))return false;
+    if(!app_ee_read(slot,&lo)||!app_ee_read((uint16_t)(slot+1u),&hi))return false;
     *v=(uint32_t)lo|((uint32_t)hi<<16); return true;
 }
 static uint16_t app_flags_pack(const adc_config *c) {
@@ -182,7 +185,7 @@ void app_vesc_defaults(app_configuration *a, uint8_t id) {
     if (!a) return;
     memset(a, 0, sizeof(*a));
     a->controller_id = id;
-    a->timeout_msec = 1000u;
+    a->timeout_msec = 10000u;
     a->timeout_brake_current = 0.0f;
     a->can_baud_rate = CAN_BAUD_500K;
     a->pairing_done = true;

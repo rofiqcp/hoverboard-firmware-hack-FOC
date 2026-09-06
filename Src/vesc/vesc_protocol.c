@@ -929,7 +929,6 @@ static void reply_mcconf(bool second, COMM_PACKET_ID id) {
     if (id == COMM_GET_MCCONF_DEFAULT) {
         mcpwm_foc_get_default_configuration(&c, second);
     } else {
-        mcpwm_foc_sync_tuning_to_conf(second);
         c = *mc_interface_get_configuration_motor(second);
     }
     const int32_t n = confgenerator_serialize_mcconf(&s_config_payload[i], &c);
@@ -968,7 +967,7 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
             if(c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER && c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER_AB)
                 c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
             if(c.m_encoder_counts<4 || c.m_encoder_counts>65536)c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
-            if(!(c.foc_encoder_ratio>=0.01f && c.foc_encoder_ratio<=1000.0f))c.foc_encoder_ratio=15.0f;
+            if(!(c.foc_encoder_ratio>=0.01f && c.foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX))c.foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
             while(c.foc_encoder_offset>=360.0f)c.foc_encoder_offset-=360.0f;
             while(c.foc_encoder_offset<0.0f)c.foc_encoder_offset+=360.0f;
         }else{
@@ -1317,13 +1316,24 @@ static bool detect_all_prepare_encoder_left(void) {
     c->sensor_mode=SENSOR_MODE_SENSORED;
     c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
     c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
-    if(c->m_encoder_counts<4 || c->m_encoder_counts>65536)
-        c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    /* Vehicle hardware is fixed: LEFT uses a 1024-PPR quadrature encoder.
+     * VESC m_encoder_counts is CPR after x4 decoding, therefore it must be
+     * 4096. Do not inherit a stale GUI value (e.g. 1024/65536) into the
+     * detector because encoder_read_deg() would then under/over-scale the
+     * mechanical probe and falsely report encoder/flux detection failure. */
+    c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+    c->si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
+    c->foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
+    c->foc_encoder_offset=0.0f;
 
     mc_interface_select_motor_thread(1);
     mc_interface_set_configuration(c);
     float off=1001.0f, ratio=0.0f; bool inv=false;
-    float detect_current=1.0f;
+    /* 1 A was insufficient on the real steering linkage and reproducibly
+     * returned detect detail 9 even though both ABI channels were toggling.
+     * Use the bounded steering commissioning ceiling (2 A on this vehicle),
+     * still clamped by the configured motor current limit. */
+    float detect_current=MCCONF_STEERING_CAL_CURRENT_MAX_A;
     if(c->l_current_max>0.20f && detect_current>c->l_current_max)detect_current=c->l_current_max;
     if(!mcpwm_foc_encoder_detect(detect_current,false,&off,&ratio,&inv))return false;
     const int poles=(int)lroundf(ratio*2.0f);
@@ -1425,6 +1435,10 @@ static void hall_detect_reply_and_stop(bool success) {
          * because PB6/PB7 are occupied by the steering ABI encoder. Only the
          * RIGHT virtual VESC is Hall. */
         if(!second || !success){
+            /* Keep a distinct internal detail code even when there is no VESC
+             * fault, so a GUI "flux linkage" umbrella error can be traced to
+             * the actual Hall stage from the terminal diagnostics. */
+            s_detect_all_last_detail = !second ? 11 : 10;
             detect_all_finish(!second ? -11 : detect_all_fault_result(second));
             return;
         }
@@ -1650,7 +1664,12 @@ static void detect_all_periodic(uint32_t now_time) {
         }
         s_detect_all.stage=DETECT_ALL_HALL;
         s_detect_all.motor_index=1u;
-        hall_detect_start_current(true,1.0f);
+        /* The RIGHT traction motor needs enough d-axis alignment torque for
+         * all six Hall sectors to cross cleanly. 1 A reproducibly left missing
+         * / compressed sectors on the real motor; 2 A gives a sane six-state
+         * table with no fault or over-current trip. hall_detect_start_current()
+         * still clamps this request to the configured motor-current limit. */
+        hall_detect_start_current(true,2.0f);
         return;
     }
     if(s_detect_all.stage==DETECT_ALL_HALL) return;

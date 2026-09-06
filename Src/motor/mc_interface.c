@@ -241,8 +241,33 @@ enum {
     /* Project steering calibration, independent from standard MC signature.
      * Magic is written last; span and bitwise complement make torn writes fail closed. */
     EE_L_STEER_CAL_MAGIC = 223, EE_L_STEER_SPAN_LO, EE_L_STEER_SPAN_HI,
-    EE_L_STEER_SPAN_INV_LO, EE_L_STEER_SPAN_INV_HI
+    EE_L_STEER_SPAN_INV_LO, EE_L_STEER_SPAN_INV_HI,
+    /* Exact standard VESC PID/FOC gains. Runtime still uses fixed-point
+     * coefficients, but these float32 shadows preserve SET_MCCONF readback
+     * and EEPROM semantics without quantizing the user's configuration. */
+    EE_L_EXT10_FOC_KP_LO = 228, EE_L_EXT10_FOC_KP_HI,
+    EE_L_EXT10_FOC_KI_LO, EE_L_EXT10_FOC_KI_HI,
+    EE_L_EXT10_SPEED_KP_LO, EE_L_EXT10_SPEED_KP_HI,
+    EE_L_EXT10_SPEED_KI_LO, EE_L_EXT10_SPEED_KI_HI,
+    EE_L_EXT10_SPEED_KD_LO, EE_L_EXT10_SPEED_KD_HI,
+    EE_L_EXT10_POS_KP_LO, EE_L_EXT10_POS_KP_HI,
+    EE_L_EXT10_POS_KI_LO, EE_L_EXT10_POS_KI_HI,
+    EE_L_EXT10_POS_KD_LO, EE_L_EXT10_POS_KD_HI,
+    EE_R_EXT10_FOC_KP_LO, EE_R_EXT10_FOC_KP_HI,
+    EE_R_EXT10_FOC_KI_LO, EE_R_EXT10_FOC_KI_HI,
+    EE_R_EXT10_SPEED_KP_LO, EE_R_EXT10_SPEED_KP_HI,
+    EE_R_EXT10_SPEED_KI_LO, EE_R_EXT10_SPEED_KI_HI,
+    EE_R_EXT10_SPEED_KD_LO, EE_R_EXT10_SPEED_KD_HI,
+    EE_R_EXT10_POS_KP_LO, EE_R_EXT10_POS_KP_HI,
+    EE_R_EXT10_POS_KI_LO, EE_R_EXT10_POS_KI_HI,
+    EE_R_EXT10_POS_KD_LO, EE_R_EXT10_POS_KD_HI
 };
+_Static_assert(EE_CFG_KEY == 0, "EEPROM config key must stay at slot 0");
+_Static_assert(EE_L_GEAR_X64 == 47 && EE_R_GEAR_X64 == 48, "legacy MC slots 0..48 moved");
+_Static_assert(EE_L_EXT_CURRENT_MIN_CA == 123, "MC extension must start after App Config slot 122");
+_Static_assert(EE_L_STEER_CAL_MAGIC == 223 && EE_L_STEER_SPAN_INV_HI == 227, "steering calibration ABI moved");
+_Static_assert(EE_L_EXT10_FOC_KP_LO == 228, "exact PID shadow must append after steering calibration");
+_Static_assert((EE_R_EXT10_POS_KD_HI + 1) == NB_OF_VAR, "EEPROM enum tail and NB_OF_VAR mismatch");
 #define EE_L_STEER_CAL_MAGIC_VALUE 0xC360u
 #define EE_CFG_SIGNATURE_VALUE 0x6021u
 #define EE_CFG_SIGNATURE_V34   0x6020u /* before Detect-All R/L/flux persistence */
@@ -267,28 +292,28 @@ enum {
 
 extern uint16_t VirtAddVarTab[NB_OF_VAR];
 
-static bool ee_read_slot(uint8_t idx, uint16_t *v) {
+static bool ee_read_slot(uint16_t idx, uint16_t *v) {
     return idx < NB_OF_VAR && EE_ReadVariable(VirtAddVarTab[idx], v) == 0u;
 }
-static bool ee_write_slot(uint8_t idx, uint16_t v) {
+static bool ee_write_slot(uint16_t idx, uint16_t v) {
     return idx < NB_OF_VAR && EE_WriteVariable(VirtAddVarTab[idx], v) == HAL_OK;
 }
-static bool ee_write_u32_pair(uint8_t lo_slot, uint32_t value) {
+static bool ee_write_u32_pair(uint16_t lo_slot, uint32_t value) {
     return ee_write_slot(lo_slot, (uint16_t)(value & 0xffffu)) &&
-           ee_write_slot((uint8_t)(lo_slot + 1u), (uint16_t)(value >> 16));
+           ee_write_slot((uint16_t)(lo_slot + 1u), (uint16_t)(value >> 16));
 }
-static bool ee_read_u32_pair(uint8_t lo_slot, uint32_t *value) {
+static bool ee_read_u32_pair(uint16_t lo_slot, uint32_t *value) {
     uint16_t lo=0u, hi=0u;
-    if (!value || !ee_read_slot(lo_slot,&lo) || !ee_read_slot((uint8_t)(lo_slot+1u),&hi)) return false;
+    if (!value || !ee_read_slot(lo_slot,&lo) || !ee_read_slot((uint16_t)(lo_slot+1u),&hi)) return false;
     *value=(uint32_t)lo | ((uint32_t)hi<<16);
     return true;
 }
 
-static bool ee_write_float32_pair(uint8_t lo_slot, float value) {
+static bool ee_write_float32_pair(uint16_t lo_slot, float value) {
     union { float f; uint32_t u; } v; v.f=value;
     return ee_write_u32_pair(lo_slot,v.u);
 }
-static bool ee_read_float32_pair(uint8_t lo_slot, float *value) {
+static bool ee_read_float32_pair(uint16_t lo_slot, float *value) {
     union { float f; uint32_t u; } v;
     if(!value || !ee_read_u32_pair(lo_slot,&v.u))return false;
     *value=v.f; return true;
@@ -477,7 +502,6 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
 
 bool mc_interface_store_configuration_motor(bool second) {
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
-    mcpwm_foc_sync_tuning_to_conf(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
     const uint8_t ramp_slot = second ? EE_R_SPEED_RAMP10 : EE_L_SPEED_RAMP10;
@@ -679,7 +703,7 @@ bool mc_interface_store_configuration_motor(bool second) {
         const uint16_t counts_word=(counts==65536u)?0u:(uint16_t)counts;
         float off=m->m_conf.foc_encoder_offset; while(off>=360.0f)off-=360.0f; while(off<0.0f)off+=360.0f;
         uint32_t offx=(uint32_t)(off*100.0f+0.5f); if(offx>35999u)offx=35999u;
-        float ratio=m->m_conf.foc_encoder_ratio; if(!(ratio>=0.01f&&ratio<=1000.0f))ratio=(float)mcpwm_foc_get_pole_pairs(false);
+        float ratio=m->m_conf.foc_encoder_ratio; if(!(ratio>=0.01f&&ratio<=MCCONF_ENCODER_RATIO_MAX))ratio=(float)mcpwm_foc_get_pole_pairs(false);
         uint32_t rx=(uint32_t)(ratio*10000.0f+0.5f);
         ok &= ee_write_slot(EE_L_EXT6_ENCODER_FLAGS,flags);
         ok &= ee_write_slot(EE_L_EXT6_ENCODER_COUNTS,counts_word);
@@ -709,6 +733,26 @@ bool mc_interface_store_configuration_motor(bool second) {
             ok &= ee_write_float32_pair(EE_L_EXT7_ENCODER_RATIO_F32_LO,m->m_conf.foc_encoder_ratio);
         }
     }
+    {
+        const uint16_t exact_gain_slots[8] = {
+            second ? EE_R_EXT10_FOC_KP_LO : EE_L_EXT10_FOC_KP_LO,
+            second ? EE_R_EXT10_FOC_KI_LO : EE_L_EXT10_FOC_KI_LO,
+            second ? EE_R_EXT10_SPEED_KP_LO : EE_L_EXT10_SPEED_KP_LO,
+            second ? EE_R_EXT10_SPEED_KI_LO : EE_L_EXT10_SPEED_KI_LO,
+            second ? EE_R_EXT10_SPEED_KD_LO : EE_L_EXT10_SPEED_KD_LO,
+            second ? EE_R_EXT10_POS_KP_LO : EE_L_EXT10_POS_KP_LO,
+            second ? EE_R_EXT10_POS_KI_LO : EE_L_EXT10_POS_KI_LO,
+            second ? EE_R_EXT10_POS_KD_LO : EE_L_EXT10_POS_KD_LO
+        };
+        const float exact_gain_values[8] = {
+            m->m_conf.foc_current_kp, m->m_conf.foc_current_ki,
+            m->m_conf.s_pid_kp, m->m_conf.s_pid_ki, m->m_conf.s_pid_kd,
+            m->m_conf.p_pid_kp, m->m_conf.p_pid_ki, m->m_conf.p_pid_kd
+        };
+        for (uint8_t gi = 0u; gi < 8u; ++gi) {
+            ok &= ee_write_float32_pair(exact_gain_slots[gi], exact_gain_values[gi]);
+        }
+    }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
     ok &= ee_write_slot(second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE, EE_CFG_SIGNATURE_VALUE);
@@ -735,6 +779,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     const bool migrate_encoder = (sig != EE_CFG_SIGNATURE_VALUE);
     const bool migrate_hall_extra = (sig != EE_CFG_SIGNATURE_VALUE);
     const bool migrate_motor_model = (sig != EE_CFG_SIGNATURE_VALUE);
+    bool migrate_exact_pid = false;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
@@ -946,7 +991,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.foc_encoder_inverted=(flags&0x0200u)!=0u;
         m->m_conf.m_encoder_counts=(cw==0u)?65536:(int32_t)cw;
         m->m_conf.foc_encoder_offset=(offx<=35999u)?(float)offx/100.0f:0.0f;
-        m->m_conf.foc_encoder_ratio=(rx>=100u&&rx<=10000000u)?(float)rx/10000.0f:(float)mcpwm_foc_get_pole_pairs(false);
+        m->m_conf.foc_encoder_ratio=(rx>=100u&&rx<=100000000u)?(float)rx/10000.0f:(float)mcpwm_foc_get_pole_pairs(false);
     }else{
         m->m_conf.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
         m->m_conf.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
@@ -985,7 +1030,7 @@ bool mc_interface_load_configuration_motor(bool second) {
             float eo=0.0f, er=0.0f;
             if(!ee_read_float32_pair(EE_L_EXT7_ENCODER_OFFSET_F32_LO,&eo) ||
                !ee_read_float32_pair(EE_L_EXT7_ENCODER_RATIO_F32_LO,&er))return false;
-            if(!(eo>-100000.0f && eo<100000.0f) || !(er>=0.01f && er<=1000.0f))return false;
+            if(!(eo>-100000.0f && eo<100000.0f) || !(er>=0.01f && er<=MCCONF_ENCODER_RATIO_MAX))return false;
             while(eo>=360.0f)eo-=360.0f;
             while(eo<0.0f)eo+=360.0f;
             m->m_conf.foc_encoder_offset=eo;
@@ -1040,6 +1085,45 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_speed_release_rpm = (uint16_t)mech;
     }
     mcpwm_foc_sync_tuning_to_conf(second);
+    {
+        const uint16_t exact_gain_slots[8] = {
+            second ? EE_R_EXT10_FOC_KP_LO : EE_L_EXT10_FOC_KP_LO,
+            second ? EE_R_EXT10_FOC_KI_LO : EE_L_EXT10_FOC_KI_LO,
+            second ? EE_R_EXT10_SPEED_KP_LO : EE_L_EXT10_SPEED_KP_LO,
+            second ? EE_R_EXT10_SPEED_KI_LO : EE_L_EXT10_SPEED_KI_LO,
+            second ? EE_R_EXT10_SPEED_KD_LO : EE_L_EXT10_SPEED_KD_LO,
+            second ? EE_R_EXT10_POS_KP_LO : EE_L_EXT10_POS_KP_LO,
+            second ? EE_R_EXT10_POS_KI_LO : EE_L_EXT10_POS_KI_LO,
+            second ? EE_R_EXT10_POS_KD_LO : EE_L_EXT10_POS_KD_LO
+        };
+        float g[8] = {0};
+        bool exact_ok = true;
+        for (uint8_t gi = 0u; gi < 8u; ++gi) {
+            exact_ok = exact_ok && ee_read_float32_pair(exact_gain_slots[gi], &g[gi]);
+        }
+        /* Bounds match what the fixed-point runtime can actually represent.
+         * Comparisons also reject NaN without needing libm in this file. */
+        exact_ok = exact_ok &&
+            g[0] >= 0.0f && g[0] <= (65535.0f/1536.0f) &&
+            g[1] >= 0.0f && g[1] <= (65535.0f/4.608f) &&
+            g[2] >= 0.0f && g[2] <= (65535.0f/(float)MCCONF_SPEED_GAIN_SCALE) &&
+            g[3] >= 0.0f && g[3] <= (65535.0f/(float)MCCONF_SPEED_GAIN_SCALE) &&
+            g[4] >= 0.0f && g[4] <= (65535.0f/(float)MCCONF_SPEED_GAIN_SCALE) &&
+            g[5] >= 0.0f && g[5] <= 65.535f &&
+            g[6] >= 0.0f && g[6] <= 65.535f &&
+            g[7] >= 0.0f && g[7] <= 65.535f;
+        if (exact_ok) {
+            m->m_conf.foc_current_kp=g[0]; m->m_conf.foc_current_ki=g[1];
+            m->m_conf.s_pid_kp=g[2]; m->m_conf.s_pid_ki=g[3]; m->m_conf.s_pid_kd=g[4];
+            m->m_conf.p_pid_kp=g[5]; m->m_conf.p_pid_ki=g[6]; m->m_conf.p_pid_kd=g[7];
+            mcpwm_foc_apply_tuning_from_conf(second);
+        } else {
+            /* Old images with the same historical signature simply lack the
+             * shadow slots. Keep the quantized legacy gains for this boot and
+             * populate exact slots when migration rewrites the config below. */
+            migrate_exact_pid = true;
+        }
+    }
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
     m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);
     {
@@ -1166,7 +1250,7 @@ bool mc_interface_load_configuration_motor(bool second) {
     mcpwm_foc_refresh_hall_interpolation(second);
     mcpwm_foc_refresh_position_configuration(second);
     mcpwm_foc_refresh_encoder_configuration(second,true);
-    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp || migrate_encoder || migrate_hall_extra || migrate_motor_model) {
+    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp || migrate_encoder || migrate_hall_extra || migrate_motor_model || migrate_exact_pid) {
         /* Rewrite only after a complete successful load; signature is written last. */
         (void)mc_interface_store_configuration_motor(second);
     }

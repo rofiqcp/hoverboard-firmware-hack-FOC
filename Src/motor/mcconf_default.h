@@ -39,6 +39,7 @@
  * 1024 PPR quadrature = 4096 counts/rev. PB6/PB7 are shared with LEFT Hall V/W,
  * therefore Hall and ABI are mutually exclusive sensor-port modes. */
 #define MCCONF_ENCODER_COUNTS_DEFAULT             4096u
+#define MCCONF_ENCODER_RATIO_MAX                  10000.0f
 #define MCCONF_ENCODER_OFFSET_DEFAULT             0.0f
 #define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    0.50f /* adaptive Id alignment starts low */
 #define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       0.50f /* rise gradually until ABI motion is proven */

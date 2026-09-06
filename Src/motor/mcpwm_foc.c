@@ -552,7 +552,7 @@ static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool re
     m->m_encoder_counts=counts;
     m->m_encoder_count_to_phase_q16=(uint32_t)((1ULL<<32)/counts);
     float ratio=m->m_conf.foc_encoder_ratio;
-    if(!(ratio>=0.01f && ratio<=1000.0f)) ratio=(float)motor_pole_pairs(false);
+    if(!(ratio>=0.01f && ratio<=MCCONF_ENCODER_RATIO_MAX)) ratio=(float)motor_pole_pairs(false);
     m->m_encoder_ratio_q16=(uint32_t)(ratio*65536.0f+0.5f);
     const float ofs=encoder_norm_deg(m->m_conf.foc_encoder_offset);
     m->m_encoder_offset_phase=(uint16_t)(ofs*(65536.0f/360.0f)+0.5f);
@@ -868,7 +868,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     }
     if (next.m_encoder_counts<4 || next.m_encoder_counts>65536)
         next.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
-    if (!(next.foc_encoder_ratio>=0.01f && next.foc_encoder_ratio<=1000.0f))
+    if (!(next.foc_encoder_ratio>=0.01f && next.foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX))
         next.foc_encoder_ratio=(float)(next.si_motor_poles/2u);
     next.foc_encoder_offset=encoder_norm_deg(next.foc_encoder_offset);
     if (!(next.l_min_erpm < 0.0f)) next.l_min_erpm=MCCONF_L_MIN_ERPM;
@@ -1013,6 +1013,24 @@ void mcpwm_foc_sync_tuning_to_conf(bool second) {
     m->m_conf.s_pid_ki=(float)m->m_kis_q16/(float)MCCONF_SPEED_GAIN_SCALE;
     m->m_conf.s_pid_kd=(float)m->m_kds_q11/(float)MCCONF_SPEED_GAIN_SCALE;
     m->m_conf.p_pid_kp=(float)m->m_kpp_q11/1000.0f; m->m_conf.p_pid_ki=(float)m->m_kip_q16/1000.0f; m->m_conf.p_pid_kd=(float)m->m_kdp_q11/1000.0f;
+}
+
+void mcpwm_foc_apply_tuning_from_conf(bool second) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    int32_t kpc=(int32_t)(m->m_conf.foc_current_kp*1536.0f+0.5f);
+    int32_t kic=(int32_t)(m->m_conf.foc_current_ki*4.608f+0.5f);
+    kpc=CLAMP(kpc,0,65535); kic=CLAMP(kic,0,65535);
+    m->m_kpq_q11=m->m_kpd_q11=(uint16_t)kpc;
+    m->m_kiq_q16=m->m_kid_q16=(uint16_t)kic;
+    m->m_kps_q11=(uint16_t)CLAMP((int32_t)(m->m_conf.s_pid_kp*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
+    m->m_kis_q16=(uint16_t)CLAMP((int32_t)(m->m_conf.s_pid_ki*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
+    m->m_kds_q11=(uint16_t)CLAMP((int32_t)(m->m_conf.s_pid_kd*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
+    m->m_kpp_q11=(uint16_t)CLAMP((int32_t)(m->m_conf.p_pid_kp*1000.0f+0.5f),0,65535);
+    m->m_kip_q16=(uint16_t)CLAMP((int32_t)(m->m_conf.p_pid_ki*1000.0f+0.5f),0,65535);
+    m->m_kdp_q11=(uint16_t)CLAMP((int32_t)(m->m_conf.p_pid_kd*1000.0f+0.5f),0,65535);
+    current_pid_recompute_coeff(m);
+    speed_pid_recompute_coeff(m);
+    position_pid_recompute_coeff(m);
 }
 const volatile mc_configuration *mcpwm_foc_get_configuration(bool second) { return &mcpwm_foc_get_motor(second)->m_conf; }
 

@@ -394,6 +394,7 @@ mc_fault_code mcpwm_foc_get_fault_motor(bool is_second_motor);
 void mcpwm_foc_get_values(mc_values *values, bool is_second_motor);
 void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *values, bool is_second_motor);
 void mcpwm_foc_sync_tuning_to_conf(bool is_second_motor);
+void mcpwm_foc_apply_tuning_from_conf(bool is_second_motor);
 void mcpwm_foc_refresh_hall_interpolation(bool is_second_motor);
 void mcpwm_foc_refresh_encoder_configuration(bool is_second_motor, bool reinitialize);
 void mcpwm_foc_refresh_position_configuration(bool is_second_motor);
