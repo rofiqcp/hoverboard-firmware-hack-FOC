@@ -52,6 +52,7 @@
 #define HB_CUSTOM_STEERING_HOME             13u /* bounded LEFT ABI startup alignment + home */
 #define HB_CUSTOM_ENCODER_DEBUG             14u /* read-only LEFT ABI alignment/detect black box */
 #define HB_CUSTOM_STEERING_SET_CENTER        15u /* redefine current LEFT ABI position as logical POS180 */
+#define HB_CUSTOM_GET_ROTOR_SNAPSHOT          16u /* simultaneous VESC-standard rotor/position diagnostics */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -541,8 +542,7 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
          * axis, so its public VESC position is physical steering degrees rather
          * than the raw motor PID shaft coordinate. Keeping both streams on the
          * same source prevents a false rotor-position jump in VESC Tool. */
-        *out = (!second && mc_interface_steering_calibration_valid()) ?
-            steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
+        *out = !second ? steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
         if(m->m_pos_pid_phase_mode){
@@ -677,8 +677,7 @@ static void get_values_normalized(bool second, mc_values *v) {
         v->rpm=-v->rpm; v->iq=-v->iq; v->duty_now=-v->duty_now; v->vq=-v->vq;
         v->tachometer=-v->tachometer;
     }
-    v->position=(!second && mc_interface_steering_calibration_valid()) ?
-        steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
+    v->position=!second ? steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
     /* Hoverboard temperature calibration is deci-degC (358 = 35.8C). */
     v->temp_mos = (float)board_temp_deg_c * 0.1f;
     v->temp_mos_1 = v->temp_mos;
@@ -755,13 +754,13 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
         if(mask&(1u<<15)) b[i++]=v.fault;
         if(mask&(1u<<16)) {
             uint32_t pv2=DWT->CYCCNT;
-            /* Keep the F103 integer fast-path semantically identical to the
-             * generic VESC values path. LEFT is a calibrated steering axis,
-             * therefore position is signed physical wheel degrees (-30..+30),
-             * not raw motor/ABI shaft angle. Otherwise frequent GET_VALUES
-             * overwrites the correct steering-calibration feedback in ROS. */
-            const float pos = (!second && mc_interface_steering_calibration_valid()) ?
-                steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
+            /* LEFT public PID position is always the logical steering coordinate
+             * 0..360 (center=180), even before span calibration. This prevents
+             * fallback to the circular raw shaft angle and therefore prevents
+             * apparent 359->0 wrap spikes in VESC Tool/ROS. Encoder/Observer
+             * display modes remain circular by upstream VESC definition. */
+            const float pos = !second ? steering_vesc_position_deg() :
+                mc_interface_get_pid_pos_now_motor(second);
             buffer_append_float32(b, pos, 1e6f, &i);
             uint32_t pv3=DWT->CYCCNT;
             dt=(uint32_t)(pv3-pv2);
@@ -1988,6 +1987,51 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,mcpwm_foc_steering_safe_span_counts(),&j);
         buffer_append_int32(b,mcpwm_foc_get_position_user_counts(false),&j);
         uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_ROTOR_SNAPSHOT) {
+        /* The stock VESC Tool exposes one DISP_POS_MODE at a time. ROS/Web needs
+         * all engineering signals simultaneously, so return one compact snapshot
+         * while reusing display_rotor_pos() for the exact same semantics.
+         *
+         * Inductance is intentionally NOT synthesized: upstream VESC only sends
+         * mcpwm_get_detect_pos() while MC_STATE_DETECTING. This F103 target has no
+         * equivalent public detector-position getter, therefore bit6 stays clear
+         * and the field is N/A outside a future true detection signal. */
+        const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(second);
+        float encoder=0.0f, observer=0.0f, pid_pos=0.0f;
+        float obs_enc=0.0f, obs_hall=0.0f, pid_error=0.0f;
+        const bool encoder_valid=!second && m->m_encoder_configured;
+        const bool hall_valid=(m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL) && m->m_hall_initialized;
+        (void)display_rotor_pos(second,DISP_POS_MODE_OBSERVER,&observer);
+        (void)display_rotor_pos(second,DISP_POS_MODE_PID_POS,&pid_pos);
+        (void)display_rotor_pos(second,DISP_POS_MODE_PID_POS_ERROR,&pid_error);
+        if(encoder_valid){
+            (void)display_rotor_pos(second,DISP_POS_MODE_ENCODER,&encoder);
+            (void)display_rotor_pos(second,DISP_POS_MODE_ENCODER_OBSERVER_ERROR,&obs_enc);
+        }
+        if(hall_valid)(void)display_rotor_pos(second,DISP_POS_MODE_HALL_OBSERVER_ERROR,&obs_hall);
+        uint8_t flags=0u;
+        if(encoder_valid)flags|=0x01u; /* mechanical encoder */
+        flags|=0x02u;                 /* observer / active FOC phase */
+        flags|=0x04u;                 /* PID position */
+        if(encoder_valid)flags|=0x08u;/* observer - encoder */
+        if(hall_valid)flags|=0x10u;   /* observer - Hall */
+        flags|=0x20u;                 /* PID setpoint - position */
+        /* bit6 = inductance/detect signal valid; deliberately clear for now. */
+        uint8_t b[48]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        b[j++]=second?VESC_SECOND_MOTOR_ID:VESC_LOCAL_ID;
+        b[j++]=flags; b[j++]=(uint8_t)m->m_conf.foc_sensor_mode; b[j++]=(uint8_t)m->m_state;
+        buffer_append_int32(b,(int32_t)lroundf(encoder*100000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(observer*100000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(pid_pos*100000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(obs_enc*100000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(obs_hall*100000.0f),&j);
+        buffer_append_int32(b,(int32_t)lroundf(pid_error*100000.0f),&j);
+        buffer_append_int32(b,0,&j); /* inductance/detect signal: invalid unless bit6 is set */
+        uart_send_payload(b,(uint16_t)j);
+        return;
     }
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
         if(second)return;
