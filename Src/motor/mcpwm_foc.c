@@ -193,13 +193,13 @@ static int32_t erpm_to_mech_rpm_q16(float erpm, bool second) {
     return (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
 }
 
-/* RIGHT traction phase/Hall wiring makes increasing calibrated Hall angle
- * correspond to negative mechanical output rotation.  Keep raw Hall direction
- * for phase interpolation, but expose one mechanical sign to speed control,
- * tachometer and VESC telemetry. LEFT ABI steering does not use this path. */
+/* Internal Hall direction must remain in the motor-local FOC convention.
+ * User/VESC direction inversion belongs exclusively to mc_interface via
+ * m_invert_direction.  Flipping Hall here double-inverts RIGHT feedback and
+ * makes the speed PID run away (target -ERPM while feedback appears +ERPM). */
 static int8_t hall_motion_direction(bool second, int8_t raw_dir) {
-    if (raw_dir == 0) return 0;
-    return second ? (int8_t)-raw_dir : raw_dir;
+    (void)second;
+    return raw_dir;
 }
 
 static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
