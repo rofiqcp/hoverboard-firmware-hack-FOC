@@ -226,6 +226,7 @@ int main(void) {
     calcAvgSpeed();
     app_vesc_process(HAL_GetTick());
     mcpwm_foc_energy_update(HAL_GetTick());
+    mcpwm_foc_housekeeping_non_isr(HAL_GetTick());
 
     /* Legacy serial has its own enable/beep handshake. A live VESC binary link
      * is armed by valid VESC traffic and must never enter this blocking ~300-ms
@@ -299,8 +300,10 @@ int main(void) {
       feedback.rpmR = (int16_t)(-m_motor_2.m_rpm);
       feedback.dutyL_x1000 = m_motor_1.m_duty_now_permille;
       feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);
-      feedback.currentMotorL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_iq_q4);
-      feedback.currentMotorR_cA = focCurrentQ4ToCentiAmp(-((int32_t)m_motor_2.m_iq_q4));
+      /* VESC current_motor is signed |Idq|, not Iq. Direction inversion does
+       * not flip this field; its sign follows measured DC/input power flow. */
+      feedback.currentMotorL_cA = (int16_t)(mcpwm_foc_get_tot_current_motor(false) * 100.0f);
+      feedback.currentMotorR_cA = (int16_t)(mcpwm_foc_get_tot_current_motor(true) * 100.0f);
       feedback.currentInL_cA = left_dc_curr;
       feedback.currentInR_cA = right_dc_curr;
       feedback.idL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_id_q4);

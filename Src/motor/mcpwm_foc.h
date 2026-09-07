@@ -175,6 +175,8 @@ typedef struct {
     uint32_t m_encoder_prev_count;
     uint32_t m_encoder_counts;
     uint32_t m_encoder_count_to_phase_q16;
+    uint32_t m_encoder_mdeg_per_count_q12; /* precomputed 360000/counts, Q12 */
+    uint32_t m_encoder_mech_rpm_coeff_q3; /* precomputed 60*PWM*8/counts */
     uint32_t m_encoder_ratio_q16;
     uint16_t m_encoder_offset_phase;
     int32_t m_encoder_delta_accum;
@@ -188,6 +190,7 @@ typedef struct {
     /* Hall estimator and fixed point regulators. */
     uint8_t m_hall_state;              /* debounced Hall state used by FOC */
     uint8_t m_hall_raw_state;          /* instantaneous GPIO sample */
+    uint8_t m_hall_filtered_state;     /* VESC-style majority sample for detection */
     uint8_t m_hall_candidate_state;
     uint8_t m_hall_candidate_count;
     uint8_t m_hall_debounce_initialized;
@@ -233,7 +236,7 @@ typedef struct {
     uint8_t m_hall_last_reject_from;
     uint8_t m_hall_last_reject_to;
 
-    /* Detect-All R/L capture. Updated only on the motor's 5.333-kHz current
+    /* Detect-All R/L capture. Updated only on the motor's 2.667-kHz current
      * regulator slot. The main loop starts/stops and snapshots it with IRQs
      * masked, so no 64-bit accumulator can tear on Cortex-M3. */
     volatile uint8_t m_rl_capture_active;
@@ -271,6 +274,7 @@ typedef struct {
     uint32_t m_position_kd_proc_coeff_q16;
     uint16_t m_position_kd_proc_phase_coeff_q4;
     uint32_t m_position_gain_dec_mdeg; /* p_pid_gain_dec_angle/p_pid_ang_div */
+    uint32_t m_position_gain_dec_inv_q31; /* reciprocal for ISR gain scaling */
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
@@ -290,6 +294,7 @@ typedef struct {
     int32_t m_current_lpf_q16[2];
 
     uint32_t m_openloop_phase_acc_q32;
+    uint32_t m_openloop_step_per_rpm_q32; /* mechanical RPM -> electrical phase increment */
     int32_t m_openloop_speed_q16;
     uint16_t m_openloop_align_ticks;
     int8_t m_openloop_direction;
@@ -378,6 +383,7 @@ bool mcpwm_foc_vesc_override_active(bool is_second_motor);
 bool mcpwm_foc_vesc_command_live(bool is_second_motor);
 void mcpwm_foc_vesc_override_clear(bool is_second_motor);
 void mcpwm_foc_energy_update(uint32_t now_ms);
+void mcpwm_foc_housekeeping_non_isr(uint32_t now_ms);
 void mcpwm_foc_set_board_temperature_x10(int16_t temperature_x10);
 
 /* Integer API used by the bare-metal command layer. */
@@ -414,8 +420,11 @@ void mcpwm_foc_refresh_encoder_configuration(bool is_second_motor, bool reinitia
 void mcpwm_foc_refresh_position_configuration(bool is_second_motor);
 void mcpwm_foc_get_default_configuration(mc_configuration *conf, bool is_second_motor);
 /* VESC-compatible Hall FOC detection. Returns table[8] in 0..199 electrical-angle units. */
-bool mcpwm_foc_detect_hall(float current, bool is_second_motor, uint8_t table[8]);
-bool mcpwm_foc_hall_table_sane(const uint8_t table[8]);
+/* VESC mcpwm_foc_hall_detect method. F103 dual-motor extension keeps an
+ * explicit motor selector. Circular samples use the existing Q15 LUT to save
+ * flash; final angle uses upstream atan2/truncate semantics outside ADC ISR. */
+bool mcpwm_foc_hall_detect(float current, bool is_second_motor, uint8_t table[8]);
+uint8_t mcpwm_foc_hall_detect_angle200(int64_t sum_s, int64_t sum_c, uint16_t samples);
 
 typedef struct {
     uint32_t samples;

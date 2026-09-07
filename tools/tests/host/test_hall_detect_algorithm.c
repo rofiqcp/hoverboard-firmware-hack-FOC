@@ -113,7 +113,7 @@ int main(void){
                 left_raw_for_sector[sec]=permute_hall_bits(base[src],perms[pi]);
             }
             mcpwm_foc_init(); force_hall_fixture();
-            if(!mcpwm_foc_detect_hall(1.0f,false,testtab))return fail("permuted Hall/phase detector returned false");
+            if(!mcpwm_foc_hall_detect(1.0f,false,testtab))return fail("permuted Hall/phase detector returned false");
             if(validate(testtab,left_raw_for_sector,"permuted"))return 1;
             cases++;
         }
@@ -124,26 +124,21 @@ int main(void){
 
     mcpwm_foc_init(); force_hall_fixture();
     HAL_Delay(1u);
-    if(!mcpwm_foc_detect_hall(1.0f,false,tl))return fail("left detector returned false");
+    if(!mcpwm_foc_hall_detect(1.0f,false,tl))return fail("left detector returned false");
     if(validate(tl,left_raw_for_sector,"left"))return 1;
     { uint8_t t2[8],t3[8];
-      if(!mcpwm_foc_detect_hall(1.0f,false,t2) || !mcpwm_foc_detect_hall(1.0f,false,t3))return fail("left repeated detector false");
+      if(!mcpwm_foc_hall_detect(1.0f,false,t2) || !mcpwm_foc_hall_detect(1.0f,false,t3))return fail("left repeated detector false");
       if(memcmp(tl,t2,8)!=0 || memcmp(tl,t3,8)!=0)return fail("left 3x detector table repeatability"); }
-    if(!mcpwm_foc_detect_hall(1.0f,true,tr))return fail("right detector returned false");
+    if(!mcpwm_foc_hall_detect(1.0f,true,tr))return fail("right detector returned false");
     if(validate(tr,right_raw_for_sector,"right"))return 1;
     { uint8_t t2[8],t3[8];
-      if(!mcpwm_foc_detect_hall(1.0f,true,t2) || !mcpwm_foc_detect_hall(1.0f,true,t3))return fail("right repeated detector false");
+      if(!mcpwm_foc_hall_detect(1.0f,true,t2) || !mcpwm_foc_hall_detect(1.0f,true,t3))return fail("right repeated detector false");
       if(memcmp(tr,t2,8)!=0 || memcmp(tr,t3,8)!=0)return fail("right 3x detector table repeatability"); }
-    for(int i=0;i<8;i++){
-        if((uint8_t)m_motor_1.m_conf.foc_hall_table[i]!=tl[i])return fail("left active table not applied");
-        if((uint8_t)m_motor_2.m_conf.foc_hall_table[i]!=tr[i])return fail("right active table not applied");
-    }
-
-    /* Reset estimator state after the synthetic dual detector sweeps. During
-     * right detection the test ISR also services left, so without this reset
-     * left legitimately carries interpolation/rate-limit history. Re-apply the
-     * just-detected tables exactly as a clean boot/config load would. */
+    /* Upstream mcpwm_foc_hall_detect only returns the table. Applying/storing
+     * it belongs to conf_general/command handling. Apply explicitly here before
+     * exercising closed-loop Hall interpolation. */
     mc_configuration cl=m_motor_1.m_conf, cr=m_motor_2.m_conf;
+    for(int i=0;i<8;i++){cl.foc_hall_table[i]=(int8_t)tl[i];cr.foc_hall_table[i]=(int8_t)tr[i];}
     mcpwm_foc_init(); force_hall_fixture();
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);

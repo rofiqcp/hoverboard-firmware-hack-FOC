@@ -24,9 +24,9 @@ assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 # its own explicit current ramp and the rotating openloop updater must not run.
 assert 'm->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE' in mc
 phase_branch=mc[mc.index('if (m->m_control_mode==CONTROL_MODE_OPENLOOP)'):mc.index('/* Hall estimator needs')]
-assert 'openloop_update(m, second);' in phase_branch and 'openloop_current_ramp_update(m);' not in phase_branch
+assert 'openloop_update(m);' in phase_branch and 'openloop_current_ramp_update(m);' not in phase_branch
 assert 'Fixed phase/current is set directly by the VESC setter' in phase_branch
-assert 'for (uint8_t pass = 0u; pass < 6u; ++pass)' in mc and ('const bool reverse = (pass & 1u) != 0u' in mc or 'const bool reverse = pass >= 3u' in mc)
+assert mc.count('for (uint8_t pass = 0u; pass < 3u; ++pass)') >= 2 and 'deg = 360; deg >= 0' in mc
 assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++)' in halltest and 'isr<16u' in halltest
 
 # VESC ownership/bridge gating is per motor, not one shared any-motor flag.
@@ -47,13 +47,13 @@ assert 'post-6.00 fields' in fwfun and 'buffer_append_uint32' not in fwfun
 
 # VESC Tool Hall detect is a blocking-command contract implemented cooperatively on bare metal.
 # Detect returns [cmd + 8 table + result], stays UART-responsive, and does not apply/store MC config.
-det=vp[vp.index('static uint8_t hall_detect_angle200'):vp.index('static int32_t q4_to_milliamps_normalized')]
-assert 'hall_detect_begin' in det and 'hall_detect_periodic' in det and 'uint8_t reply[10]' in det
+det=vp[vp.index('static bool hall_detect_motor_locked'):vp.index('static int32_t q4_to_milliamps_normalized')]
+assert 'mcpwm_foc_hall_detect_command_start' in det and 'mcpwm_foc_hall_detect_process' in det and 'uint8_t reply[10]' in det
 assert 'reply[9]=success?0u:1u' in det and 'standalone detect is not a store' in det
 assert 'mc_interface_release_motor()' in det and 'mcpwm_foc_vesc_override_clear(second)' in det
-assert 'COMM_DETECT_APPLY_ALL_FOC' in vp and 'detect_all_periodic' in det and 'detect_all_commit' in det
+assert 'COMM_DETECT_APPLY_ALL_FOC' in vp and 'conf_general_detect_apply_all_foc_process' in det and 'detect_all_commit' in det
 assert 'mc_interface_store_configuration_motor(mi!=0u)' in det and 'uart_send_payload(reply,sizeof(reply))' in det
-assert 'detect_all_compute_rl' in det and 'DETECT_ALL_FLUX_SAMPLE' in det, 'Detect-All must identify motor model before transactional store'
+assert 'measure_r_l_imax_f103_finish' in det and 'DETECT_ALL_FLUX_SAMPLE' in det, 'Detect-All must identify motor model before transactional store'
 
 # Standard VESC Tool setPos is a signed degree x1e6 packet builder with no
 # client-side clamp; firmware normalizes its angular target. Project multi-turn

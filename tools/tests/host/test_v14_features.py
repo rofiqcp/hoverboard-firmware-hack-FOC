@@ -31,10 +31,10 @@ for token in ('v->current_motor, 1e2f','v->current_in, 1e2f','v->id, 1e2f','v->i
     assert token in vp, token
 # Hall table must be a live control input and detection must update it.
 assert 'm->m_conf.foc_hall_table' in mc and 'hall_table_angle' in mc
-assert 'bool mcpwm_foc_detect_hall' in mc
+assert 'bool mcpwm_foc_hall_detect' in mc
 assert 'mcpwm_foc_set_openloop_phase(current' in mc
-assert 'valid != 6u' in mc and 'table[0] = 255u; table[7] = 255u;' in mc
-assert 'c.foc_hall_table[i] = table[i]' in mc
+assert 'fails == 2u' in mc and 'mcpwm_foc_hall_detect_angle200' in mc
+assert 'detect_all_prepare_hall' in vp and 'foc_hall_table' in vp
 assert 'mc_interface_store_configuration_motor(second)' in vp
 # Dual-motor forwarding selects motor thread only; no virtual-right coordinate rewrite.
 assert 'Right power stage is physically mirrored' not in vp

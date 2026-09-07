@@ -1,6 +1,6 @@
 # STM32F103RCT6 VESC Bootloader and Upload Paths
 
-The F103 uses USART3 on PB10/PB11 at 2000000 baud for both normal VESC traffic and firmware updates. No BOOT0 or NRST wire is required after the resident bootloader has been installed once with ST-Link.
+The F103 uses USART3 on PB10/PB11 at 115200 baud for both normal VESC traffic and firmware updates. No BOOT0 or NRST wire is required after the resident bootloader has been installed once with ST-Link.
 
 ## Flash layout
 
@@ -38,13 +38,13 @@ pio run -e APP_USART_PC -t upload --upload-port /dev/ttyUSBX
 
 ### Through the STM32F411 gateway
 
-The F411 exposes F103 VESC packets through the localhost TCP proxy on port `65102`. With ROS/F411 bridge running:
+The F411 exposes F103 VESC packets through the highest-priority Python maintenance proxy on port `65101`. With ROS/F411 bridge running:
 
 ```bash
 pio run -e APP_F411 -t upload
 ```
 
-The same TCP endpoint can be selected in VESC Tool. The web operator console remains on `http://localhost:5000`.
+VESC Tool remains on the separate lower-priority TCP endpoint `65102`; firmware upload must use `65101`. The web operator console remains on `http://localhost:5000`.
 ## Recovery and safety guarantees
 
 During update the application releases both motors and clears both advanced-timer MOE bits before touching flash. The bootloader holds all six high-side gates low and all six active-low low-side gates high.

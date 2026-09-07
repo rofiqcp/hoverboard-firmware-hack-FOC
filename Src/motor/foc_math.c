@@ -28,17 +28,21 @@ int16_t foc_sat_s16(int32_t x) {
 
 
 void foc_sin_cos_q15(uint16_t phase, int16_t *s, int16_t *c) {
+    /* 256 intervals + duplicated 360-deg endpoint make idx+1 always safe.
+     * phase is Q0.16 turns: high byte selects the LUT interval and low byte
+     * linearly interpolates it. Cosine is exactly a +90-deg (= +64 index)
+     * shift, so its fractional byte is identical; avoid a second 16-bit phase
+     * add/split in the ISR hot path. No float, division, modulo, sinf or cosf. */
     const uint8_t idx = (uint8_t)(phase >> 8);
     const uint8_t frac = (uint8_t)phase;
     int32_t y0 = s_sin_q15[idx];
     int32_t y1 = s_sin_q15[(uint16_t)idx + 1u];
     *s = (int16_t)(y0 + (((y1 - y0) * frac) >> 8));
-    uint16_t cp = (uint16_t)(phase + 16384u);
-    const uint8_t cidx = (uint8_t)(cp >> 8);
-    const uint8_t cfrac = (uint8_t)cp;
+
+    const uint8_t cidx = (uint8_t)(idx + 64u);
     y0 = s_sin_q15[cidx];
     y1 = s_sin_q15[(uint16_t)cidx + 1u];
-    *c = (int16_t)(y0 + (((y1 - y0) * cfrac) >> 8));
+    *c = (int16_t)(y0 + (((y1 - y0) * frac) >> 8));
 }
 
 void foc_clarke_ab_q4(int16_t ia_q4, int16_t ib_q4, foc_ab_t *out) {

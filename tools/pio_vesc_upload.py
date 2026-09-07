@@ -1,9 +1,88 @@
 #!/usr/bin/env python3
-import argparse, os, signal, socket, struct, subprocess, sys, time
+import argparse, fcntl, os, signal, socket, struct, subprocess, sys, time
 from pathlib import Path
 
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 MAX_FW=120*1024-6
+
+ROS_PROCESS_MARKERS = (
+    "/opt/ros/",
+    "/home/otomasi/ros/install/",
+    "ros2 launch ",
+    "ros2 run ",
+)
+
+def _protected_pids():
+    protected={os.getpid()}
+    pid=os.getppid()
+    while pid>1 and pid not in protected:
+        protected.add(pid)
+        try:
+            raw=Path(f'/proc/{pid}/stat').read_text().split()
+            pid=int(raw[3])
+        except Exception:
+            break
+    return protected
+
+def _cmdline(pid):
+    try:
+        return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace').strip()
+    except Exception:
+        return ''
+
+def stop_ros_processes():
+    protected=_protected_pids(); victims=[]
+    for ent in Path('/proc').iterdir():
+        if not ent.name.isdigit(): continue
+        pid=int(ent.name)
+        if pid in protected: continue
+        cmd=_cmdline(pid)
+        if cmd and any(m in cmd for m in ROS_PROCESS_MARKERS):
+            victims.append((pid,cmd))
+    if not victims:
+        print('[UPLOAD] ROS stack already stopped', flush=True); return
+    pids=[pid for pid,_ in victims]
+    print(f'[UPLOAD] stopping ROS processes: {pids}', flush=True)
+    for pid in pids:
+        try: os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError): pass
+    deadline=time.monotonic()+4.0
+    while time.monotonic()<deadline:
+        alive=[pid for pid in pids if Path(f'/proc/{pid}').exists()]
+        if not alive: return
+        time.sleep(.10)
+    alive=[pid for pid in pids if Path(f'/proc/{pid}').exists()]
+    if alive:
+        print(f'[UPLOAD] force-stopping remaining ROS processes: {alive}', flush=True)
+    for pid in alive:
+        try: os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError): pass
+    time.sleep(.20)
+
+class RestartUploadSession(RuntimeError):
+    pass
+
+class UploadProcessLock:
+    def __init__(self, key: str):
+        safe=''.join(c if c.isalnum() else '_' for c in key)[:96]
+        self.path=Path('/tmp')/f'pio_vesc_upload_{safe}.lock'
+        self.fd=None
+    def __enter__(self):
+        self.fd=os.open(self.path, os.O_CREAT|os.O_RDWR, 0o660)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                os.lseek(self.fd,0,os.SEEK_SET); owner=os.read(self.fd,128).decode(errors='replace').strip()
+            except Exception:
+                owner=''
+            raise RuntimeError(f'another firmware uploader is already active{f" ({owner})" if owner else ""}')
+        os.ftruncate(self.fd,0); os.write(self.fd, f'pid={os.getpid()} started={time.time():.3f}'.encode()); os.fsync(self.fd)
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if self.fd is not None:
+            try: fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally: os.close(self.fd); self.fd=None
 
 def crc16(data: bytes)->int:
     crc=0
@@ -20,7 +99,7 @@ def frame(payload: bytes)->bytes:
 
 class Link:
     def __init__(self,args):
-        self.args=args; self.sock=None; self.ser=None; self.buf=bytearray(); self.linebuf=bytearray(); self.f411_direct=False
+        self.args=args; self.sock=None; self.ser=None; self.buf=bytearray(); self.linebuf=bytearray(); self.f411_direct=False; self.last_maintenance_refresh=0.0
         self.open()
 
     def _holders(self, port):
@@ -59,7 +138,7 @@ class Link:
     def _stop_official_bridge(self, official):
         if not official: return
         pids=[pid for pid,_ in official]
-        print(f'[F411] TCP unavailable/unhealthy; stopping stmf4_hmi_bridge pid={pids} for direct CDC upload',flush=True)
+        print(f'[F411] stopping CDC holder pid={pids} for direct USB upload',flush=True)
         for pid in pids:
             try: os.kill(pid, signal.SIGTERM)
             except ProcessLookupError: pass
@@ -75,7 +154,7 @@ class Link:
         while time.monotonic()<deadline:
             if not any(x[0] in pids for x in self._holders(self.args.serial_port)): return
             time.sleep(.10)
-        raise RuntimeError(f'F411 CDC still held after stopping stmf4_hmi_bridge pid={pids}')
+        raise RuntimeError(f'F411 CDC still held after stopping pid={pids}')
 
     def reconnect_tcp(self):
         if self.sock:
@@ -105,42 +184,48 @@ class Link:
             if expect in line: return line
         raise TimeoutError(f'F411 command timeout: {text}')
 
+    def _refresh_f411_maintenance(self, force=False):
+        if not self.f411_direct or self.ser is None:
+            return
+        now=time.monotonic()
+        if not force and now-self.last_maintenance_refresh < 2.0:
+            return
+        # Refresh only between complete VESC request/reply transactions. Older
+        # F411 gateway builds used a short maintenance lease. Re-entering the
+        # same mode is idempotent and keeps direct USB firmware uploads alive.
+        line=self._f411_command('VESC:MODE:MAINTENANCE','VESC:MODE:MAINTENANCE',2.0)
+        if line.strip() != 'VESC:MODE:MAINTENANCE':
+            raise RuntimeError(f'F411 maintenance handshake invalid: {line!r}')
+        self.last_maintenance_refresh=time.monotonic()
+        if force:
+            status=self._f411_command('VESC:STATUS','mode=MAINTENANCE',2.0)
+            if 'VESC:STAT:' not in status or 'mode=MAINTENANCE' not in status:
+                raise RuntimeError(f'F411 maintenance status invalid: {status!r}')
+
     def _open_f411_direct(self):
         import serial
         self.ser=serial.Serial(self.args.serial_port,1000000,timeout=.05,write_timeout=2,exclusive=True)
         self.f411_direct=True; self.ser.reset_input_buffer(); self.ser.reset_output_buffer(); self.linebuf.clear()
         self.ser.write(b'\n'); self.ser.flush(); time.sleep(.03); self.ser.reset_input_buffer()
-        line=self._f411_command('VESC:MODE:MAINTENANCE','VESC:MODE:MAINTENANCE',3.0)
-        print(f'[F411] direct CDC {line}',flush=True)
-        self._f411_command('VESC:STATUS','mode=MAINTENANCE',2.0)
+        self._refresh_f411_maintenance(force=True)
+        print('[F411] direct CDC maintenance confirmed',flush=True)
         # F411 changes UART ownership synchronously, but allow its CDC/status
         # output and UART RX flush to settle before the first binary packet.
-        time.sleep(.30)
+        time.sleep(.20)
 
     def open(self):
         if self.args.transport=='tcp':
             self._open_tcp(); return
         if self.args.transport=='f411':
+            # APP_F411 is intentionally USB-only. Firmware upload must not depend
+            # on ROS, TCP port 65101/65102, or vesc_tool_bridge being alive.
+            stop_ros_processes()
             holders=self._holders(self.args.serial_port)
-            official=[(pid,cmd) for pid,cmd in holders if 'stmf4_hmi_bridge' in cmd]
-            other=[(pid,cmd) for pid,cmd in holders if 'stmf4_hmi_bridge' not in cmd]
-            if other:
-                pid,cmd=other[0]; raise RuntimeError(f'F411 CDC busy by non-gateway pid={pid}: {cmd[:160]}')
-            if official:
-                print(f'[F411] CDC owned by stmf4_hmi_bridge pid={official[0][0]}; probing TCP {self.args.host}:{self.args.port}',flush=True)
-                try:
-                    self._open_tcp(attempts=2)
-                    if self._tcp_probe(.8):
-                        print('[F411] TCP maintenance path healthy; using TCP',flush=True)
-                        return
-                    print('[F411] TCP connected but VESC probe failed; falling back to direct CDC',flush=True)
-                except Exception as e:
-                    print(f'[F411] TCP path unavailable: {e}; falling back to direct CDC',flush=True)
-                if self.sock:
-                    try:self.sock.close()
-                    except Exception:pass
-                    self.sock=None; self.buf.clear()
-                self._stop_official_bridge(official)
+            if holders:
+                pids=[pid for pid,_ in holders]
+                print(f'[F411] releasing CDC holders pid={pids}',flush=True)
+                self._stop_official_bridge(holders)
+            print(f'[F411] using direct USB CDC only: {self.args.serial_port} @ 1000000',flush=True)
             self._open_f411_direct(); return
         import serial
         self.ser=serial.Serial(self.args.serial_port,self.args.baud,timeout=.1,write_timeout=2)
@@ -160,6 +245,7 @@ class Link:
         if self.sock:
             self.sock.sendall(b); return
         if self.f411_direct:
+            self._refresh_f411_maintenance()
             for off in range(0,len(b),48):
                 chunk=b[off:off+48]
                 self.ser.write(b'VESC:TX:M:'+chunk.hex().upper().encode()+b'\n'); self.ser.flush(); time.sleep(.002)
@@ -231,7 +317,7 @@ def wait_for_bootloader(link, initial_hw: str) -> str:
     # The application writes only a dual-word SRAM boot request and resets.
     # No flash write and no motor command is issued; recovery starts fail-safe.
     link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
-    deadline=time.monotonic()+10.0
+    deadline=time.monotonic()+20.0
     last=''
     while time.monotonic()<deadline:
         time.sleep(.25)
@@ -245,70 +331,139 @@ def wait_for_bootloader(link, initial_hw: str) -> str:
     raise RuntimeError(f'bootloader did not appear; last={last!r}')
 
 
-def upload(link,fw:bytes):
-    if not fw or len(fw)>MAX_FW: raise RuntimeError(f'firmware size {len(fw)} exceeds {MAX_FW}')
-    hw=None; last_error=None
-    for attempt in range(1,7):
+def _recover_bootloader_transport(link, reason: str):
+    print(f'[VESC] transport recovery: {reason}', flush=True)
+    last_error=None
+    for attempt in range(1,5):
         try:
-            hw=fw_version(link,4); break
+            if link.sock is not None or link.args.transport in ('tcp','f411'):
+                if link.sock is not None:
+                    link.reconnect_tcp()
+                elif link.args.transport=='tcp':
+                    link._open_tcp(attempts=4)
+            hw=fw_version(link,3.0)
+            if 'bootloader' in hw.lower():
+                print(f'[VESC] recovery probe bootloader ready: {hw}', flush=True)
+                return
+            wait_for_bootloader(link,hw)
+            raise RestartUploadSession('target application restarted; staging session must restart from erase')
+        except RestartUploadSession:
+            raise
         except Exception as e:
             last_error=e
-            if link.sock is not None and link.args.transport=='tcp':
-                try:
-                    link.reconnect_tcp()
-                    print(f'[VESC] reconnect initial probe attempt={attempt+1}',flush=True)
-                except Exception as re:
-                    last_error=re
-            else:
-                print(f'[VESC] retry initial probe attempt={attempt+1}',flush=True)
-                time.sleep(.20)
-            continue
-    if hw is None: raise RuntimeError(f'initial firmware probe failed: {last_error}')
-    wait_for_bootloader(link,hw)
-    p=link.transact(bytes((COMM_ERASE_NEW_APP,))+struct.pack('>I',len(fw)),COMM_ERASE_NEW_APP,8)
+            time.sleep(.20*attempt)
+    raise RuntimeError(f'transport recovery failed: {last_error}')
+
+
+def _stage_once(link,fw:bytes,session:int):
+    p=link.transact(bytes((COMM_ERASE_NEW_APP,))+struct.pack('>I',len(fw)),COMM_ERASE_NEW_APP,10)
     if len(p)<2 or p[1]!=1: raise RuntimeError('erase staging rejected')
     staged=struct.pack('>IH',len(fw),crc16(fw))+fw
-    step=192  # request payload stays <=255 bytes -> simple short VESC frame
+    # The F411 path crosses TCP -> ROS -> USB CDC -> 115200 UART. Smaller
+    # packets reduce worst-case blocking and USB/UART burst pressure while the
+    # bootloader's idempotent writes make retries safe.
+    step=128 if link.args.transport=='f411' else 192
     for off in range(0,len(staged),step):
         chunk=staged[off:off+step]
         request=bytes((COMM_WRITE_NEW_APP_DATA,))+struct.pack('>I',off)+chunk
         last_error=None
-        for attempt in range(1,6):
+        for attempt in range(1,5):
             try:
-                p=link.transact(request,COMM_WRITE_NEW_APP_DATA,5)
+                p=link.transact(request,COMM_WRITE_NEW_APP_DATA,2.5)
                 if len(p)>=6 and p[1]==1 and struct.unpack('>I',p[2:6])[0]==off:
                     last_error=None; break
                 last_error=RuntimeError(f'bad write ACK at {off}: {p.hex()}')
             except Exception as e:
                 last_error=e
-            if attempt<5:
-                print(f'[VESC] retry offset={off} attempt={attempt+1}', flush=True)
-                time.sleep(.10)
-        if last_error is not None: raise RuntimeError(f'write failed at {off}: {last_error}')
+                if link.f411_direct and 'OWNER:RUNTIME' in str(e):
+                    try:
+                        link._refresh_f411_maintenance(force=True)
+                        print(f'[F411] maintenance ownership restored at offset={off}', flush=True)
+                    except Exception as me:
+                        last_error=RuntimeError(f'{e}; maintenance restore failed: {me}')
+            if attempt<4:
+                print(f'[VESC] retry offset={off} attempt={attempt+1} reason={last_error}', flush=True)
+                # One immediate idempotent retry handles a lost ACK. If two
+                # attempts fail on TCP, rebuild the socket/maintenance route.
+                if attempt==2 and link.sock is not None:
+                    _recover_bootloader_transport(link,f'offset={off}')
+                time.sleep(.08*attempt)
+        if last_error is not None:
+            raise RuntimeError(f'write failed at {off}: {last_error}')
         if off==0 or off+len(chunk)>=len(staged) or off%(step*40)==0:
-            print(f'[VESC] write {min(off+len(chunk),len(staged))}/{len(staged)}', flush=True)
-        time.sleep(.002)
+            print(f'[VESC] session={session} write {min(off+len(chunk),len(staged))}/{len(staged)}', flush=True)
+        time.sleep(.001)
+
+
+def upload(link,fw:bytes):
+    if not fw or len(fw)>MAX_FW: raise RuntimeError(f'firmware size {len(fw)} exceeds {MAX_FW}')
+    hw=None; last_error=None
+    # An interrupted resident-bootloader staging/copy can leave the F103 busy for
+    # tens of seconds before the application services USART3 again. Keep the
+    # F411 maintenance ownership alive and probe gently instead of failing after
+    # a fixed handful of long transactions.
+    probe_deadline=time.monotonic()+75.0
+    attempt=0
+    while time.monotonic()<probe_deadline:
+        attempt += 1
+        try:
+            hw=fw_version(link,1.2)
+            break
+        except Exception as e:
+            last_error=e
+            if link.sock is not None and link.args.transport=='tcp':
+                try:
+                    link.reconnect_tcp()
+                except Exception as re:
+                    last_error=re
+            if attempt==1 or attempt%4==0:
+                remain=max(0,int(probe_deadline-time.monotonic()))
+                print(f'[VESC] waiting for F103 response attempt={attempt} remaining={remain}s',flush=True)
+            time.sleep(.15)
+    if hw is None: raise RuntimeError(f'initial firmware probe failed after recovery window: {last_error}')
+    wait_for_bootloader(link,hw)
+
+    stage_error=None
+    for session in range(1,4):
+        try:
+            _stage_once(link,fw,session)
+            stage_error=None
+            break
+        except RestartUploadSession as e:
+            stage_error=e
+        except Exception as e:
+            stage_error=e
+        if session>=3: break
+        print(f'[VESC] staging session {session} failed: {stage_error}; restarting from erase', flush=True)
+        _recover_bootloader_transport(link,f'restart staging session {session+1}')
+    if stage_error is not None:
+        raise RuntimeError(f'staging failed after recovery attempts: {stage_error}')
+
     link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
     print('[VESC] staged CRC complete; bootloader copy requested', flush=True)
-    # A pre-reset FW_VERSION frame can still be buffered by the F411/USB path.
-    # Never declare update success from one response: require two fresh,
-    # consecutive application probes after the bootloader copy/reset.
     link.buf.clear()
     if hasattr(link, 'linebuf'): link.linebuf.clear()
     deadline=time.monotonic()+45
-    last=''; stable_app_probes=0
+    last=''; stable_app_probes=0; probe_failures=0
     while time.monotonic()<deadline:
         time.sleep(.4)
         try:
-            last=fw_version(link,1.2)
+            last=fw_version(link,1.5)
+            probe_failures=0
             if last and 'bootloader' not in last.lower():
                 stable_app_probes += 1
                 if stable_app_probes >= 2:
                     print(f'[VESC] application returned stable: {last}', flush=True); return
             else:
                 stable_app_probes = 0
-        except Exception:
-            stable_app_probes = 0
+        except Exception as e:
+            stable_app_probes = 0; probe_failures += 1
+            if probe_failures>=3 and link.sock is not None:
+                try:
+                    link.reconnect_tcp(); probe_failures=0
+                    print(f'[VESC] reconnect while waiting for updated application: {e}', flush=True)
+                except Exception:
+                    pass
     raise RuntimeError(f'application did not return stably after update; last={last!r}')
 
 def selftest():
@@ -321,15 +476,18 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--transport',choices=['serial','tcp','f411'])
     ap.add_argument('--serial-port'); ap.add_argument('--baud',type=int,default=1000000)
-    ap.add_argument('--host',default='127.0.0.1'); ap.add_argument('--port',type=int,default=65102)
+    ap.add_argument('--host',default='127.0.0.1'); ap.add_argument('--port',type=int,default=65101)
     ap.add_argument('--firmware'); ap.add_argument('--selftest',action='store_true')
     a=ap.parse_args()
     if a.selftest: selftest(); return
     if not a.transport or not a.firmware: ap.error('--transport and --firmware required')
     if a.transport in ('serial','f411') and not a.serial_port: ap.error('--serial-port required')
-    fw=Path(a.firmware).read_bytes(); link=Link(a)
-    try: upload(link,fw)
-    finally: link.close()
+    fw=Path(a.firmware).read_bytes()
+    lock_key=f'{a.transport}_{a.host}_{a.port}_{a.serial_port or "none"}'
+    with UploadProcessLock(lock_key):
+        link=Link(a)
+        try: upload(link,fw)
+        finally: link.close()
 if __name__=='__main__':
     try: main()
     except Exception as e:

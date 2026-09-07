@@ -492,8 +492,9 @@ int main(void){
     }
 
     /* Batas safety VESC 6.00 harus benar-benar memengaruhi runtime, bukan
-     * sekadar terserialisasi di MC Config. Uji watt motoring/regen pada 40 V
-     * dan duty 0,5, lalu uji derating/fault temperatur dan Vin. */
+     * sekadar terserialisasi di MC Config. Upstream FOC membatasi Iq melalui
+     * Ibus ~= mod_q*Iq, jadi uji watt motoring/regen pada 40 V dan mod_q=0,5,
+     * lalu uji derating/fault temperatur dan Vin. */
     {
         mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
         mc_configuration saf=m_motor_1.m_conf;
@@ -509,19 +510,19 @@ int main(void){
         mcpwm_foc_vesc_override_touch(false);
         batVoltage=(int16_t)((4000L*BAT_CALIB_ADC)/BAT_CALIB_REAL_VOLTAGE); /* 40,00 V */
         m_motor_1.m_control_mode=CONTROL_MODE_CURRENT;
-        m_motor_1.m_duty_now_permille=500;
+        m_motor_1.m_vq=MCCONF_FOC_VOLTAGE_MAX/2; /* mod_q = +0.5 */
         m_motor_1.m_iq_target_q4=10*FOC_CURRENT_Q4_PER_A;
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         mcpwm_foc_set_board_temperature_x10(250);
         for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
-        if(m_motor_1.m_iq_set_q4>5*FOC_CURRENT_Q4_PER_A+4)return fail("VESC watt max 100W @40V duty0.5");
-        m_motor_1.m_duty_now_permille=500;
+        if(m_motor_1.m_iq_set_q4>5*FOC_CURRENT_Q4_PER_A+4)return fail("VESC watt max 100W @40V mod_q0.5");
+        m_motor_1.m_vq=MCCONF_FOC_VOLTAGE_MAX/2; /* positive voltage, negative Iq = regen */
         m_motor_1.m_iq_target_q4=-10*FOC_CURRENT_Q4_PER_A;
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
-        if(m_motor_1.m_iq_set_q4<-(4*FOC_CURRENT_Q4_PER_A+4))return fail("VESC watt min -80W @40V duty0.5");
+        if(m_motor_1.m_iq_set_q4<-(4*FOC_CURRENT_Q4_PER_A+4))return fail("VESC watt min -80W @40V mod_q0.5");
 
         /* Pada 62,5 C (tengah 60..65 C) batas arus harus sekitar 50%. */
         m_motor_1.m_duty_now_permille=0;

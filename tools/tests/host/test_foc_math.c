@@ -1,12 +1,26 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "config.h"
 #include "motor/foc_math.h"
 static int fail(const char *m){fprintf(stderr,"FAIL %s\n",m);return 1;}
 
 int main(void){
-  int16_t s=0,c=0; foc_sin_cos_q15(0,&s,&c); if(abs(s)>2||c<32760)return fail("sin0");
+  int16_t s=0,c=0; foc_sin_cos_q15(0,&s,&c); if(s!=0||c!=32767)return fail("sin/cos cardinal 0");
+  foc_sin_cos_q15(16384u,&s,&c); if(s!=32767||c!=0)return fail("sin/cos cardinal 90");
+  foc_sin_cos_q15(32768u,&s,&c); if(s!=0||c!=-32767)return fail("sin/cos cardinal 180");
+  foc_sin_cos_q15(49152u,&s,&c); if(s!=-32767||c!=0)return fail("sin/cos cardinal 270");
+  int max_trig_err=0;
+  for(uint32_t ph=0;ph<65536u;ph++){
+    foc_sin_cos_q15((uint16_t)ph,&s,&c);
+    const double a=6.28318530717958647692*(double)ph/65536.0;
+    const int sr=(int)lround(sin(a)*32767.0), cr=(int)lround(cos(a)*32767.0);
+    const int es=abs((int)s-sr), ec=abs((int)c-cr);
+    if(es>max_trig_err)max_trig_err=es;
+    if(ec>max_trig_err)max_trig_err=ec;
+    if(es>4||ec>4)return fail("sin/cos LUT interpolation error");
+  }
   foc_ab_t ab={1200,-700},ab2={0,0}; foc_dq_t dq={0,0};
   foc_park_q4(&ab,10000,&dq); foc_inv_park(&dq,10000,&ab2);
   if(abs(ab.alpha-ab2.alpha)>3||abs(ab.beta-ab2.beta)>3)return fail("park roundtrip");
@@ -40,6 +54,6 @@ int main(void){
   if(FOC_SVPWM_VECTOR_MAX!=(FOC_SVPWM_VECTOR_FULL_SAFE*VESC_DUTY_PHYSICAL_SCALE_PERMILLE)/1000)
     return fail("config duty scale arithmetic");
   if(scaled_abs<850||scaled_abs>856)return fail("0.960 physical duty scale PWM range");
-  printf("FOC_FIXEDPOINT_RUNTIME_PASS pwm=%d,%d,%d eferu_max_abs=%d scaled960_abs=%d span=%d\n",pwm.a,pwm.b,pwm.c,max_abs,scaled_abs,max_span);
+  printf("FOC_FIXEDPOINT_RUNTIME_PASS lut_max_err=%d pwm=%d,%d,%d eferu_max_abs=%d scaled960_abs=%d span=%d\n",max_trig_err,pwm.a,pwm.b,pwm.c,max_abs,scaled_abs,max_span);
   return 0;
 }

@@ -176,6 +176,8 @@ typedef struct {
     uint32_t align_start_time;
     uint32_t next_time;
     float current_a;
+    uint8_t restore_backup;
+    mc_configuration backup;
     int64_t sum_s[8];
     int64_t sum_c[8];
     uint16_t samples[8];
@@ -211,11 +213,11 @@ typedef struct {
     float current_high;
     float flux_current;
     float flux_target_erpm;
-    double sum_i;
-    double sum_v;
-    double sum_i_raw;
-    double sum_v_raw;
-    double sum_erpm;
+    float sum_i;
+    float sum_v;
+    float sum_i_raw;
+    float sum_v_raw;
+    float sum_erpm;
     mc_configuration backup[2];
     mc_configuration result[2];
     float r[2], l[2], ld_lq[2], flux[2], imax[2];
@@ -230,14 +232,21 @@ typedef struct {
     uint8_t steering_homed_backup;
     uint8_t left_sensor_encoder;
     uint8_t steering_span_pending;
+    /* 0 = Detect-All. Otherwise this same cooperative motor-model worker is
+     * serving a stock VESC measurement command (25/26/57) for one endpoint. */
+    uint8_t standalone_cmd;
+    uint8_t standalone_second;
+    float standalone_flux_current;
+    float standalone_flux_ramp_erpm_s;
 } detect_all_job_t;
 
 static detect_all_job_t s_detect_all;
 static int16_t s_detect_all_last_detail = 0;
 static uint32_t detect_time_now(void);
 static bool detect_time_due(uint32_t now, uint32_t deadline);
-static void hall_detect_periodic(uint32_t now_ms);
-static void detect_all_periodic(uint32_t now_ms);
+static void mcpwm_foc_hall_detect_process(uint32_t now_ms);
+static void conf_general_detect_apply_all_foc_process(uint32_t now_ms);
+static void measure_r_l_imax_f103_start(uint8_t mi, uint32_t now_time);
 static void reply_mcconf(bool second, COMM_PACKET_ID id);
 /* VESC Tool rotor-position display stream. Upstream commands.c stores one
  * display_position_mode per VESC instance; this dual virtual target stores the
@@ -589,8 +598,8 @@ void vesc_protocol_periodic(uint32_t now_ms) {
         s_rx_timeout_reset++;
     }
     const uint32_t detector_now = detect_time_now();
-    hall_detect_periodic(detector_now);
-    detect_all_periodic(detector_now);
+    mcpwm_foc_hall_detect_process(detector_now);
+    conf_general_detect_apply_all_foc_process(detector_now);
     if (s_openloop_test_active) {
         const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(s_openloop_test_second != 0u);
         const bool expired = detect_time_due(detector_now, s_openloop_test_deadline);
@@ -1270,25 +1279,11 @@ static bool detect_time_due(uint32_t now, uint32_t deadline) {
     return (int32_t)(now - deadline) >= 0;
 }
 
-static uint8_t hall_detect_angle200(int64_t sum_s, int64_t sum_c, uint16_t n) {
-    if (n <= 30u) return 255u;
-    int64_t best_dot = INT64_MIN;
-    uint8_t best = 255u;
-    for (uint16_t a = 0u; a < 200u; ++a) {
-        int16_t sn, cs;
-        const uint16_t ph = (uint16_t)(((uint32_t)a * 65536u) / 200u);
-        foc_sin_cos_q15(ph, &sn, &cs);
-        const int64_t dot = sum_s * sn + sum_c * cs;
-        if (dot > best_dot) { best_dot = dot; best = (uint8_t)a; }
-    }
-    return best;
-}
-
 static bool hall_detect_motor_locked(bool second) {
     return s_hall_detect.active && (s_hall_detect.second != 0u) == second;
 }
 
-static void hall_detect_start_current(bool second, float current) {
+static void mcpwm_foc_hall_detect_start(bool second, float current) {
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
     float max_i = m->m_conf.l_current_max;
     if (max_i <= 0.0f || max_i > (float)I_MOT_MAX) max_i = (float)I_MOT_MAX;
@@ -1444,7 +1439,138 @@ static void detect_all_finish(int16_t result) {
     detect_all_reply(result);
 }
 
-static void detect_all_start_rl(uint8_t mi, uint32_t now_time) {
+static void standalone_measure_finish(bool success) {
+    const bool second=s_detect_all.standalone_second!=0u;
+    const uint8_t cmd=s_detect_all.standalone_cmd;
+    mcpwm_foc_rl_capture_stop(second);
+    mc_interface_select_motor_thread(second?2:1);
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(second);
+    mc_configuration restore=s_detect_all.backup[second?1u:0u];
+    mc_interface_set_configuration(&restore);
+    mc_interface_select_motor_thread(1);
+    app_vesc_disable_output(0);
+
+    uint8_t b[20]; int32_t i=0;
+    b[i++]=cmd;
+    const uint8_t mi=second?1u:0u;
+    if(cmd==COMM_DETECT_MOTOR_R_L){
+        const float r=success?s_detect_all.r[mi]:0.0f;
+        const float l_uH=success?s_detect_all.l[mi]*1.0e6f:0.0f;
+        const float ld_uH=success?s_detect_all.ld_lq[mi]*1.0e6f:0.0f;
+        buffer_append_float32(b,r,1e6f,&i);
+        buffer_append_float32(b,l_uH,1e3f,&i);
+        buffer_append_float32(b,ld_uH,1e3f,&i);
+    }else{
+        const float flux=success?s_detect_all.flux[mi]:0.0f;
+        buffer_append_float32(b,flux,1e7f,&i);
+        if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP){
+            /* Upstream optionally estimates encoder parameters while coasting.
+             * Steering-safe F103 commissioning deliberately does not add an
+             * unbounded encoder travel phase to a flux-only command. */
+            buffer_append_float32(b,-1.0f,1e6f,&i);
+            buffer_append_float32(b,-1.0f,1e6f,&i);
+            b[i++]=0u;
+        }
+    }
+    s_detect_all.active=0u;
+    s_detect_all.stage=DETECT_ALL_IDLE;
+    s_detect_all.standalone_cmd=0u;
+    uart_send_payload(b,(uint16_t)i);
+}
+
+static void conf_general_detect_worker_finish(int16_t result) {
+    if(s_detect_all.standalone_cmd!=0u) standalone_measure_finish(result>=0);
+    else detect_all_finish(result);
+}
+
+static bool mcpwm_foc_measure_res_ind_f103_start(bool second) {
+    if(s_hall_detect.active || s_detect_all.active)return false;
+    memset(&s_detect_all,0,sizeof(s_detect_all));
+    s_detect_all.active=1u;
+    s_detect_all.standalone_cmd=COMM_DETECT_MOTOR_R_L;
+    s_detect_all.standalone_second=second?1u:0u;
+    s_detect_all.max_power_loss=50.0f; /* Imax is not returned by command 25. */
+    for(uint8_t mi=0u;mi<2u;++mi){
+        s_detect_all.backup[mi]=*mc_interface_get_configuration_motor(mi!=0u);
+        s_detect_all.result[mi]=s_detect_all.backup[mi];
+        s_detect_all.result[mi].motor_type=MOTOR_TYPE_FOC;
+    }
+    app_vesc_disable_output(60000);
+    measure_r_l_imax_f103_start(second?1u:0u,detect_time_now());
+    return true;
+}
+
+static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COMM_PACKET_ID cmd,
+                                          float current,float rpm_or_ramp,
+                                          float resistance,float inductance) {
+    if(s_hall_detect.active || s_detect_all.active)return false;
+    if(!(resistance>0.0f && resistance<=2.0f))return false;
+    if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP && !(inductance>0.0f && inductance<=0.1f))return false;
+    memset(&s_detect_all,0,sizeof(s_detect_all));
+    s_detect_all.active=1u;
+    s_detect_all.standalone_cmd=(uint8_t)cmd;
+    s_detect_all.standalone_second=second?1u:0u;
+    if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE){
+        const mc_configuration *live=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+        inductance=(live && live->foc_motor_l>0.0f)?live->foc_motor_l:0.0f;
+    }
+    s_detect_all.standalone_flux_current=fabsf(current);
+    s_detect_all.standalone_flux_ramp_erpm_s=(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP)?fabsf(rpm_or_ramp):600.0f;
+    for(uint8_t mi=0u;mi<2u;++mi){
+        s_detect_all.backup[mi]=*mc_interface_get_configuration_motor(mi!=0u);
+        s_detect_all.result[mi]=s_detect_all.backup[mi];
+        s_detect_all.result[mi].motor_type=MOTOR_TYPE_FOC;
+    }
+    const uint8_t mi=second?1u:0u;
+    s_detect_all.motor_index=mi;
+    s_detect_all.r[mi]=resistance;
+    s_detect_all.l[mi]=inductance;
+    float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
+    if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
+    if(fmax>(float)I_MOT_MAX)fmax=(float)I_MOT_MAX;
+    s_detect_all.flux_current=fabsf(current);
+    if(s_detect_all.flux_current<0.50f)s_detect_all.flux_current=0.50f;
+    if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
+    /* Keep flux motion bounded on the steering-capable board. The requested
+     * VESC acceleration is honored, but the identification sample is taken at
+     * 600 ERPM instead of spinning indefinitely to a duty threshold. */
+    s_detect_all.flux_target_erpm=600.0f;
+    if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE && rpm_or_ramp>600.0f && rpm_or_ramp<1200.0f)
+        s_detect_all.flux_target_erpm=rpm_or_ramp;
+    if(s_detect_all.standalone_flux_ramp_erpm_s<50.0f)s_detect_all.standalone_flux_ramp_erpm_s=50.0f;
+    if(s_detect_all.standalone_flux_ramp_erpm_s>20000.0f)s_detect_all.standalone_flux_ramp_erpm_s=20000.0f;
+    detect_all_apply_runtime(mi);
+    app_vesc_disable_output(60000);
+    detect_all_reset_sample();
+    s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
+    s_detect_all.stage_start_time=detect_time_now();
+    s_detect_all.next_sample_time=s_detect_all.stage_start_time;
+    return true;
+}
+
+static inline bool conf_general_measure_flux_linkage_start(bool second, float current,
+                                                        float duty, float min_erpm,
+                                                        float resistance) {
+    (void)duty;
+    /* COMM_DETECT_MOTOR_FLUX_LINKAGE (26) in upstream uses the legacy BLDC
+     * sensorless commutator. This F103 firmware is FOC-only, so this wrapper is
+     * a protocol-compatible adapter onto the FOC commissioning worker. */
+    return conf_general_measure_flux_linkage_f103_worker_start(second,
+        COMM_DETECT_MOTOR_FLUX_LINKAGE,current,min_erpm,resistance,0.0f);
+}
+
+static inline bool conf_general_measure_flux_linkage_openloop_start(bool second, float current,
+                                                                 float duty, float erpm_per_sec,
+                                                                 float resistance, float inductance) {
+    (void)duty;
+    /* Same command/method family as upstream conf_general_measure_flux_linkage_openloop;
+     * cooperative suffix is required because this bare-metal target has no worker thread. */
+    return conf_general_measure_flux_linkage_f103_worker_start(second,
+        COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,current,erpm_per_sec,resistance,inductance);
+}
+
+static void measure_r_l_imax_f103_start(uint8_t mi, uint32_t now_time) {
     s_detect_all.motor_index=mi;
     detect_all_apply_runtime(mi);
     const bool second=mi!=0u;
@@ -1470,7 +1596,15 @@ static void detect_all_start_rl(uint8_t mi, uint32_t now_time) {
     detect_all_reset_sample();
 }
 
-static void detect_all_start_sensors(uint32_t now_time) {
+static float detect_all_sensor_current(uint8_t mi) {
+    float i=s_detect_all.imax[mi]/3.0f;
+    if(!(i>0.0f))i=MCCONF_STEERING_DETECT_CURRENT_START_A;
+    if(i<0.10f)i=0.10f;
+    if(i>(float)I_MOT_MAX)i=(float)I_MOT_MAX;
+    return i;
+}
+
+static void conf_general_autodetect_apply_sensors_foc_start(uint32_t now_time) {
     detect_all_release_all();
     s_detect_all.motor_index=0u;
     s_detect_all.stage_start_time=now_time;
@@ -1480,41 +1614,73 @@ static void detect_all_start_sensors(uint32_t now_time) {
         s_detect_all.stage=DETECT_ALL_ENCODER;
     }else{
         s_detect_all.stage=DETECT_ALL_HALL;
-        hall_detect_start_current(false,2.0f);
+        mcpwm_foc_hall_detect_start(false,detect_all_sensor_current(0u));
     }
 }
 
-static void hall_detect_reply_and_stop(bool success) {
+static void mcpwm_foc_hall_detect_finish(bool success) {
     uint8_t table[8]; uint8_t fails=0u;
-    for(uint8_t h=0u;h<8u;++h){const uint8_t a=hall_detect_angle200(s_hall_detect.sum_s[h],s_hall_detect.sum_c[h],s_hall_detect.samples[h]);table[h]=a;if(a==255u)fails++;}
-    if(fails!=2u || !mcpwm_foc_hall_table_sane(table))success=false;
+    for(uint8_t h=0u;h<8u;++h){const uint8_t a=mcpwm_foc_hall_detect_angle200(s_hall_detect.sum_s[h],s_hall_detect.sum_c[h],s_hall_detect.samples[h]);table[h]=a;if(a==255u)fails++;}
+    if(fails!=2u)success=false;
     const bool second=s_hall_detect.second!=0u;
+    const uint8_t restore_backup=s_hall_detect.restore_backup;
+    const mc_configuration backup=s_hall_detect.backup;
     mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
     if(s_detect_all.active){
         if(!success){s_detect_all_last_detail=second?10:11;detect_all_finish(detect_all_fault_result(second));return;}
         const uint8_t mi=second?1u:0u; memcpy(s_detect_all.hall[mi],table,8u); detect_all_prepare_hall(mi); detect_all_apply_runtime(mi);
         memset(&s_hall_detect,0,sizeof(s_hall_detect));
-        if(!second){s_detect_all.stage=DETECT_ALL_HALL;s_detect_all.motor_index=1u;hall_detect_start_current(true,2.0f);}
+        if(!second){s_detect_all.stage=DETECT_ALL_HALL;s_detect_all.motor_index=1u;mcpwm_foc_hall_detect_start(true,detect_all_sensor_current(1u));}
         else detect_all_finish(2);
         return;
     }
     uint8_t reply[10]; reply[0]=COMM_DETECT_HALL_FOC; memcpy(&reply[1],table,8u); reply[9]=success?0u:1u;
-    s_last_hall_store_ok[second?1u:0u]=0u; memset(&s_hall_detect,0,sizeof(s_hall_detect)); uart_send_payload(reply,sizeof(reply));
+    s_last_hall_store_ok[second?1u:0u]=0u; /* standalone detect is not a store */
+    if(restore_backup){
+        mc_interface_select_motor_thread(second?2:1);
+        mc_configuration c=backup;
+        mc_interface_set_configuration(&c);
+        mc_interface_select_motor_thread(1);
+    }
+    memset(&s_hall_detect,0,sizeof(s_hall_detect)); uart_send_payload(reply,sizeof(reply));
 }
 
-static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
+static void mcpwm_foc_hall_detect_command_start(bool second, const uint8_t *data, uint16_t len) {
     if (s_hall_detect.active || s_detect_all.active) return;
     if (len < 4u) {
         uint8_t reply[10] = {COMM_DETECT_HALL_FOC,255,255,255,255,255,255,255,255,1};
         uart_send_payload(reply, sizeof(reply));
         return;
     }
+
+    mc_interface_select_motor_thread(second?2:1);
+    const mc_configuration *live=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+    if(!live || live->m_sensor_port_mode!=SENSOR_PORT_MODE_HALL){
+        mc_interface_select_motor_thread(1);
+        uint8_t reply[10] = {COMM_DETECT_HALL_FOC,255,255,255,255,255,255,255,255,1};
+        uart_send_payload(reply,sizeof(reply));
+        return;
+    }
+
+    mc_configuration backup=*live;
+    mc_configuration temp=backup;
+    /* Upstream COMM_DETECT_HALL_FOC wrapper uses a temporary FOC setup, runs
+     * mcpwm_foc_hall_detect(), then restores the complete previous MC config. */
+    temp.motor_type=MOTOR_TYPE_FOC;
+    temp.foc_f_zv=10000.0f;
+    temp.foc_current_kp=0.01f;
+    temp.foc_current_ki=10.0f;
+    mc_interface_set_configuration(&temp);
+    mc_interface_select_motor_thread(1);
+
     int32_t ind = 0;
     float current = (float)buffer_get_int32(data, &ind) / 1000.0f;
-    hall_detect_start_current(second,current);
+    mcpwm_foc_hall_detect_start(second,current);
+    s_hall_detect.backup=backup;
+    s_hall_detect.restore_backup=1u;
 }
 
-static void detect_all_begin(const uint8_t *data,uint16_t len) {
+static void conf_general_detect_apply_all_foc_can_start(const uint8_t *data,uint16_t len) {
     if(s_hall_detect.active || s_detect_all.active) return;
     if(len<21u){ detect_all_reply(-1); return; }
     int32_t k=0;
@@ -1534,8 +1700,11 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
         s_detect_all.result[mi]=s_detect_all.backup[mi];
         detect_all_apply_common_limits(&s_detect_all.result[mi]);
         s_detect_all.result[mi].motor_type=MOTOR_TYPE_FOC;
-        s_detect_all.result[mi].sensor_mode=SENSOR_MODE_SENSORLESS;
-        s_detect_all.result[mi].foc_sensor_mode=FOC_SENSOR_MODE_SENSORLESS;
+        /* Model identification itself is sensor-independent because the
+         * commissioning control modes override electrical phase explicitly.
+         * Keep the user's physical/FOC sensor selection intact here. This is
+         * safer on the steering LEFT endpoint than exposing a temporary
+         * SENSORLESS configuration that is valid only while OPENLOOP is active. */
     }
     s_detect_all.steering_span_backup=mcpwm_foc_steering_span_counts();
     s_detect_all.steering_cal_backup=mcpwm_foc_steering_is_calibrated()?1u:0u;
@@ -1548,16 +1717,16 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     /* Upstream VESC Detect-All order: motor model first (R/L/Imax -> flux),
      * then sensor commissioning. Rotor sensors are not used for these model
      * measurements. */
-    detect_all_start_rl(0u,detect_time_now());
+    measure_r_l_imax_f103_start(0u,detect_time_now());
 }
 
-static void hall_detect_periodic(uint32_t now_time) {
+static void mcpwm_foc_hall_detect_process(uint32_t now_time) {
     if (!s_hall_detect.active) return;
     if (!detect_time_due(now_time, s_hall_detect.next_time)) return;
     const bool second = s_hall_detect.second != 0u;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     mcpwm_foc_vesc_override_touch(second);
-    if (m->m_fault != FAULT_CODE_NONE) { hall_detect_reply_and_stop(false); return; }
+    if (m->m_fault != FAULT_CODE_NONE) { mcpwm_foc_hall_detect_finish(false); return; }
 
     if (s_hall_detect.stage == HALL_DETECT_ALIGN) {
         /* The upstream detector ramps alignment current for about one second.
@@ -1592,11 +1761,18 @@ static void hall_detect_periodic(uint32_t now_time) {
         return;
     }
 
-    const uint8_t h = m->m_hall_state & 7u;
+    /* Upstream utils_read_hall() samples the physical Hall code with its
+     * configured majority filter. Use the equivalent majority state here, not
+     * the closed-loop/debounced Hall estimator state. */
+    const uint8_t h = m->m_hall_filtered_state & 7u;
     const int32_t dnorm = (s_hall_detect.degree >= 360) ? 0 : s_hall_detect.degree;
-    int16_t sn, cs;
-    const uint16_t ph = (uint16_t)(((uint32_t)dnorm * 65536u) / 360u);
-    foc_sin_cos_q15(ph, &sn, &cs);
+    /* F103 adaptation: keep the upstream circular-mean method, but source
+     * sine/cosine from the existing Q15 LUT. This avoids pulling full sinf/cosf
+     * into the 120-KiB application image; finalization still uses atan2f and
+     * VESC truncate semantics, so this is not the old nearest-bin best_dot path. */
+    int16_t sn,cs;
+    const uint16_t ph=(uint16_t)(((uint32_t)dnorm*65536u)/360u);
+    foc_sin_cos_q15(ph,&sn,&cs);
     s_hall_detect.sum_s[h] += sn;
     s_hall_detect.sum_c[h] += cs;
     if (s_hall_detect.samples[h] < 0xffffu) s_hall_detect.samples[h]++;
@@ -1613,7 +1789,7 @@ static void hall_detect_periodic(uint32_t now_time) {
         if (s_hall_detect.degree <= 0) {
             s_hall_detect.pass++;
             if (s_hall_detect.pass >= 6u) {
-                hall_detect_reply_and_stop(true);
+                mcpwm_foc_hall_detect_finish(true);
                 return;
             }
             s_hall_detect.degree = 360;
@@ -1634,29 +1810,29 @@ static void hall_detect_periodic(uint32_t now_time) {
     s_hall_detect.next_time = detect_time_after_ms(now_time,5u);
 }
 
-static bool detect_all_compute_rl(uint8_t mi) {
-    const double di_phys=(double)s_detect_all.high_i[mi]-(double)s_detect_all.low_i[mi];
-    const double dv_phys=(double)s_detect_all.high_v[mi]-(double)s_detect_all.low_v[mi];
-    const double di_raw=(double)s_detect_all.high_i_raw[mi]-(double)s_detect_all.low_i_raw[mi];
-    const double dv_raw=(double)s_detect_all.high_v_raw[mi]-(double)s_detect_all.low_v_raw[mi];
-    if(fabs(di_phys)<0.25 || fabs(di_raw)<100.0 || fabs(dv_raw)<20.0) return false;
-    const double r=fabs(dv_phys/di_phys);
-    if(!(r>=0.005 && r<=2.0)) return false;
+static bool measure_r_l_imax_f103_finish(uint8_t mi) {
+    const float di_phys=(float)s_detect_all.high_i[mi]-(float)s_detect_all.low_i[mi];
+    const float dv_phys=(float)s_detect_all.high_v[mi]-(float)s_detect_all.low_v[mi];
+    const float di_raw=(float)s_detect_all.high_i_raw[mi]-(float)s_detect_all.low_i_raw[mi];
+    const float dv_raw=(float)s_detect_all.high_v_raw[mi]-(float)s_detect_all.low_v_raw[mi];
+    if(fabsf(di_phys)<0.25f || fabsf(di_raw)<100.0f || fabsf(dv_raw)<20.0f) return false;
+    const float r=fabsf(dv_phys/di_phys);
+    if(!(r>=0.005f && r<=2.0f)) return false;
 
     mcpwm_foc_rl_capture_t cap;
     mcpwm_foc_rl_capture_get(mi!=0u,&cap);
     if(cap.samples<20u || cap.sum_di2==0) return false;
-    const double a=dv_raw/di_raw;
-    const double c=(double)s_detect_all.low_v_raw[mi]-a*(double)s_detect_all.low_i_raw[mi];
-    const double b=((double)cap.sum_div-a*(double)cap.sum_dii-c*(double)cap.sum_di)/(double)cap.sum_di2;
-    const double vscale=fabs(dv_phys/dv_raw);
-    const double dt=(double)MCCONF_FOC_CONTROL_DIV/(double)PWM_FREQ;
-    const double l=fabs(b)*vscale*(double)FOC_CURRENT_Q4_PER_A*dt;
-    if(!(l>=0.000005 && l<=0.020)) return false;
+    const float a=dv_raw/di_raw;
+    const float c=(float)s_detect_all.low_v_raw[mi]-a*(float)s_detect_all.low_i_raw[mi];
+    const float b=((float)cap.sum_div-a*(float)cap.sum_dii-c*(float)cap.sum_di)/(float)cap.sum_di2;
+    const float vscale=fabsf(dv_phys/dv_raw);
+    const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
+    const float l=fabsf(b)*vscale*(float)FOC_CURRENT_Q4_PER_A*dt;
+    if(!(l>=0.000005f && l<=0.020f)) return false;
 
-    double im=sqrt((double)s_detect_all.max_power_loss/(r*1.5));
-    if(im<1.0)im=1.0;
-    if(im>(double)I_MOT_MAX)im=(double)I_MOT_MAX;
+    float im=sqrtf((float)s_detect_all.max_power_loss/(r*1.5f));
+    if(im<1.0f)im=1.0f;
+    if(im>(float)I_MOT_MAX)im=(float)I_MOT_MAX;
     s_detect_all.r[mi]=(float)r;
     s_detect_all.l[mi]=(float)l;
     s_detect_all.ld_lq[mi]=0.0f; /* safe d-axis identification; non-salient default */
@@ -1664,16 +1840,25 @@ static bool detect_all_compute_rl(uint8_t mi) {
     return true;
 }
 
-static void detect_all_finalize_motor(uint8_t mi) {
+/* Same equations and function name as upstream conf_general.c. This helper is
+ * commissioning/main-loop code, so float math is intentional and never enters
+ * the 16-kHz ADC ISR. */
+static inline void conf_general_calc_apply_foc_cc_kp_ki_gain(mc_configuration *mcconf, float tc) {
+    if(!mcconf || !(tc>0.0f)) return;
+    const float bw=1.0f/(tc*1.0e-6f);
+    mcconf->foc_current_kp=mcconf->foc_motor_l*bw;
+    mcconf->foc_current_ki=mcconf->foc_motor_r*bw;
+    if(mcconf->foc_motor_flux_linkage>0.000001f)
+        mcconf->foc_observer_gain=1000.0f/(mcconf->foc_motor_flux_linkage*mcconf->foc_motor_flux_linkage);
+}
+
+static void conf_general_detect_apply_all_foc_finalize_motor(uint8_t mi) {
     mc_configuration *c=&s_detect_all.result[mi];
     c->foc_motor_r=s_detect_all.r[mi];
     c->foc_motor_l=s_detect_all.l[mi];
     c->foc_motor_ld_lq_diff=s_detect_all.ld_lq[mi];
     c->foc_motor_flux_linkage=s_detect_all.flux[mi];
-    c->foc_current_kp=c->foc_motor_l*1000.0f;
-    c->foc_current_ki=c->foc_motor_r*1000.0f;
-    if(c->foc_motor_flux_linkage>0.000001f)
-        c->foc_observer_gain=1000.0f/(c->foc_motor_flux_linkage*c->foc_motor_flux_linkage);
+    conf_general_calc_apply_foc_cc_kp_ki_gain(c,1000.0f);
     c->l_current_max=s_detect_all.imax[mi];
     c->l_current_min=-s_detect_all.imax[mi];
     float absmax=s_detect_all.imax[mi]*1.5f;
@@ -1681,18 +1866,18 @@ static void detect_all_finalize_motor(uint8_t mi) {
     if(absmax<s_detect_all.imax[mi])absmax=s_detect_all.imax[mi];
     c->l_abs_current_max=absmax;
     c->motor_type=MOTOR_TYPE_FOC;
-    c->sensor_mode=SENSOR_MODE_SENSORLESS;
-    c->foc_sensor_mode=FOC_SENSOR_MODE_SENSORLESS;
+    /* Do not overwrite sensor selection while finalizing R/L/flux. The next
+     * commissioning stage explicitly applies Encoder or Hall. */
 }
 
-static void detect_all_periodic(uint32_t now_time) {
+static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
     if(!s_detect_all.active || s_detect_all.stage==DETECT_ALL_IDLE) return;
     if(s_detect_all.stage==DETECT_ALL_ENCODER){
         /* Encoder detect is intentionally blocking like upstream VESC's motor
          * detection worker, while the bridge remains output-gated. */
         if(!detect_all_prepare_encoder_left()){
             s_detect_all_last_detail=9;
-            detect_all_finish(-10);
+            conf_general_detect_worker_finish(-10);
             return;
         }
         detect_all_apply_runtime(0u);
@@ -1701,9 +1886,9 @@ static void detect_all_periodic(uint32_t now_time) {
         /* The RIGHT traction motor needs enough d-axis alignment torque for
          * all six Hall sectors to cross cleanly. 1 A reproducibly left missing
          * / compressed sectors on the real motor; 2 A gives a sane six-state
-         * table with no fault or over-current trip. hall_detect_start_current()
+         * table with no fault or over-current trip. mcpwm_foc_hall_detect_start()
          * still clamps this request to the configured motor-current limit. */
-        hall_detect_start_current(true,2.0f);
+        mcpwm_foc_hall_detect_start(true,detect_all_sensor_current(1u));
         return;
     }
     if(s_detect_all.stage==DETECT_ALL_HALL) return;
@@ -1713,7 +1898,7 @@ static void detect_all_periodic(uint32_t now_time) {
     const bool second=mi!=0u;
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     const mc_fault_code fault=mc_interface_get_fault_motor(second);
-    if(fault!=FAULT_CODE_NONE){detect_all_finish((int16_t)((int)fault-100));return;}
+    if(fault!=FAULT_CODE_NONE){conf_general_detect_worker_finish((int16_t)((int)fault-100));return;}
     mcpwm_foc_vesc_override_touch(second);
     const uint32_t elapsed=detect_time_elapsed_ms(s_detect_all.stage_start_time,now_time);
 
@@ -1732,19 +1917,19 @@ static void detect_all_periodic(uint32_t now_time) {
         s_detect_all.sum_v_raw+=m->m_vd;
         s_detect_all.sample_n++;
         if(elapsed>=250u && s_detect_all.sample_n>=20u){
-            const double n=(double)s_detect_all.sample_n;
+            const float n=(float)s_detect_all.sample_n;
             s_detect_all.low_i[mi]=(float)(s_detect_all.sum_i/n);
             s_detect_all.low_v[mi]=(float)(s_detect_all.sum_v/n);
             s_detect_all.low_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.low_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
-            if(fabsf(s_detect_all.low_i[mi])<0.20f){s_detect_all_last_detail=2;detect_all_finish(-10);return;}
+            if(fabsf(s_detect_all.low_i[mi])<0.20f){s_detect_all_last_detail=2;conf_general_detect_worker_finish(-10);return;}
             mcpwm_foc_rl_capture_start(second);
             mcpwm_foc_set_openloop_phase(s_detect_all.current_high,0.0f,second);
             mcpwm_foc_vesc_override_touch(second);
             s_detect_all.stage=DETECT_ALL_RL_STEP;
             s_detect_all.stage_start_time=now_time;
         } else if(elapsed>=2000u && s_detect_all.sample_n<20u){
-            s_detect_all_last_detail=1; detect_all_finish(-10); return;
+            s_detect_all_last_detail=1; conf_general_detect_worker_finish(-10); return;
         }
         break;
     case DETECT_ALL_RL_STEP:
@@ -1762,13 +1947,20 @@ static void detect_all_periodic(uint32_t now_time) {
         s_detect_all.sum_v_raw+=m->m_vd;
         s_detect_all.sample_n++;
         if(elapsed>=250u && s_detect_all.sample_n>=20u){
-            const double n=(double)s_detect_all.sample_n;
+            const float n=(float)s_detect_all.sample_n;
             s_detect_all.high_i[mi]=(float)(s_detect_all.sum_i/n);
             s_detect_all.high_v[mi]=(float)(s_detect_all.sum_v/n);
             s_detect_all.high_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.high_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
-            if(!detect_all_compute_rl(mi)){s_detect_all_last_detail=4;detect_all_finish(-10);return;}
-            s_detect_all.flux_current=MCCONF_STEERING_DETECT_CURRENT_START_A;
+            if(!measure_r_l_imax_f103_finish(mi)){s_detect_all_last_detail=4;conf_general_detect_worker_finish(-10);return;}
+            if(s_detect_all.standalone_cmd==COMM_DETECT_MOTOR_R_L){
+                conf_general_detect_worker_finish(0);
+                return;
+            }
+            /* Match VESC Detect-All: flux open-loop current is Imax / 2.5.
+             * Keep only the board safety clamps around that upstream choice. */
+            s_detect_all.flux_current=s_detect_all.standalone_cmd ?
+                s_detect_all.standalone_flux_current : s_detect_all.imax[mi]/2.5f;
             {
                 float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
                 if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
@@ -1781,15 +1973,20 @@ static void detect_all_periodic(uint32_t now_time) {
             s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
             s_detect_all.stage_start_time=now_time;
         } else if(elapsed>=2000u && s_detect_all.sample_n<20u){
-            s_detect_all_last_detail=3; detect_all_finish(-10); return;
+            s_detect_all_last_detail=3; conf_general_detect_worker_finish(-10); return;
         }
         break;
     case DETECT_ALL_FLUX_RAMP: {
-        float f=(float)elapsed/1200.0f; if(f>1.0f)f=1.0f;
+        float ramp_rate=s_detect_all.standalone_cmd ? s_detect_all.standalone_flux_ramp_erpm_s : 1800.0f;
+        if(ramp_rate<50.0f)ramp_rate=50.0f;
+        float ramp_ms=(s_detect_all.flux_target_erpm-80.0f)*1000.0f/ramp_rate;
+        if(ramp_ms<100.0f)ramp_ms=100.0f;
+        if(ramp_ms>5000.0f)ramp_ms=5000.0f;
+        float f=(float)elapsed/ramp_ms; if(f>1.0f)f=1.0f;
         const float erpm=80.0f+(s_detect_all.flux_target_erpm-80.0f)*f;
         mcpwm_foc_set_openloop_current(s_detect_all.flux_current,erpm,second);
         mcpwm_foc_vesc_override_touch(second);
-        if(elapsed>=1200u){
+        if((float)elapsed>=ramp_ms){
             const float actual_erpm=fabsf(mcpwm_foc_get_erpm_motor(second));
             float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
             if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
@@ -1810,35 +2007,48 @@ static void detect_all_periodic(uint32_t now_time) {
         }
         break;
     }
-    case DETECT_ALL_FLUX_SAMPLE:
+    case DETECT_ALL_FLUX_SAMPLE: {
         mcpwm_foc_set_openloop_current(s_detect_all.flux_current,s_detect_all.flux_target_erpm,second);
         mcpwm_foc_vesc_override_touch(second);
-        s_detect_all.sum_i+=fabs((double)mcpwm_foc_get_iq_motor(second));
-        s_detect_all.sum_v+=fabs((double)mcpwm_foc_get_vq_motor(second));
-        s_detect_all.sum_erpm+=fabs((double)mcpwm_foc_get_erpm_motor(second));
+        const float id=mcpwm_foc_get_id_motor(second);
+        const float iq=mcpwm_foc_get_iq_motor(second);
+        const float vd=mcpwm_foc_get_vd_motor(second);
+        const float vq=mcpwm_foc_get_vq_motor(second);
+        s_detect_all.sum_i+=sqrtf(id*id+iq*iq);
+        s_detect_all.sum_v+=sqrtf(vd*vd+vq*vq);
+        s_detect_all.sum_erpm+=fabsf(mcpwm_foc_get_erpm_motor(second));
         s_detect_all.sample_n++;
         if(elapsed>=800u && s_detect_all.sample_n>=40u){
-            const double n=(double)s_detect_all.sample_n;
-            const double iq=s_detect_all.sum_i/n;
-            const double vq=s_detect_all.sum_v/n;
-            const double erpm=s_detect_all.sum_erpm/n;
-            if(erpm<(double)s_detect_all.flux_target_erpm*0.50 ||
-               erpm>(double)s_detect_all.flux_target_erpm*1.60){s_detect_all_last_detail=6;detect_all_finish(-10);return;}
-            const double omega=erpm*6.28318530717958647692/60.0;
-            const double bemf=vq-(double)s_detect_all.r[mi]*iq;
-            if(bemf<=0.02 || omega<=1.0){s_detect_all_last_detail=7;detect_all_finish(-10);return;}
-            const double flux=bemf/omega;
-            if(!(flux>=0.0001 && flux<=1.0)){s_detect_all_last_detail=8;detect_all_finish(-10);return;}
-            s_detect_all.flux[mi]=(float)flux;
-            detect_all_finalize_motor(mi);
+            const float n=(float)s_detect_all.sample_n;
+            const float i_mag=s_detect_all.sum_i/n;
+            const float v_mag=s_detect_all.sum_v/n;
+            const float erpm=s_detect_all.sum_erpm/n;
+            if(erpm<s_detect_all.flux_target_erpm*0.50f ||
+               erpm>s_detect_all.flux_target_erpm*1.60f){s_detect_all_last_detail=6;conf_general_detect_worker_finish(-10);return;}
+            const float omega=erpm*6.28318530717958647692f/60.0f;
+            const float bemf=v_mag-s_detect_all.r[mi]*i_mag;
+            if(bemf<=0.02f || omega<=1.0f){s_detect_all_last_detail=7;conf_general_detect_worker_finish(-10);return;}
+            /* Same VESC open-loop flux equation used by
+             * conf_general_measure_flux_linkage_openloop():
+             * lambda=(|Vdq|-R|Idq|)/omega - L|Idq|. */
+            const float ldrop=s_detect_all.l[mi]*i_mag;
+            const float flux=bemf/omega-ldrop;
+            if(!(flux>=0.0001f && flux<=1.0f)){s_detect_all_last_detail=8;conf_general_detect_worker_finish(-10);return;}
+            s_detect_all.flux[mi]=flux;
+            if(s_detect_all.standalone_cmd){
+                conf_general_detect_worker_finish(0);
+                return;
+            }
+            conf_general_detect_apply_all_foc_finalize_motor(mi);
             mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
-            if(mi==0u){detect_all_start_rl(1u,now_time);}
-            else detect_all_start_sensors(now_time);
+            if(mi==0u){measure_r_l_imax_f103_start(1u,now_time);}
+            else conf_general_autodetect_apply_sensors_foc_start(now_time);
         } else if(elapsed>=3000u && s_detect_all.sample_n<40u){
-            s_detect_all_last_detail=5; detect_all_finish(-10); return;
+            s_detect_all_last_detail=5; conf_general_detect_worker_finish(-10); return;
         }
         break;
+    }
     default:
         break;
     }
@@ -2479,9 +2689,9 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"status")){terminal_detect_status();return;}
         if(!strcmp(sub,"cancel")){terminal_cancel_detect();terminal_send_text("OK detect cancelled\n");return;}
         if(s_detect_all.active||s_hall_detect.active){terminal_send_text("ERR detect busy\n");return;}
-        if(!strcmp(sub,"hall")){float x=3.0f;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}hall_detect_start_current(second,x);terminal_send_text("OK Hall detect started; poll 'detect'\n");return;}
+        if(!strcmp(sub,"hall")){float x=3.0f;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}mcpwm_foc_hall_detect_start(second,x);terminal_send_text("OK Hall detect started; poll 'detect'\n");return;}
         if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Steering span-only detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f logical_inv=%u stops=%ld/%ld span=%ld center=180\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp);terminal_send_text(o);return;}
-        if(!strcmp(sub,"all")){if(second){terminal_send_text("ERR start from LEFT/ID1\n");return;}float loss=50,minin=cc->l_in_current_min,maxin=cc->l_in_current_max,ol=cc->foc_openloop_rpm,sl=cc->foc_sl_erpm;if(ac-base==5){if(!terminal_float(a[base],&loss)||!terminal_float(a[base+1],&minin)||!terminal_float(a[base+2],&maxin)||!terminal_float(a[base+3],&ol)||!terminal_float(a[base+4],&sl)){terminal_send_text("ERR args\n");return;}}else if(ac!=base){terminal_send_text("ERR detect all [LOSS MIN MAX OPENRPM SLERPM]\n");return;}uint8_t d[21];int32_t k=0;d[k++]=1;buffer_append_float32(d,loss,1e3f,&k);buffer_append_float32(d,minin,1e3f,&k);buffer_append_float32(d,maxin,1e3f,&k);buffer_append_float32(d,ol,1e3f,&k);buffer_append_float32(d,sl,1e3f,&k);detect_all_begin(d,sizeof(d));terminal_send_text("OK Detect-All started; poll 'detect'\n");return;}
+        if(!strcmp(sub,"all")){if(second){terminal_send_text("ERR start from LEFT/ID1\n");return;}float loss=50,minin=cc->l_in_current_min,maxin=cc->l_in_current_max,ol=cc->foc_openloop_rpm,sl=cc->foc_sl_erpm;if(ac-base==5){if(!terminal_float(a[base],&loss)||!terminal_float(a[base+1],&minin)||!terminal_float(a[base+2],&maxin)||!terminal_float(a[base+3],&ol)||!terminal_float(a[base+4],&sl)){terminal_send_text("ERR args\n");return;}}else if(ac!=base){terminal_send_text("ERR detect all [LOSS MIN MAX OPENRPM SLERPM]\n");return;}uint8_t d[21];int32_t k=0;d[k++]=1;buffer_append_float32(d,loss,1e3f,&k);buffer_append_float32(d,minin,1e3f,&k);buffer_append_float32(d,maxin,1e3f,&k);buffer_append_float32(d,ol,1e3f,&k);buffer_append_float32(d,sl,1e3f,&k);conf_general_detect_apply_all_foc_can_start(d,sizeof(d));terminal_send_text("OK Detect-All started; poll 'detect'\n");return;}
         terminal_send_text("ERR detect status|hall|encoder|all|cancel\n");return;
     }
     if(!strcmp(a[0],"home")){if(second||cc->m_sensor_port_mode!=SENSOR_PORT_MODE_ABI){terminal_send_text("ERR LEFT encoder only\n");return;}terminal_send_text(mc_interface_steering_boot_home()?"PASS home\n":"FAIL home\n");return;}
@@ -2708,6 +2918,53 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
             app_vesc_disable_output(time_ms);
         }
         break;
+    case COMM_DETECT_MOTOR_R_L:
+        if(!mcpwm_foc_measure_res_ind_f103_start(second)){
+            uint8_t b[13]; int32_t bi=0; b[bi++]=COMM_DETECT_MOTOR_R_L;
+            buffer_append_float32(b,0.0f,1e6f,&bi);
+            buffer_append_float32(b,0.0f,1e3f,&bi);
+            buffer_append_float32(b,0.0f,1e3f,&bi);
+            uart_send_payload(b,(uint16_t)bi);
+        }
+        break;
+    case COMM_DETECT_MOTOR_FLUX_LINKAGE: {
+        if(n<16u){
+            uint8_t b[5]; int32_t bi=0; b[bi++]=COMM_DETECT_MOTOR_FLUX_LINKAGE;
+            buffer_append_float32(b,0.0f,1e7f,&bi); uart_send_payload(b,(uint16_t)bi); break;
+        }
+        const float current=buffer_get_float32(d,1e3f,&k);
+        const float min_erpm=buffer_get_float32(d,1e3f,&k);
+        const float duty=buffer_get_float32(d,1e3f,&k);
+        const float resistance=buffer_get_float32(d,1e6f,&k);
+        if(!conf_general_measure_flux_linkage_start(second,current,duty,min_erpm,resistance)){
+            uint8_t b[5]; int32_t bi=0; b[bi++]=COMM_DETECT_MOTOR_FLUX_LINKAGE;
+            buffer_append_float32(b,0.0f,1e7f,&bi); uart_send_payload(b,(uint16_t)bi);
+        }
+        break;
+    }
+    case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP: {
+        if(n<16u){
+            uint8_t b[14]; int32_t bi=0; b[bi++]=COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP;
+            buffer_append_float32(b,0.0f,1e7f,&bi); buffer_append_float32(b,-1.0f,1e6f,&bi);
+            buffer_append_float32(b,-1.0f,1e6f,&bi); b[bi++]=0u; uart_send_payload(b,(uint16_t)bi); break;
+        }
+        const float current=buffer_get_float32(d,1e3f,&k);
+        const float erpm_per_sec=buffer_get_float32(d,1e3f,&k);
+        const float duty=buffer_get_float32(d,1e3f,&k);
+        const float resistance=buffer_get_float32(d,1e6f,&k);
+        float inductance=0.0f;
+        if(n>=(uint16_t)(k+4)) inductance=buffer_get_float32(d,1e8f,&k);
+        if(!(inductance>0.0f)){
+            const mc_configuration *cc=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+            if(cc)inductance=cc->foc_motor_l;
+        }
+        if(!conf_general_measure_flux_linkage_openloop_start(second,current,duty,erpm_per_sec,resistance,inductance)){
+            uint8_t b[14]; int32_t bi=0; b[bi++]=COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP;
+            buffer_append_float32(b,0.0f,1e7f,&bi); buffer_append_float32(b,-1.0f,1e6f,&bi);
+            buffer_append_float32(b,-1.0f,1e6f,&bi); b[bi++]=0u; uart_send_payload(b,(uint16_t)bi);
+        }
+        break;
+    }
     case COMM_DETECT_ENCODER: {
 #ifdef STM32F103xE
         *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC100001Bu;
@@ -2721,12 +2978,50 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
 #ifdef STM32F103xE
         *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC200001Bu;
 #endif
+        bool ok=false;
         int32_t raw_left=0,raw_right=0,span=0;
-        const bool ok=!second && mc_interface_steering_detect_calibrate(
-            current,&off,&ratio,&inv,&raw_left,&raw_right,&span);
-        /* Preserve the stock VESC reply shape so VESC Tool still sees encoder
-         * offset/ratio/inversion. Hard-stop/span details are available through
-         * project diagnostics/ROS and are stored transactionally in EEPROM. */
+        if(!second){
+            const mc_configuration backup=*mc_interface_get_configuration_motor(false);
+            const int32_t old_span=mcpwm_foc_steering_span_counts();
+            const bool old_cal=mcpwm_foc_steering_is_calibrated();
+            const bool old_homed=mcpwm_foc_steering_is_homed();
+            const bool old_logical_inv=mc_interface_steering_logical_inverted();
+            float eoff=1001.0f, eratio=0.0f; bool einv=false;
+            /* Project-specific standalone Detect Encoder is a superset of the
+             * VESC command: first perform the electrical ABI phase/direction
+             * probe, then use those detected electrical parameters while the
+             * steering commissioning routine measures the real hard-stop span. */
+            if(backup.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
+               mcpwm_foc_encoder_detect(current,false,&eoff,&eratio,&einv)){
+                mc_configuration detected=backup;
+                detected.motor_type=MOTOR_TYPE_FOC;
+                detected.sensor_mode=SENSOR_MODE_SENSORED;
+                detected.m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+                detected.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+                detected.foc_encoder_offset=eoff;
+                detected.foc_encoder_ratio=eratio;
+                detected.foc_encoder_inverted=einv;
+                mc_interface_select_motor_thread(1);
+                mc_interface_set_configuration(&detected);
+                float span_off=0.0f,span_ratio=0.0f; bool logical_inv=false;
+                ok=mc_interface_steering_detect_calibrate(current,&span_off,&span_ratio,&logical_inv,
+                                                           &raw_left,&raw_right,&span);
+                if(ok){
+                    /* Wire reply remains stock VESC electrical semantics. Span
+                     * is persisted separately by the project calibration path. */
+                    off=eoff; ratio=eratio; inv=einv;
+                }else{
+                    mc_configuration restore=backup;
+                    mc_interface_set_configuration(&restore);
+                    (void)mc_interface_set_steering_logical_inverted(old_logical_inv);
+                    if(old_cal && old_span!=0)
+                        (void)mcpwm_foc_steering_set_span(old_span,old_homed);
+                    else
+                        mcpwm_foc_steering_clear_calibration();
+                }
+            }
+        }
+        app_vesc_disable_output(0);
         if(!ok){off=1001.0f;ratio=0.0f;inv=false;}
         uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
         buffer_append_float32(reply,off,1e6f,&ri);
@@ -2737,10 +3032,10 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     }
     case COMM_DETECT_HALL_FOC:
-        hall_detect_begin(second, d, n);
+        mcpwm_foc_hall_detect_command_start(second, d, n);
         break;
     case COMM_DETECT_APPLY_ALL_FOC:
-        if(!second) detect_all_begin(d,n);
+        if(!second) conf_general_detect_apply_all_foc_can_start(d,n);
         break;
     case COMM_TERMINAL_CMD:
     case COMM_TERMINAL_CMD_SYNC:

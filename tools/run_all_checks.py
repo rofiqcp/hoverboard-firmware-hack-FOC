@@ -35,8 +35,12 @@ def check_static():
     for token in ('BLDC_controller','rtwtypes.h','rtP_Left','rtP_Right','rtDW_Left','rtDW_Right'):
         assert token not in source_text, f'obsolete generated dependency in live source: {token}'
     ini=(ROOT/'platformio.ini').read_text()
-    for token in ('src_dir = Src','default_envs = APP_STLINK','[env:APP_STLINK]','[env:APP_USART_PC]','[env:APP_F411]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
+    for token in ('src_dir = Src','[env:APP_STLINK]','[env:APP_USART_PC]','[env:APP_F411]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
         assert token in ini, f'platformio.ini missing {token}'
+    # Deployment may intentionally choose direct ST-Link or the resident F411
+    # gateway as the default uploader. The audit must validate both environments
+    # exist, not force one transport and fail after an intentional deployment switch.
+    assert re.search(r'^default_envs\s*=\s*(APP_STLINK|APP_F411)\s*$', ini, re.M), 'unsupported PlatformIO default_envs'
     # Warning policy: project sources use -Wall/-Wextra/-Werror via build_src_flags only.
     # Framework STM32Cube must not inherit project -Werror (avoids HAL_PCD unused-parameter build failure).
     before_build_flags=ini.split('build_flags =',1)[0]
@@ -72,8 +76,7 @@ def check_static():
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'if(openloop_phase) m->m_phase=m->m_phase_openloop;' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
-    assert 'mcpwm_foc_detect_hall' in mc and 'valid != 6u' in mc, 'strict internal Hall detector/validation missing'
-    assert 'gap < 18u || gap > 48u' in mc, 'Hall detect sector-gap rejection missing'
+    assert 'mcpwm_foc_hall_detect' in mc and 'fails == 2u' in mc and 'atan2f((float)sum_s,(float)sum_c)' in mc, 'upstream VESC Hall detector/finalization missing'
     assert 'MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT' in mcc and 'hall_interp_recompute' in mc and 'm_hall_interp_max_ticks' in mc and 'm_hall_rate_min_step' in mc and 'err_same_direction' in mc, 'VESC foc_hall_interp_erpm runtime semantics missing'
     assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
@@ -82,6 +85,8 @@ def check_static():
     assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 EFeru full-safe modulation ceiling missing'
     assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+1\.00f',mcc), 'VESC normalized duty max must be 1.00'
     assert re.search(r'#define\s+MCCONF_L_IN_CURRENT_MAX\s+15\.0f',mcc) and re.search(r'#define\s+MCCONF_L_IN_CURRENT_MIN\s+-15\.0f',mcc), 'DC-link soft limit must be +/-15A'
+    assert 'const int32_t mod_q=(int32_t)m->m_vq;' in mc and 'MCCONF_FOC_VOLTAGE_MAX)/amod_q' in mc, 'FOC input-current limit must use VESC mod_q*Iq semantics, not total duty magnitude'
+    assert '|Ibus| ~= |Iq|*|duty|' not in mc, 'obsolete duty-magnitude input-current approximation remains'
     assert 'MCCONF_DUTY_RAMP_STEP_DEFAULT' in mcc and 'm_duty_ramp_permille' not in mc and 'duty_setpoint_slew_step' not in mc and 'm_duty_set_permille' in mc, 'FOC duty must use direct VESC target; m_duty_ramp_step is wire-compatible BLDC config only'
     assert re.search(r'#define\s+VESC_DUTY_PHYSICAL_SCALE_PERMILLE\s+960',cfg), 'board VESC duty scale must be 0.960'
     assert re.search(r'#define\s+FOC_SVPWM_VECTOR_FULL_SAFE\s+14238',cfg), 'EFeru full-safe SVPWM reference vector must be 14238'
@@ -110,7 +115,7 @@ def check_static():
     assert 'VESC_TX_QUEUE_DEPTH' in vp and 'vesc_tx_service' in vp and 'HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n)' in vp, 'VESC reply path must use nonblocking USART3 TX DMA FIFO'
     assert 'while (huart3.gState != HAL_UART_STATE_READY)' not in vp, 'VESC reply path must never busy-wait on UART TX'
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
-    assert 'COMM_DETECT_HALL_FOC' in vp and 'hall_detect_begin' in vp and 'hall_detect_periodic' in vp, 'VESC-standard async Hall detect command missing'
+    assert 'COMM_DETECT_HALL_FOC' in vp and 'mcpwm_foc_hall_detect_command_start' in vp and 'mcpwm_foc_hall_detect_process' in vp, 'VESC-standard async Hall detect command missing'
     assert 'case COMM_DETECT_ENCODER:' in vp and 'mc_interface_steering_detect_calibrate' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect + steering commissioning command missing'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
@@ -191,6 +196,8 @@ def check_static():
     mainc=(ROOT/'Src/main.c').read_text()
     assert '!vescLinkActive && !timeoutFlgSerial && enable == 0' in mainc, 'legacy blocking enable handshake must be suppressed while VESC link is armed'
     assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
+    assert 'mcpwm_foc_get_tot_current_motor(false) * 100.0f' in mainc and 'mcpwm_foc_get_tot_current_motor(true) * 100.0f' in mainc, 'legacy currentMotor must be signed DQ magnitude, not Iq'
+    assert 'feedback.currentMotorL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_iq_q4);' not in mainc, 'obsolete legacy currentMotor=Iq mapping remains'
     assert 'feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);' in mainc, 'custom telemetry right Vq sign not normalized'
     h=hashlib.sha256((ROOT/'Src/vesc/datatypes.h').read_bytes()).hexdigest()
     assert h == EXPECTED_DATATYPES_SHA256, f'datatypes.h SHA mismatch: {h}'
@@ -233,6 +240,7 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_v14_features.py'])
     run([sys.executable,'tools/tests/host/test_bootloader_layout.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
+    run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_recovery.py'])
     run([sys.executable,'tools/tests/host/test_v15_features.py'])
     run([sys.executable,'tools/tests/host/test_v16_features.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
