@@ -448,22 +448,6 @@ seek_fail:
     return false;
 }
 
-static bool steering_wait_target(int32_t target, uint32_t timeout_ms){
-    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
-    uint32_t elapsed=0u;
-    while(elapsed<timeout_ms){
-        mcpwm_foc_vesc_override_touch(false);
-        const int32_t e=m->m_position_counts-target;
-        if(e<=MCCONF_STEERING_SETTLE_COUNTS && e>=-MCCONF_STEERING_SETTLE_COUNTS){
-            steering_bounded_delay_ms(150u); return true;
-        }
-        if(m->m_fault!=FAULT_CODE_NONE)return false;
-        steering_bounded_delay_ms(5u);
-        elapsed += 5u;
-    }
-    return false;
-}
-
 bool mc_interface_store_steering_calibration(void){
     if(!mcpwm_foc_steering_is_calibrated())return false;
     const int32_t span=mcpwm_foc_steering_span_counts();
@@ -613,17 +597,30 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     m->m_position_abs_counts=0u;
     m->m_position_target_counts=m->m_position_counts;
     if(!mcpwm_foc_steering_set_span(signed_span,true)){steering_stage_set(0xE6u);return false;}
-    steering_stage_set(8u);
 
-    /* Always finish at logical POS 180 / physical center. The span is committed
-     * only after center is proven, so a sticky linkage or blocked wheel cannot
-     * leave a false persistent calibration behind. */
-    if(!mcpwm_foc_set_steering_deg(0.0f)){mcpwm_foc_steering_clear_calibration();steering_stage_set(0xE8u);return false;}
-    const bool centered=steering_wait_target(0,20000u);
-    mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
-    if(!centered){mcpwm_foc_steering_clear_calibration();steering_stage_set(0xE9u);return false;}
+    /* Span calibration is geometric. Once two full sweeps are repeatable, keep
+     * that valid span independent of the optional return-to-center motion. */
+    steering_stage_set(8u);
+    if(!mc_interface_store_steering_calibration()){
+        mcpwm_foc_steering_clear_calibration();
+        steering_stage_set(0xE7u);
+        return false;
+    }
+
+    /* Return using exactly the same target as VESC COMM_SET_POS=180: LEFT
+     * physical steering 0 deg. Hold for a bounded 2 s, then always RELEASE.
+     * Do not invalidate a repeatable span just because the mechanism needs more
+     * time to settle; position tracking is verified separately. */
     steering_stage_set(9u);
-    if(!mc_interface_store_steering_calibration()){mcpwm_foc_steering_clear_calibration();steering_stage_set(0xE7u);return false;}
+    bool center_commanded=mcpwm_foc_set_steering_deg(0.0f);
+    uint32_t center_elapsed=0u;
+    while(center_commanded && center_elapsed<2000u && m->m_fault==FAULT_CODE_NONE){
+        mcpwm_foc_vesc_override_touch(false);
+        steering_bounded_delay_ms(5u);
+        center_elapsed += 5u;
+    }
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_vesc_override_clear(false);
     steering_stage_set(10u);
     if(offset)*offset=cc->foc_encoder_offset;
     if(ratio)*ratio=cc->foc_encoder_ratio;

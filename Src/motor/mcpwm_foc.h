@@ -158,6 +158,15 @@ typedef struct {
     volatile uint16_t m_phase_openloop;
     volatile uint8_t m_phase_override;
 
+    /* Independent VESC FOC flux observer used by the standard Rotor Position
+     * diagnostics. It is deliberately separate from m_phase: Encoder/Hall may
+     * be authoritative for Park/SVPWM while Observer must remain an estimator. */
+    float m_observer_x1;
+    float m_observer_x2;
+    float m_observer_l_ia;
+    float m_observer_l_ib;
+    volatile uint8_t m_observer_valid;
+
     /* VESC ABI encoder runtime state. Only motor LEFT can own TIM4/PB6/PB7. */
     volatile uint32_t m_encoder_raw_count;
     uint32_t m_encoder_prev_count;
@@ -385,6 +394,8 @@ float mcpwm_foc_get_iq_motor(bool is_second_motor);
 float mcpwm_foc_get_vd_motor(bool is_second_motor);
 float mcpwm_foc_get_vq_motor(bool is_second_motor);
 float mcpwm_foc_get_phase_motor(bool is_second_motor);
+float mcpwm_foc_get_phase_observer_motor(bool is_second_motor); /* independent FOC observer */
+bool mcpwm_foc_observer_valid(bool is_second_motor);
 float mcpwm_foc_get_phase_encoder_motor(bool is_second_motor); /* corrected electrical */
 float mcpwm_foc_get_encoder_position_motor(bool is_second_motor); /* raw mechanical ABI */
 float mcpwm_foc_get_pid_pos_now_motor(bool is_second_motor);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, socket, struct, subprocess, sys, time
+import argparse, os, signal, socket, struct, subprocess, sys, time
 from pathlib import Path
 
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
@@ -36,17 +36,46 @@ class Link:
             out.append((pid,cmd))
         return out
 
-    def _open_tcp(self):
+    def _open_tcp(self, attempts=2):
         last=None
-        for attempt in range(1,11):
+        for attempt in range(1, attempts + 1):
             try:
-                self.sock=socket.create_connection((self.args.host,self.args.port),timeout=2)
-                self.sock.settimeout(.1); self.buf.clear(); time.sleep(.35)
+                self.sock=socket.create_connection((self.args.host,self.args.port),timeout=.75)
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock.settimeout(.10); self.buf.clear(); time.sleep(.12)
                 return
             except OSError as e:
                 last=e; self.sock=None
-                if attempt<10: time.sleep(.25)
+                if attempt < attempts: time.sleep(.12)
         raise RuntimeError(f'cannot connect F411 ROS gateway TCP {self.args.host}:{self.args.port}: {last}')
+
+    def _tcp_probe(self, timeout=.8):
+        try:
+            p=self.transact(bytes((COMM_FW_VERSION,)),COMM_FW_VERSION,timeout)
+            return bool(p and p[0]==COMM_FW_VERSION)
+        except Exception:
+            return False
+
+    def _stop_official_bridge(self, official):
+        if not official: return
+        pids=[pid for pid,_ in official]
+        print(f'[F411] TCP unavailable/unhealthy; stopping stmf4_hmi_bridge pid={pids} for direct CDC upload',flush=True)
+        for pid in pids:
+            try: os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+        deadline=time.monotonic()+4.0
+        while time.monotonic()<deadline:
+            remain=[x for x in self._holders(self.args.serial_port) if x[0] in pids]
+            if not remain: return
+            time.sleep(.10)
+        for pid in pids:
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        deadline=time.monotonic()+2.0
+        while time.monotonic()<deadline:
+            if not any(x[0] in pids for x in self._holders(self.args.serial_port)): return
+            time.sleep(.10)
+        raise RuntimeError(f'F411 CDC still held after stopping stmf4_hmi_bridge pid={pids}')
 
     def reconnect_tcp(self):
         if self.sock:
@@ -98,8 +127,20 @@ class Link:
             if other:
                 pid,cmd=other[0]; raise RuntimeError(f'F411 CDC busy by non-gateway pid={pid}: {cmd[:160]}')
             if official:
-                print(f'[F411] CDC owned by stmf4_hmi_bridge pid={official[0][0]}; using local gateway TCP',flush=True)
-                self._open_tcp(); return
+                print(f'[F411] CDC owned by stmf4_hmi_bridge pid={official[0][0]}; probing TCP {self.args.host}:{self.args.port}',flush=True)
+                try:
+                    self._open_tcp(attempts=2)
+                    if self._tcp_probe(.8):
+                        print('[F411] TCP maintenance path healthy; using TCP',flush=True)
+                        return
+                    print('[F411] TCP connected but VESC probe failed; falling back to direct CDC',flush=True)
+                except Exception as e:
+                    print(f'[F411] TCP path unavailable: {e}; falling back to direct CDC',flush=True)
+                if self.sock:
+                    try:self.sock.close()
+                    except Exception:pass
+                    self.sock=None; self.buf.clear()
+                self._stop_official_bridge(official)
             self._open_f411_direct(); return
         import serial
         self.ser=serial.Serial(self.args.serial_port,self.args.baud,timeout=.1,write_timeout=2)
@@ -212,7 +253,7 @@ def upload(link,fw:bytes):
             hw=fw_version(link,4); break
         except Exception as e:
             last_error=e
-            if link.sock is not None or link.args.transport=='tcp':
+            if link.sock is not None and link.args.transport=='tcp':
                 try:
                     link.reconnect_tcp()
                     print(f'[VESC] reconnect initial probe attempt={attempt+1}',flush=True)

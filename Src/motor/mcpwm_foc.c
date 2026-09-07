@@ -88,6 +88,8 @@ int16_t curL_phaA = 0, curL_phaB = 0, curL_DC = 0;
 int16_t curR_phaB = 0, curR_phaC = 0, curR_DC = 0;
 int16_t batVoltage = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE;
 static int32_t batVoltageFixdt = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE << 16;
+
+static float bus_voltage_now(void);
 /* VESC: mod = Vdq * 1.5 / Vbus. Internal 16000 == mod 1.0.
  * Cache reciprocal scales when the slow battery filter updates so the 5.33-kHz
  * current regulator needs only multiply/shift, no floating point or division. */
@@ -409,6 +411,11 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_current_kp = 0.80013f;
     c->foc_current_ki = 266.710f;
     c->foc_current_filter_const = MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+    /* VESC 6.00 defaults for the independent FOC rotor observer. The model
+     * R/L/flux and main gain are populated by motor detection or MC config. */
+    c->foc_observer_type = FOC_OBSERVER_ORTEGA_ORIGINAL;
+    c->foc_observer_gain_slow = 0.05f;
+    c->foc_observer_offset = 0.0f;
     c->foc_encoder_offset = MCCONF_ENCODER_OFFSET_DEFAULT;
     c->foc_encoder_inverted = false;
     c->foc_encoder_ratio = (float)default_motor_poles(second) * 0.5f;
@@ -3005,6 +3012,96 @@ static void telemetry_avg_push(mcpwm_foc_motor_t *m, int16_t id_q4, int16_t iq_q
     m->m_telem_avg_samples++;
 }
 
+/* VESC-standard independent FOC observer for Rotor Position diagnostics.
+ *
+ * The actuator phase m_phase can be Encoder/Hall corrected and therefore must
+ * never be used as mcpwm_foc_get_phase_observer(). This diagnostic observer is
+ * an Ortega flux observer, matching the default VESC 6.00 observer equation.
+ * It runs only on this motor's current-regulator slot to preserve the proven
+ * F103 ISR budget; the 50/100-Hz diagnostic output remains fully realtime.
+ * No atan2 is executed in the ADC ISR -- phase conversion happens on readout. */
+static bool foc_observer_model_valid(const mcpwm_foc_motor_t *m) {
+    if (!m) return false;
+    const mc_configuration *c=&m->m_conf;
+    return c->foc_observer_type==FOC_OBSERVER_ORTEGA_ORIGINAL &&
+           isfinite(c->foc_motor_r) && c->foc_motor_r>0.0f && c->foc_motor_r<=2.0f &&
+           isfinite(c->foc_motor_l) && c->foc_motor_l>0.0f && c->foc_motor_l<=0.1f &&
+           isfinite(c->foc_motor_flux_linkage) && c->foc_motor_flux_linkage>0.000001f && c->foc_motor_flux_linkage<=1.0f &&
+           isfinite(c->foc_observer_gain) && c->foc_observer_gain>0.0f;
+}
+
+static void foc_observer_bootstrap(mcpwm_foc_motor_t *m, float lia, float lib) {
+    const float lambda=m->m_conf.foc_motor_flux_linkage;
+    int16_t sn=0,cs=32767;
+    foc_sin_cos_q15(m->m_phase,&sn,&cs);
+    m->m_observer_x1=lambda*((float)cs/32767.0f)+lia;
+    m->m_observer_x2=lambda*((float)sn/32767.0f)+lib;
+    m->m_observer_l_ia=lia;
+    m->m_observer_l_ib=lib;
+    m->m_observer_valid=1u;
+}
+
+static void foc_observer_update_diag(mcpwm_foc_motor_t *m) {
+    if (!foc_observer_model_valid(m)) { m->m_observer_valid=0u; return; }
+    const mc_configuration *c=&m->m_conf;
+    const float inv_i=1.0f/(float)FOC_CURRENT_Q4_PER_A;
+    const float ia=(float)m->m_i_alpha_q4*inv_i;
+    const float ib=(float)m->m_i_beta_q4*inv_i;
+    const float id=(float)m->m_id_q4*inv_i;
+    const float iq=(float)m->m_iq_q4*inv_i;
+    float L=c->foc_motor_l;
+    if (fabsf(id)>0.1f || fabsf(iq)>0.1f) {
+        const float den=id*id+iq*iq;
+        if (den>0.000001f) L=L-c->foc_motor_ld_lq_diff*0.5f+c->foc_motor_ld_lq_diff*(iq*iq/den);
+    }
+    const float lia=L*ia, lib=L*ib;
+    if (!m->m_observer_valid || !isfinite(m->m_observer_x1) || !isfinite(m->m_observer_x2)) {
+        foc_observer_bootstrap(m,lia,lib); return;
+    }
+
+    /* Use the voltage vector that produced this current sample (previous held
+     * D/Q output), exactly as a model observer should. Internal 16000 modulation
+     * maps to Vdq = mod*Vbus/1.5 in upstream VESC. */
+    const foc_dq_t vprev={m->m_vd,m->m_vq};
+    foc_ab_t vab={0,0};
+    foc_inv_park(&vprev,m->m_phase,&vab);
+    const float vin=bus_voltage_now();
+    const float vscale=vin/(1.5f*(float)MCCONF_FOC_VOLTAGE_MAX);
+    const float va=(float)vab.alpha*vscale;
+    const float vb=(float)vab.beta*vscale;
+    const float lambda=c->foc_motor_flux_linkage;
+    const float ex=m->m_observer_x1-lia;
+    const float ey=m->m_observer_x2-lib;
+    float err=lambda*lambda-(ex*ex+ey*ey);
+    if (err>0.0f) err=0.0f; /* VESC Ortega convergence rule */
+
+    float slow=c->foc_observer_gain_slow;
+    if (!isfinite(slow) || slow<0.0f) slow=0.05f;
+    if (slow>1.0f) slow=1.0f;
+    float duty=(float)m->m_duty_now_permille/1000.0f;
+    if (duty<0.0f) duty=-duty;
+    float gain_scale=duty*vin/40.0f;
+    if (gain_scale<slow) gain_scale=slow;
+    const float gamma_half=(c->foc_observer_gain*gain_scale*4.0f)*0.5f;
+    const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
+    m->m_observer_x1 += (va-c->foc_motor_r*ia + gamma_half*ex*err)*dt;
+    m->m_observer_x2 += (vb-c->foc_motor_r*ib + gamma_half*ey*err)*dt;
+    m->m_observer_l_ia=lia;
+    m->m_observer_l_ib=lib;
+
+    const float limit=lambda*8.0f;
+    if (!isfinite(m->m_observer_x1) || !isfinite(m->m_observer_x2) ||
+        fabsf(m->m_observer_x1)>limit || fabsf(m->m_observer_x2)>limit) {
+        foc_observer_bootstrap(m,lia,lib); return;
+    }
+    /* Upstream prevents observer-vector magnitude from collapsing. */
+    const float mag2=m->m_observer_x1*m->m_observer_x1+m->m_observer_x2*m->m_observer_x2;
+    if (mag2 < lambda*lambda*0.25f) {
+        m->m_observer_x1*=1.1f;
+        m->m_observer_x2*=1.1f;
+    }
+}
+
 static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_counts,
                                int16_t i1_counts, int16_t idc_counts, bool control_update) {
     const uint32_t profSensorStart=DWT->CYCCNT;
@@ -3180,6 +3277,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         m->m_iq_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[1],a,m->m_iq_q4);
         m->m_current_in_telem_counts=telemetry_lpf_step(&m->m_telem_current_lpf_q16[2],a,m->m_current_in_counts);
         telemetry_avg_push(m,m->m_id_telem_q4,m->m_iq_telem_q4,m->m_current_in_telem_counts);
+        foc_observer_update_diag(m);
         { const uint32_t c=DWT->CYCCNT-profCurrentStart; if(c>foc_prof_current_max_cycles)foc_prof_current_max_cycles=c; }
     }
 
@@ -4067,6 +4165,19 @@ void mcpwm_foc_energy_update(uint32_t now_ms) {
 float mcpwm_foc_get_vd_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vd*(bus_voltage_now()/(1.5f*(float)MCCONF_FOC_VOLTAGE_MAX));}
 float mcpwm_foc_get_vq_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_vq*(bus_voltage_now()/(1.5f*(float)MCCONF_FOC_VOLTAGE_MAX));}
 float mcpwm_foc_get_phase_motor(bool s){return (float)mcpwm_foc_get_motor_const(s)->m_phase*(360.0f/65536.0f);}
+bool mcpwm_foc_observer_valid(bool s){return mcpwm_foc_get_motor_const(s)->m_observer_valid!=0u && foc_observer_model_valid(mcpwm_foc_get_motor_const(s));}
+float mcpwm_foc_get_phase_observer_motor(bool s){
+    const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(s);
+    if(!mcpwm_foc_observer_valid(s))return 0.0f;
+    float deg=atan2f(m->m_observer_x2-m->m_observer_l_ib,m->m_observer_x1-m->m_observer_l_ia)*(180.0f/3.14159265358979323846f);
+    /* Same switching-lag compensation concept as upstream m_phase_now_observer.
+     * This port updates the diagnostic observer at the current-regulator cadence. */
+    const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
+    deg += mcpwm_foc_get_erpm_motor(s)*6.0f*dt*(0.5f+m->m_conf.foc_observer_offset);
+    while(deg>=360.0f)deg-=360.0f;
+    while(deg<0.0f)deg+=360.0f;
+    return deg;
+}
 float mcpwm_foc_get_phase_encoder_motor(bool s){
     const mcpwm_foc_motor_t*m=mcpwm_foc_get_motor_const(s);
     return (!s && m->m_encoder_configured)?(float)m->m_phase_encoder*(360.0f/65536.0f):0.0f;

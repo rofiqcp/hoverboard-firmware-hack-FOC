@@ -523,19 +523,17 @@ static float steering_vesc_position_deg(void) {
 static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
     if (!out) return false;
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
-    const float phase = mcpwm_foc_get_phase_motor(second);
     switch (mode) {
     case DISP_POS_MODE_OBSERVER:
-        /* Hall-only FOC has no sensorless observer. m_phase is the live
-         * interpolated electrical phase actually used by Park/SVPWM, which is
-         * the correct observer-equivalent display quantity on this hardware. */
-        *out = phase;
+        /* Upstream VESC: mcpwm_foc_get_phase_observer(). This MUST be the
+         * independent flux observer, never the Encoder/Hall corrected m_phase. */
+        *out = mcpwm_foc_get_phase_observer_motor(second);
         return true;
     case DISP_POS_MODE_ENCODER:
-        /* VESC main.c mengirim encoder_read_deg(): mechanical sensor angle,
-         * bukan corrected electrical phase. */
+        /* Upstream VESC: encoder_read_deg() = mechanical encoder angle. There
+         * is no phase/Hall fallback when an encoder is not configured. */
         *out = (!second && m->m_encoder_configured) ?
-            mcpwm_foc_get_encoder_position_motor(false) : phase;
+            mcpwm_foc_get_encoder_position_motor(false) : 0.0f;
         return true;
     case DISP_POS_MODE_PID_POS:
         /* Match COMM_GET_VALUES.position exactly. LEFT is a calibrated steering
@@ -567,15 +565,17 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         return true;
     }
     case DISP_POS_MODE_ENCODER_OBSERVER_ERROR:
-        if(!second && m->m_encoder_configured)
-            /* Target belum memiliki observer sensorless; active phase adalah
-             * referensi FOC terdekat. Gunakan sign upstream: observer-encoder. */
-            *out = wrap_angle_diff_deg(phase,mcpwm_foc_get_phase_encoder_motor(false));
+        /* Upstream VESC: angle_difference(observer electrical, encoder electrical). */
+        if(!second && m->m_encoder_configured && mcpwm_foc_observer_valid(false))
+            *out = wrap_angle_diff_deg(mcpwm_foc_get_phase_observer_motor(false),
+                                       mcpwm_foc_get_phase_encoder_motor(false));
         else *out = 0.0f;
         return true;
     case DISP_POS_MODE_HALL_OBSERVER_ERROR: {
+        /* Upstream VESC: angle_difference(observer electrical, Hall electrical). */
         const float hall = (float)m->m_phase_hall * (360.0f / 65536.0f);
-        *out = wrap_angle_diff_deg(phase, hall);
+        *out = mcpwm_foc_observer_valid(second) ?
+            wrap_angle_diff_deg(mcpwm_foc_get_phase_observer_motor(second), hall) : 0.0f;
         return true;
     }
     default:
@@ -2001,6 +2001,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         float encoder=0.0f, observer=0.0f, pid_pos=0.0f;
         float obs_enc=0.0f, obs_hall=0.0f, pid_error=0.0f;
         const bool encoder_valid=!second && m->m_encoder_configured;
+        const bool observer_valid=mcpwm_foc_observer_valid(second);
         const bool hall_valid=(m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL) && m->m_hall_initialized;
         (void)display_rotor_pos(second,DISP_POS_MODE_OBSERVER,&observer);
         (void)display_rotor_pos(second,DISP_POS_MODE_PID_POS,&pid_pos);
@@ -2012,10 +2013,10 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         if(hall_valid)(void)display_rotor_pos(second,DISP_POS_MODE_HALL_OBSERVER_ERROR,&obs_hall);
         uint8_t flags=0u;
         if(encoder_valid)flags|=0x01u; /* mechanical encoder */
-        flags|=0x02u;                 /* observer / active FOC phase */
+        if(observer_valid)flags|=0x02u;/* independent FOC observer */
         flags|=0x04u;                 /* PID position */
-        if(encoder_valid)flags|=0x08u;/* observer - encoder */
-        if(hall_valid)flags|=0x10u;   /* observer - Hall */
+        if(encoder_valid && observer_valid)flags|=0x08u;/* observer - encoder */
+        if(hall_valid && observer_valid)flags|=0x10u;   /* observer - Hall */
         flags|=0x20u;                 /* PID setpoint - position */
         /* bit6 = inductance/detect signal valid; deliberately clear for now. */
         uint8_t b[48]; int32_t j=0;

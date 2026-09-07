@@ -199,6 +199,8 @@ void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
 float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
+bool mcpwm_foc_observer_valid(bool second) { (void)second; return true; }
+float mcpwm_foc_get_phase_observer_motor(bool second) { return second?210.0f:100.0f; }
 float mcpwm_foc_get_phase_encoder_motor(bool second) { return second?0.0f:12.5f; }
 float mcpwm_foc_get_encoder_position_motor(bool second) { return second?0.0f:12.5f; }
 bool mcpwm_foc_encoder_is_synced(bool second) { return !second && diag_motors[0].m_encoder_synced!=0u; }
@@ -434,21 +436,61 @@ int main(void){
     }
 
     uint8_t gvr[]={COMM_FORWARD_CAN,2u,COMM_GET_VALUES}; if(!transact(gvr,sizeof(gvr),r,&rn) || check_values_reply(r,rn,true)) return 1;
-    /* Upstream VESC: COMM_SET_DETECT selects a display mode and the 10-ms
-     * periodic thread sends unsolicited COMM_ROTOR_POSITION = deg*100000. */
+    /* Upstream VESC 6.00 rotor-position contract. Exercise all seven buttons:
+     * Inductance is BLDC detection-only; the six FOC/position traces must be
+     * sourced independently and encoded as COMM_ROTOR_POSITION deg*100000. */
     {
-        uint8_t sd[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_OBSERVER};
-        if(!transact(sd,sizeof(sd),r,&rn)||rn!=0u)return fail("set detect local");
-        diag_motors[0].m_phase=16384u; /* 90 electrical deg */
+        int32_t pi=1;
+        diag_motors[0].m_encoder_configured=1u;
+        uint8_t ind[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_INDUCTANCE};
+        if(!transact(ind,sizeof(ind),r,&rn)||rn!=0u)return fail("set detect inductance");
         tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
-        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("rotor stream local packet");
-        int32_t pi=1; if(buffer_get_int32(r,&pi)!=9000000)return fail("rotor stream local value");
+        if(tx_capture_len!=0u)return fail("FOC inductance must be detection-only");
+
+        uint8_t enc[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_ENCODER};
+        if(!transact(enc,sizeof(enc),r,&rn)||rn!=0u)return fail("set detect encoder");
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("encoder rotor packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=1250000)return fail("encoder must be mechanical 12.5deg");
+
+        uint8_t obs[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_OBSERVER};
+        if(!transact(obs,sizeof(obs),r,&rn)||rn!=0u)return fail("set detect observer");
+        diag_motors[0].m_phase=16384u; /* active phase intentionally differs: 90deg */
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("observer rotor packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=10000000)return fail("observer must not alias active phase");
+
+        uint8_t pid[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_PID_POS};
+        if(!transact(pid,sizeof(pid),r,&rn)||rn!=0u)return fail("set detect pid pos");
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("pid position packet");
+        pi=1; { const int32_t got=buffer_get_int32(r,&pi); const float exp=(12.5f-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG); int32_t d=got-(int32_t)lroundf(exp*100000.0f); if(d<0)d=-d; if(d>2)return fail("pid position steering feedback"); }
+
+        diag_motors[0].m_pos_pid_phase_mode=1u; set_pos[0]=22.5f;
+        uint8_t pe[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_PID_POS_ERROR};
+        if(!transact(pe,sizeof(pe),r,&rn)||rn!=0u)return fail("set detect pid error");
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("pid error packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=1000000)return fail("pid error setpoint-now");
+
+        uint8_t oe[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_ENCODER_OBSERVER_ERROR};
+        if(!transact(oe,sizeof(oe),r,&rn)||rn!=0u)return fail("set detect obs enc");
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("obs-vs-enc packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=8750000)return fail("obs-vs-enc must be observer-encoder");
+
+        diag_motors[1].m_phase_hall=32768u; /* 180deg */
+        uint8_t oh[]={COMM_FORWARD_CAN,2u,COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_HALL_OBSERVER_ERROR};
+        if(!transact(oh,sizeof(oh),r,&rn)||rn!=0u)return fail("set detect obs hall");
+        tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("obs-vs-hall packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=3000000)return fail("obs-vs-hall must be observer-hall");
+
         uint8_t sdr[]={COMM_FORWARD_CAN,2u,COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_OBSERVER};
-        if(!transact(sdr,sizeof(sdr),r,&rn)||rn!=0u)return fail("set detect right");
-        diag_motors[1].m_phase=32768u; /* 180 electrical deg */
+        if(!transact(sdr,sizeof(sdr),r,&rn)||rn!=0u)return fail("set detect right observer");
         tick_ms+=11u; tx_capture_len=0u; vesc_protocol_periodic(tick_ms);
-        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("rotor stream right packet");
-        pi=1; if(buffer_get_int32(r,&pi)!=18000000)return fail("rotor stream right value");
+        if(!decode_tx(r,&rn)||rn!=5u||r[0]!=COMM_ROTOR_POSITION)return fail("right observer packet");
+        pi=1; if(buffer_get_int32(r,&pi)!=21000000)return fail("right observer independent value");
         uint8_t off[]={COMM_SET_DETECT,(uint8_t)DISP_POS_MODE_NONE};
         if(!transact(off,sizeof(off),r,&rn))return fail("set detect off");
     }

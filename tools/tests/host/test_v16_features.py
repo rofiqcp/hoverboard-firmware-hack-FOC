@@ -85,7 +85,8 @@ assert 'const uint32_t vesc_now_ms = HAL_GetTick();' in main and 'vesc_protocol_
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'realtime mailbox latest VESC-tool mapped setpoint' in host and 'request/reply only' in host
-assert 'rotor stream local value' in host and 'rotor stream right value' in host
+assert 'observer must not alias active phase' in host and 'obs-vs-enc must be observer-encoder' in host and 'right observer independent value' in host
+assert 'm_observer_x1' in mch and 'mcpwm_foc_get_phase_observer_motor' in mc and 'foc_observer_update_diag' in mc, 'independent VESC observer diagnostic missing'
 
 
 assert 'MCCONF_HALL_DEBOUNCE_SAMPLES' in mcc and 'm_hall_candidate_count' in mc, 'Hall GPIO debounce missing'
