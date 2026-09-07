@@ -64,6 +64,9 @@ typedef struct {
     volatile uint32_t m_tachometer_abs;
     uint8_t m_tacho_step_last;
     volatile int32_t m_position_target_counts;
+    volatile int32_t m_position_pid_target_counts; /* slew-limited target actually used by PID */
+    int32_t m_position_target_ramp_q16;
+    uint32_t m_position_target_ramp_step_q16;
     volatile int32_t m_position_min_counts;
     volatile int32_t m_position_max_counts;
     /* LEFT steering calibration. span is signed user-direction count travel

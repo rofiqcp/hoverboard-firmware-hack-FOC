@@ -1101,6 +1101,27 @@ static void reset_current_pi(mcpwm_foc_motor_t *m) {
     m->m_iq_sat_hold = 0; m->m_id_sat_hold = 0;
 }
 
+static int32_t steering_target_slew_step(mcpwm_foc_motor_t *m) {
+    if(!m)return 0;
+    const int64_t target_q16=(int64_t)m->m_position_target_counts<<16;
+    int64_t ramp_q16=(int64_t)m->m_position_target_ramp_q16;
+    const uint32_t step=m->m_position_target_ramp_step_q16;
+    if(step==0u){
+        ramp_q16=target_q16;
+    }else if(ramp_q16<target_q16){
+        ramp_q16 += (int64_t)step;
+        if(ramp_q16>target_q16)ramp_q16=target_q16;
+    }else if(ramp_q16>target_q16){
+        ramp_q16 -= (int64_t)step;
+        if(ramp_q16<target_q16)ramp_q16=target_q16;
+    }
+    if(ramp_q16>INT32_MAX)ramp_q16=INT32_MAX;
+    if(ramp_q16<INT32_MIN)ramp_q16=INT32_MIN;
+    m->m_position_target_ramp_q16=(int32_t)ramp_q16;
+    m->m_position_pid_target_counts=(int32_t)(ramp_q16>>16);
+    return m->m_position_pid_target_counts;
+}
+
 static void set_control_mode(mcpwm_foc_motor_t *m, mc_control_mode mode);
 
 static void speed_setpoint_slew_step(mcpwm_foc_motor_t *m) {
@@ -1209,7 +1230,6 @@ void mcpwm_foc_set_pid_pos(float position_deg,bool second){
     const int16_t target_delta=(int16_t)(new_phase-m->m_pos_pid_set_phase);
     const bool target_changed=(target_delta>64 || target_delta<-64);
     set_control_mode(m,CONTROL_MODE_POS);
-    if(branch_change) reset_position_pid(m);
     if(target_changed && !branch_change){
         m->m_position_breakaway_ticks=0u;m->m_position_no_motion_ticks=0u;m->m_position_motion_seen=0u;
         m->m_position_step_braking=0u;m->m_position_brake_direction=0;
@@ -1223,10 +1243,15 @@ void mcpwm_foc_set_position_counts(int32_t pc,bool second){
     mcpwm_foc_motor_t*m=mcpwm_foc_get_motor(second);
     if(pc<m->m_position_min_counts)pc=m->m_position_min_counts;
     if(pc>m->m_position_max_counts)pc=m->m_position_max_counts;
+    const bool count_mode_active=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode==0u);
     const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode!=0u);
     const bool target_changed=(pc!=m->m_position_target_counts);
     set_control_mode(m,CONTROL_MODE_POS);
-    if(branch_change) reset_position_pid(m);
+    if(!count_mode_active || branch_change){
+        m->m_position_target_ramp_q16=m->m_position_counts<<16;
+        m->m_position_pid_target_counts=m->m_position_counts;
+        reset_position_pid(m);
+    }
     if(target_changed && !branch_change){
         m->m_position_breakaway_ticks=0u; m->m_position_no_motion_ticks=0u;
         m->m_position_last_motion_count=m->m_position_counts;
@@ -1247,6 +1272,8 @@ void mcpwm_foc_steering_clear_calibration(void){
     m->m_position_min_counts=INT32_MIN;
     m->m_position_max_counts=INT32_MAX;
     m->m_position_target_counts=m->m_position_counts;
+    m->m_position_pid_target_counts=m->m_position_counts;
+    m->m_position_target_ramp_q16=m->m_position_counts<<16;
     reset_position_pid(m);
 }
 
@@ -1275,6 +1302,16 @@ bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
     const int32_t half=safe_abs/2;
     m->m_position_min_counts=-half;
     m->m_position_max_counts= half;
+    {
+        uint64_t step=((uint64_t)safe_abs*(uint64_t)MCCONF_STEERING_SLEW_RATE_DEG_S*
+                       (uint64_t)MCCONF_FOC_CONTROL_DIV*65536ULL)/
+                      (60ULL*(uint64_t)PWM_FREQ);
+        if(step<1u)step=1u;
+        if(step>UINT32_MAX)step=UINT32_MAX;
+        m->m_position_target_ramp_step_q16=(uint32_t)step;
+    }
+    m->m_position_target_ramp_q16=m->m_position_counts<<16;
+    m->m_position_pid_target_counts=m->m_position_counts;
     return true;
 }
 
@@ -1283,6 +1320,8 @@ bool mcpwm_foc_steering_rebase_left(void){
     if(!m->m_steering_calibrated)return false;
     m->m_position_counts=0; m->m_position_abs_counts=0u;
     m->m_position_target_counts=0;
+    m->m_position_pid_target_counts=0;
+    m->m_position_target_ramp_q16=0;
     reset_position_pid(m);
     m->m_steering_homed=1u;
     return true;
@@ -1298,6 +1337,8 @@ bool mcpwm_foc_steering_rebase_center(void){
     m->m_position_counts=0;
     m->m_position_abs_counts=0u;
     m->m_position_target_counts=0;
+    m->m_position_pid_target_counts=0;
+    m->m_position_target_ramp_q16=0;
     reset_position_pid(m);
     m->m_steering_homed=1u;
     return true;
@@ -1369,6 +1410,8 @@ void mcpwm_foc_reset_position(bool second) {
     m->m_position_counts = 0;
     m->m_position_abs_counts = 0u;
     m->m_position_target_counts = 0;
+    m->m_position_pid_target_counts = 0;
+    m->m_position_target_ramp_q16 = 0;
     if (second) odom_r = 0;
     else odom_l = 0;
     reset_position_pid(m);
@@ -2627,14 +2670,22 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
         return (int16_t)(((int64_t)out_q15*limit_q4)/32768LL);
     }
 
-    /* Mode hitungan Hall multi-putaran: ubah selisih hitungan menjadi
-     * mili-derajat mekanik agar gain posisi tetap mengikuti skala VESC. */
-    int64_t ec64=(int64_t)m->m_position_target_counts-(int64_t)m->m_position_counts;
-    if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
-    count_error=(int32_t)ec64;
+    /* Count-position branch. Calibrated LEFT steering uses a slew-limited
+     * internal PID target while preserving the final COMM_SET_POS target. */
     const int32_t pp=(int32_t)motor_pole_pairs(second);
     const bool encoder_count_mode=encoder_port_active(m,second) && m->m_encoder_configured &&
                                   m->m_encoder_counts>=4u;
+    const bool steering_count_mode=encoder_count_mode && !second && m->m_steering_calibrated;
+    int32_t pid_target=m->m_position_target_counts;
+    if(steering_count_mode){
+        pid_target=steering_target_slew_step(m);
+    }else{
+        m->m_position_pid_target_counts=pid_target;
+        m->m_position_target_ramp_q16=pid_target<<16;
+    }
+    int64_t ec64=(int64_t)pid_target-(int64_t)m->m_position_counts;
+    if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
+    count_error=(int32_t)ec64;
     if(encoder_count_mode){
         if(!second && m->m_steering_calibrated && m->m_steering_span_counts!=0){
             /* Steering user coordinates are calibrated independently from the
@@ -2663,7 +2714,6 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
     }
     m->m_position_prev_error=(int16_t)count_error;
     const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
-    const bool steering_count_mode=encoder_count_mode && !second && m->m_steering_calibrated;
     uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
     if(steering_count_mode){
         uint32_t boosted=kp_eff*(uint32_t)MCCONF_STEERING_POSITION_KP_MULTIPLIER;
@@ -2720,14 +2770,12 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
      * standstill. m_rpm*pp is signed ERPM, so this is exactly -deg/s*Kd_proc. */
     int64_t dproc64=-(int64_t)m->m_rpm*(int32_t)motor_pole_pairs(second)*
                     (int64_t)m->m_position_kd_proc_coeff_q16;
-    /* In calibrated LEFT steering-count mode m_rpm is already in actuator/torque
-     * direction: positive Iq produces positive m_rpm while ABI counts move in
-     * their possibly inverted electrical direction. Therefore -m_rpm is the
-     * correct viscous damping term and MUST NOT be flipped by
-     * foc_encoder_inverted. Doing so creates anti-damping and violent
-     * center-crossing oscillation. Generic ABI phase-position mode keeps the
-     * historical electrical sign transform. */
-    if(encoder_count_mode && !steering_count_mode && m->m_conf.foc_encoder_inverted)
+    /* ABI encoder direction is electrical. For an inverted ABI encoder the
+     * measured mechanical RPM sign is opposite the user/count coordinate used
+     * by the position loop. Apply the same sign transform to process-D as the
+     * position error. This matches the historically stable steering behavior
+     * and prevents the center limit-cycle seen when the transform was omitted. */
+    if(encoder_count_mode && m->m_conf.foc_encoder_inverted)
         dproc64=-dproc64;
     dproc64 >>= 16;
     if(dproc64>32768)dproc64=32768; else if(dproc64<-32768)dproc64=-32768;

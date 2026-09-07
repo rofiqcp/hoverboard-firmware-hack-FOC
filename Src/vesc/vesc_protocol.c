@@ -2061,6 +2061,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
         buffer_append_int32(b,m->m_position_counts,&j);
         buffer_append_int32(b,m->m_position_target_counts,&j);
+        buffer_append_int32(b,m->m_position_pid_target_counts,&j);
         uart_send_payload(b,(uint16_t)j);
         return;
     }

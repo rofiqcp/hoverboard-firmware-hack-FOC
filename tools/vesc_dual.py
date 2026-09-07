@@ -1165,13 +1165,15 @@ class VescDual:
         edge_a,edge_b,edge_pb5,samples=struct.unpack_from(">IIII",p,q); q+=16
         current_ma=struct.unpack_from(">H",p,q)[0]; q+=2
         span,pos,target=struct.unpack_from(">iii",p,q); q+=12
+        pid_target=struct.unpack_from(">i",p,q)[0] if len(p)>=q+4 else target
+        if len(p)>=q+4: q+=4
         return {"align_stage":align_stage,"steering_stage":steer_stage,"detect_stage":detect_stage,
                 "inverted":bool(inverted),"configured":bool(configured),"synced":bool(synced),
                 "offset_deg":offset_mdeg/1000.0,"ratio":ratio_milli/1000.0,"raw":raw,
                 "before":before,"jog":jog,"back":back,"dj":dj,"db":db,
                 "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
                 "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
-                "span":span,"position":pos,"target":target}
+                "span":span,"position":pos,"target":target,"pid_target":pid_target}
 
     def set_steering_deg(self, deg: float):
         """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""

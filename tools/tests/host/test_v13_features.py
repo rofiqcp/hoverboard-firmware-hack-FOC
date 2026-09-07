@@ -27,9 +27,9 @@ assert 'position_pid_iq_target_step' in mc, 'position PID must feed Iq target'
 assert 'm_current_kpq_v_q16' in mc and 'm_current_kiq_dt_v_q16' in mc and 'm_current_kpd_v_q16' in mc and 'm_current_kid_dt_v_q16' in mc
 assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
 assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
-assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   3000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling must stay at 3 A'
+assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   4500u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling must stay at 4.5 A; minimum measured authority for asymmetric 360-side load'
 assert 'MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering Kp multiplier must stay bounded'
-assert 'encoder_count_mode && !steering_count_mode && m->m_conf.foc_encoder_inverted' in mc, 'steering process-D must not be inverted into anti-damping'
+assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' in mc, 'ABI process-D sign must follow encoder inversion in steering count mode'
 assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main, 'automatic 50 Hz legacy telemetry missing'
 assert 'no user-controlled live telemetry switch' in main, 'live-removal rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp
