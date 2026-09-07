@@ -69,12 +69,6 @@ static inline void encoder_stage_set(uint8_t stage) {
 #endif
 }
 volatile uint32_t foc_isr_cycles_max = 0;
-volatile uint32_t foc_isr_pre_max_cycles = 0;
-volatile uint32_t foc_isr_control_max_cycles = 0;
-volatile uint32_t foc_isr_post_max_cycles = 0;
-volatile uint32_t foc_step_left_max_cycles = 0;
-volatile uint32_t foc_step_right_max_cycles = 0;
-volatile uint32_t foc_slot_max_cycles[3] = {0u,0u,0u};
 volatile uint32_t foc_prof_sensor_max_cycles=0u;
 volatile uint32_t foc_prof_current_max_cycles=0u;
 volatile uint32_t foc_prof_regulator_max_cycles=0u;
@@ -817,9 +811,6 @@ void mcpwm_foc_init(void) {
     m_motor_1.m_off_offset0=offsetrlA; m_motor_1.m_off_offset1=offsetrlB; m_motor_1.m_off_offsetdc=offsetdcl;
     m_motor_2.m_off_offset0=offsetrrB; m_motor_2.m_off_offset1=offsetrrC; m_motor_2.m_off_offsetdc=offsetdcr;
     foc_isr_cycles = foc_isr_cycles_max = 0;
-    foc_isr_pre_max_cycles = foc_isr_control_max_cycles = foc_isr_post_max_cycles = 0;
-    foc_step_left_max_cycles = foc_step_right_max_cycles = 0;
-    foc_slot_max_cycles[0]=foc_slot_max_cycles[1]=foc_slot_max_cycles[2]=0u;
     foc_prof_sensor_max_cycles=foc_prof_current_max_cycles=foc_prof_regulator_max_cycles=foc_prof_svpwm_max_cycles=0u;
     s_overrun = 0;
     s_voltage_scale_bat_adc = INT16_MIN;
