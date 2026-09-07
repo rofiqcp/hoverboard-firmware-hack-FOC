@@ -1231,6 +1231,18 @@ void mcpwm_foc_set_position_user_counts(int32_t pc,bool second){
     mcpwm_foc_set_position_counts(user_position_to_internal(pc,second),second);
 }
 
+void mcpwm_foc_steering_clear_calibration(void){
+    mcpwm_foc_motor_t *m=&m_motor_1;
+    mcpwm_foc_release_motor(false);
+    m->m_steering_span_counts=0;
+    m->m_steering_calibrated=0u;
+    m->m_steering_homed=0u;
+    m->m_position_min_counts=INT32_MIN;
+    m->m_position_max_counts=INT32_MAX;
+    m->m_position_target_counts=m->m_position_counts;
+    reset_position_pid(m);
+}
+
 bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
     mcpwm_foc_motor_t *m=&m_motor_1;
     int32_t a=span_counts<0?-span_counts:span_counts;
@@ -2613,11 +2625,13 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
              * span already maps count direction to LEFT/RIGHT user direction. */
             const int32_t steering_span_abs=m->m_steering_span_counts<0?
                                             -m->m_steering_span_counts:m->m_steering_span_counts;
-            /* Keep torque sign in raw ABI count space. A negative logical span
-             * only swaps the 0/360 endpoint labels; it must never invert the
-             * position controller itself. */
+            /* Logical span sign only swaps the VESC 0/360 endpoint labels.
+             * Closed-loop torque direction is an electrical/ABI property and
+             * must follow foc_encoder_inverted, exactly like generic ABI mode.
+             * Otherwise a target toward center can drive farther into a stop. */
             error_mdeg=(int32_t)(((int64_t)count_error*60000LL)/
                                  (int64_t)steering_span_abs);
+            error_mdeg*=position_error_sign(m,second);
         }else{
             /* Generic ABI position: one custom count is one quadrature count. */
             error_mdeg=(int32_t)(((int64_t)count_error*360000LL)/(int64_t)m->m_encoder_counts);
@@ -2686,7 +2700,15 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
      * standstill. m_rpm*pp is signed ERPM, so this is exactly -deg/s*Kd_proc. */
     int64_t dproc64=-(int64_t)m->m_rpm*(int32_t)motor_pole_pairs(second)*
                     (int64_t)m->m_position_kd_proc_coeff_q16;
-    if(encoder_count_mode && m->m_conf.foc_encoder_inverted)dproc64=-dproc64;
+    /* In calibrated LEFT steering-count mode m_rpm is already in actuator/torque
+     * direction: positive Iq produces positive m_rpm while ABI counts move in
+     * their possibly inverted electrical direction. Therefore -m_rpm is the
+     * correct viscous damping term and MUST NOT be flipped by
+     * foc_encoder_inverted. Doing so creates anti-damping and violent
+     * center-crossing oscillation. Generic ABI phase-position mode keeps the
+     * historical electrical sign transform. */
+    if(encoder_count_mode && !steering_count_mode && m->m_conf.foc_encoder_inverted)
+        dproc64=-dproc64;
     dproc64 >>= 16;
     if(dproc64>32768)dproc64=32768; else if(dproc64<-32768)dproc64=-32768;
     const int32_t dproc_raw_q15=(int32_t)((dproc64*(int64_t)gain_scale)>>15);

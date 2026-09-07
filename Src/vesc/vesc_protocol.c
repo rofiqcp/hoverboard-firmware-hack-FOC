@@ -1932,6 +1932,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         if(mc_interface_steering_calibration_valid())flags|=0x01u;
         if(mcpwm_foc_steering_is_homed())flags|=0x02u;
         if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
+        if(mc_interface_steering_logical_inverted())flags|=0x08u;
         const int32_t sp=mcpwm_foc_steering_span_counts();
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
         b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u; b[j++]=flags;
@@ -1956,6 +1957,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         if(mc_interface_steering_calibration_valid())flags|=0x01u;
         if(mcpwm_foc_steering_is_homed())flags|=0x02u;
         if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
+        if(mc_interface_steering_logical_inverted())flags|=0x08u;
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
         b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=status; b[j++]=flags;
         buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
@@ -2410,6 +2412,14 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
             (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,0L,(long)(mc_interface_get_steering_deg()*1000.0f),
             (unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)m->m_encoder_configured,(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)m->m_conf.foc_encoder_inverted,(unsigned long)m->m_conf.m_encoder_counts,(double)m->m_conf.foc_encoder_ratio,(double)m->m_conf.foc_encoder_offset);terminal_send_text(o);return;
     }
+    if(!strcmp(a[0],"steering")){
+        if(second){terminal_send_text("ERR LEFT steering only\n");return;}
+        const char *sub=ac>1?a[1]:"status"; terminal_lower((char *)sub);
+        if(!strcmp(sub,"status")){int32_t n1=0,p1=0,n2=0,p2=0,s1=0,s2=0,tol=0;mc_interface_get_steering_span_diag(&n1,&p1,&n2,&p2,&s1,&s2,&tol);snprintf(o,sizeof(o),"steering cal=%u home=%u sync=%u logical_inv=%u span=%ld deg=%.3f pos360=%.1f sweep1=%ld/%ld span1=%ld sweep2=%ld/%ld span2=%ld tol=%ld\n",(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)mc_interface_steering_logical_inverted(),(long)mcpwm_foc_steering_span_counts(),(double)mc_interface_get_steering_deg(),(double)((mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG)),(long)n1,(long)p1,(long)s1,(long)n2,(long)p2,(long)s2,(long)tol);terminal_send_text(o);return;}
+        if(!strcmp(sub,"reset")){terminal_send_text(mc_interface_reset_steering_calibration()?"OK steering span reset; electrical encoder config preserved\n":"ERR steering reset\n");return;}
+        if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
+        terminal_send_text("ERR steering status|reset|invert 0|1\n");return;
+    }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
     if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){snprintf(o,sizeof(o),"isr=%lu/%lu overrun=%lu rx=%lu crc=%lu rxdrop=%lu txdrop=%lu gap=%lums\n",(unsigned long)mcpwm_foc_get_isr_cycles(),(unsigned long)mcpwm_foc_get_isr_cycles_max(),(unsigned long)m->m_overrun_count,(unsigned long)s_rx_ok,(unsigned long)s_rx_crc_err,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,(unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
@@ -2421,7 +2431,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"cancel")){terminal_cancel_detect();terminal_send_text("OK detect cancelled\n");return;}
         if(s_detect_all.active||s_hall_detect.active){terminal_send_text("ERR detect busy\n");return;}
         if(!strcmp(sub,"hall")){float x=3.0f;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}hall_detect_start_current(second,x);terminal_send_text("OK Hall detect started; poll 'detect'\n");return;}
-        if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Encoder detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f inv=%u stops=%ld/%ld span=%ld center=%ld\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp,0L);terminal_send_text(o);return;}
+        if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Steering span-only detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f logical_inv=%u stops=%ld/%ld span=%ld center=180\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp);terminal_send_text(o);return;}
         if(!strcmp(sub,"all")){if(second){terminal_send_text("ERR start from LEFT/ID1\n");return;}float loss=50,minin=cc->l_in_current_min,maxin=cc->l_in_current_max,ol=cc->foc_openloop_rpm,sl=cc->foc_sl_erpm;if(ac-base==5){if(!terminal_float(a[base],&loss)||!terminal_float(a[base+1],&minin)||!terminal_float(a[base+2],&maxin)||!terminal_float(a[base+3],&ol)||!terminal_float(a[base+4],&sl)){terminal_send_text("ERR args\n");return;}}else if(ac!=base){terminal_send_text("ERR detect all [LOSS MIN MAX OPENRPM SLERPM]\n");return;}uint8_t d[21];int32_t k=0;d[k++]=1;buffer_append_float32(d,loss,1e3f,&k);buffer_append_float32(d,minin,1e3f,&k);buffer_append_float32(d,maxin,1e3f,&k);buffer_append_float32(d,ol,1e3f,&k);buffer_append_float32(d,sl,1e3f,&k);detect_all_begin(d,sizeof(d));terminal_send_text("OK Detect-All started; poll 'detect'\n");return;}
         terminal_send_text("ERR detect status|hall|encoder|all|cancel\n");return;
     }

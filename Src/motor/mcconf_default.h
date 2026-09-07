@@ -51,8 +51,8 @@
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u /* worst-side -28 deg still saturated at 6 A; 8 A is final closed-loop ceiling, 53% of 15-A motor limit, +/-30 deg envelope */
-#define MCCONF_STEERING_POSITION_KP_MULTIPLIER        6u /* 0.025 VESC base -> 0.15 effective on calibrated steering */
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   3000u /* calibrated steering closed-loop ceiling; prevents high-energy oscillation while retaining measured breakaway authority */
+#define MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u /* 0.025 VESC base -> 0.075 effective; proportional through ~13 deg before 3-A ceiling */
 #define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       3500u /* measured minimum to cross worst static steering stiction */
 #define MCCONF_STEERING_BREAKAWAY_MAX_MS               0u /* disabled: standard position PID has enough 4-A authority */
 #define MCCONF_STEERING_BREAKAWAY_DELAY_MS           150u

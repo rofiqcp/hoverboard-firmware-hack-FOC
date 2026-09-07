@@ -429,6 +429,7 @@ void mcpwm_foc_adc_int_handler(void);
 #endif
 
 
+void mcpwm_foc_steering_clear_calibration(void);
 bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed);
 bool mcpwm_foc_steering_rebase_left(void);
 bool mcpwm_foc_steering_rebase_center(void);

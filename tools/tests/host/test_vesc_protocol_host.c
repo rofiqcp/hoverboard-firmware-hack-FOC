@@ -111,6 +111,10 @@ void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c;
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
 bool mc_interface_steering_calibration_valid(void){return true;}
+bool mc_interface_reset_steering_calibration(void){return true;}
+static bool mock_steering_logical_inv=false;
+bool mc_interface_steering_logical_inverted(void){return mock_steering_logical_inv;}
+bool mc_interface_set_steering_logical_inverted(bool v){mock_steering_logical_inv=v;return true;}
 bool mc_interface_store_steering_calibration(void){return true;}
 bool mc_interface_steering_boot_home(void){diag_motors[0].m_encoder_synced=1u;return true;}
 float mc_interface_get_steering_deg(void){return 12.5f;}
@@ -122,6 +126,16 @@ bool mc_interface_steering_detect_calibrate(float current,float *offset,float *r
     if(raw_right)*raw_right=683;
     if(span)*span=683;
     return true;
+}
+void mc_interface_get_steering_span_diag(int32_t *neg1,int32_t *pos1,int32_t *neg2,int32_t *pos2,
+                                         int32_t *span1,int32_t *span2,int32_t *tolerance){
+    if(neg1) *neg1=0;
+    if(pos1) *pos1=683;
+    if(neg2) *neg2=1;
+    if(pos2) *pos2=684;
+    if(span1) *span1=683;
+    if(span2) *span2=683;
+    if(tolerance) *tolerance=32;
 }
 void mcpwm_foc_sync_tuning_to_conf(bool second) { (void)second; }
 void mcpwm_foc_get_default_configuration(mc_configuration *c, bool second) {
