@@ -168,7 +168,7 @@ int main(void){
     m_motor_1.m_speed_set_ramp_q16=(int32_t)4<<16;
     m_motor_1.m_speed_target_rpm_q16=0; m_motor_1.m_speed_target_rpm=0;
     m_motor_1.m_iq_set_q4=800; m_motor_1.m_iq_target_q4=800; m_motor_1.m_iq_set_ramp_q16=(int32_t)800<<16;
-    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("speed STOP must not release with nonzero Iq");
     if(m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zone must force zero Iq like VESC");
     for(int i=0;i<4000;i++)mcpwm_foc_adc_int_handler();
@@ -179,10 +179,10 @@ int main(void){
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1; m_motor_1.m_hall_period=200u; m_motor_1.m_hall_ticks=20u; m_motor_1.m_rpm=53;
     mcpwm_foc_set_brake_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT_BRAKE || m_motor_1.m_iq_target_q4>=0)return fail("brake must oppose positive speed");
     m_motor_1.m_hall_ticks=1200u;
-    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_iq_target_q4!=0)return fail("stale brake speed must command zero torque");
     for(int i=0;i<1200;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT_BRAKE || m_motor_1.m_iq_set_q4!=0)return fail("brake must remain active at zero speed");
@@ -191,7 +191,7 @@ int main(void){
      * field at phase zero so the rotor is held rather than continuously driven. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     mcpwm_foc_set_handbrake(1.0f,false); mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_HANDBRAKE)return fail("handbrake control mode");
     if(m_motor_1.m_phase!=0u)return fail("handbrake must lock phase zero");
     if(m_motor_1.m_iq_target_q4<=0)return fail("handbrake current missing");

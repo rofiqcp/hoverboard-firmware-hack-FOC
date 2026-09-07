@@ -158,7 +158,7 @@ class F411DirectTransport:
             raise RuntimeError("pyserial required for direct F411 USB mode")
         self.path = path or _discover_f411_cdc()
         self.timeout = max(0.0, float(timeout))
-        # Poll USB CDC at 1 ms. At 1 Mbaud the F411/F103 round-trip is normally
+        # Poll USB CDC at 1 ms. With the F411/F103 UART fixed at 115200 baud the round-trip is normally
         # sub-millisecond to a few milliseconds; a 10-ms tty read timeout turns
         # an otherwise healthy request into artificial 10-ms latency whenever
         # the reply is not already queued at the first read.
@@ -224,7 +224,7 @@ class F411DirectTransport:
         return len(self.rawbuf)
 
     def write(self, data: bytes) -> int:
-        # USB CDC is packetized and the F411->F103 UART runs at 1 Mbaud. The
+        # USB CDC is packetized; Mini-PC->F411 is 1 Mbaud while F411->F103 is validated at 115200 baud. The
         # old unconditional 2-ms sleep after every VESC frame was inherited from
         # the 115200-baud bridge and alone added >=2 ms request latency. Normal
         # realtime/setpoint frames fit in one chunk, so do not pace them. Only
@@ -263,7 +263,7 @@ class F411DirectTransport:
         self.ser.close()
 
 
-def open_transport(port: str, baud: int = 1000000, timeout: float = 0.01):
+def open_transport(port: str, baud: int = 115200, timeout: float = 0.01):
     """Open one of the supported VESC links.
 
     - ``auto``: Python-maintenance TCP first, then direct F411 USB CDC.
@@ -548,6 +548,8 @@ class Diag:
     tx_start_failures: int | None = None
     rx_queue_highwater: int | None = None
     process_gap_max_ms: int | None = None
+    usart3_rx_errors: int | None = None
+    usart3_rx_restarts: int | None = None
 
     def short(self) -> str:
         return (
@@ -640,6 +642,9 @@ def parse_diag(payload: bytes) -> Diag:
     if len(payload) >= 205:
         rxhi, gapmax = struct.unpack_from(">2I", payload, 197)
         ext.update(rx_queue_highwater=rxhi, process_gap_max_ms=gapmax)
+    if len(payload) >= 217:
+        _main_vesc, uart_err, uart_restart = struct.unpack_from(">3I", payload, 205)
+        ext.update(usart3_rx_errors=uart_err, usart3_rx_restarts=uart_restart)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok), link_armed=bool(link_armed),
@@ -705,7 +710,7 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 
 class VescDual:
-    def __init__(self, port: str, baud: int = 1000000, timeout: float = 0.15):
+    def __init__(self, port: str, baud: int = 115200, timeout: float = 0.15):
         self.ser = open_transport(port, baud, timeout=0.01)
         # A software reboot can leave an incomplete pre-reset VESC frame in the
         # USB-UART driver's RX queue. Start each new host session at a packet

@@ -8,10 +8,10 @@
 #define F103_FLASH_PAGE_SIZE      0x00000800u /* 2 KiB for STM32F103xE */
 
 /* Native VESC transport: F103 USART3 PB10/PB11 <-> F411 USART1 PB6/PB7.
- * Production rate is 1 Mbaud. Hardware testing showed 2 Mbaud could lose the
- * final byte of a VESC frame; 1 Mbaud is CRC-clean while still ~8.7x faster
- * than the former USB-TTL-limited 115200 path. */
-#define F103_VESC_UART_BAUD       1000000u
+ * This hardware link is validated and fixed at the standard 115200 baud.
+ * The separate Mini-PC <-> F411 USB CDC host link remains 1 Mbaud. Do not
+ * conflate the two links when tuning buffering, timeouts, or diagnostics. */
+#define F103_VESC_UART_BAUD       115200u
 
 /* Top 16 bytes of SRAM are reserved in BOTH linker scripts. A two-word magic
  * makes application -> resident-bootloader entry independent of flash writes.

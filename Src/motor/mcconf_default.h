@@ -51,12 +51,13 @@
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   3000u /* tuned steering position ceiling; 20% of 15-A motor limit */
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u /* worst-side -28 deg still saturated at 6 A; 8 A is final closed-loop ceiling, 53% of 15-A motor limit, +/-30 deg envelope */
 #define MCCONF_STEERING_POSITION_KP_MULTIPLIER        6u /* 0.025 VESC base -> 0.15 effective on calibrated steering */
-#define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       2000u /* bounded one-shot assist; commissioning-safe ceiling */
-#define MCCONF_STEERING_BREAKAWAY_MAX_MS             300u
-#define MCCONF_STEERING_BREAKAWAY_DELAY_MS            20u
-#define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        2000u /* no 2-A assist inside +/-2 degrees */
+#define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       3500u /* measured minimum to cross worst static steering stiction */
+#define MCCONF_STEERING_BREAKAWAY_MAX_MS               0u /* disabled: standard position PID has enough 4-A authority */
+#define MCCONF_STEERING_BREAKAWAY_DELAY_MS           150u
+#define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        1000u /* no high-current assist inside +/-1 degree */
+#define MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS     32u /* require ~0.39 deg real rack motion; reject encoder/mechanical chatter */
 #define MCCONF_STEERING_HOME_CURRENT_A             3.00f
 #define MCCONF_STEERING_CAL_CURRENT_MAX_A         15.00f /* commissioning only; runtime steering stays capped separately */
 #define MCCONF_STEERING_DETECT_CURRENT_START_A      3.00f
@@ -129,7 +130,7 @@
 #define MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT    500u
 /* Upstream VESC default: 3 extra samples => 7 instantaneous GPIO reads with majority vote. */
 #define MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT       3u
-#define MCCONF_FOC_CONTROL_DIV                  3u
+#define MCCONF_FOC_CONTROL_DIV                  6u
 /* Hall timeout must be longer than one Hall sector at low VESC ERPM.
  * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.
  * 8000 ticks (0.5 s) keeps valid low-speed Hall feedback down to ~20 ERPM. */

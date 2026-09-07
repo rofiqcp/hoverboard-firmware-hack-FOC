@@ -4,6 +4,7 @@
 #include <math.h>
 #include "config.h"
 #include "defines.h"
+#include "util.h"
 #include "motor/mcpwm_foc.h"
 
 #ifndef VESC_EXTENDED_TERMINAL
@@ -27,7 +28,7 @@
 #define VESC_LINK_HOLD_MS        2000u
 #define VESC_MAX_PAYLOAD          700u
 #define VESC_MAX_FRAME      (VESC_MAX_PAYLOAD + 7u)
-#define VESC_RX_INTERBYTE_TIMEOUT_MS 12u
+#define VESC_RX_INTERBYTE_TIMEOUT_MS 100u
 #define VESC_RX_QUEUE_DEPTH          16u
 #define VESC_TX_QUEUE_DEPTH          8u
 
@@ -281,6 +282,22 @@ void vesc_protocol_init(void) {
     app_vesc_init();
 }
 
+void vesc_protocol_transport_reset(void) {
+    /* Communication recovery only. Preserve MC/App configuration and EEPROM,
+     * but discard every in-flight command/reply so a corrupt frame can never
+     * execute after the UART is restarted. */
+    rx_reset();
+    s_pending_head = s_pending_tail = s_pending_count = 0u;
+    memset((void *)s_pending_len, 0, sizeof(s_pending_len));
+    memset((void *)s_rt_cmd, 0, sizeof(s_rt_cmd));
+    s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
+    memset(s_tx_len, 0, sizeof(s_tx_len));
+    s_link_last_ms = 0u;
+    s_openloop_test_active = 0u;
+    memset(&s_hall_detect, 0, sizeof(s_hall_detect));
+    memset(&s_detect_all, 0, sizeof(s_detect_all));
+}
+
 bool vesc_protocol_rx_in_progress(void) { return s_rx_active != 0u; }
 
 static bool rt_command_extract(const uint8_t *vp, uint16_t n, uint8_t *motor, const uint8_t **cmdp) {
@@ -372,7 +389,7 @@ bool vesc_protocol_rx_byte(uint8_t byte) {
     const uint32_t now_ms = HAL_GetTick();
     if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
         /* A truncated/corrupt long frame must never poison all later traffic.
-         * F411 upload chunks are paced well below 12 ms at 1 Mbaud, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
+         * F411 upload chunks are explicitly paced on the validated 115200-baud F411<->F103 link, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
         rx_reset();
         s_rx_timeout_reset++;
     }
@@ -490,6 +507,17 @@ static float wrap_angle_diff_deg(float a, float b) {
     return d;
 }
 
+static float steering_vesc_position_deg(void) {
+    /* Public VESC position remains the stock 0..360 widget coordinate while
+     * ROS/custom steering stays signed mechanical degrees. Center is 180. */
+    const float mech=mc_interface_get_steering_deg();
+    float pos=(mech-MCCONF_STEERING_POS_MIN_DEG) * 360.0f /
+        (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+    if(pos<0.0f)pos=0.0f;
+    if(pos>360.0f)pos=360.0f;
+    return pos;
+}
+
 static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
     if (!out) return false;
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
@@ -513,7 +541,7 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
          * than the raw motor PID shaft coordinate. Keeping both streams on the
          * same source prevents a false rotor-position jump in VESC Tool. */
         *out = (!second && mc_interface_steering_calibration_valid()) ?
-            mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
+            steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
         if(m->m_pos_pid_phase_mode){
@@ -649,7 +677,7 @@ static void get_values_normalized(bool second, mc_values *v) {
         v->tachometer=-v->tachometer;
     }
     v->position=(!second && mc_interface_steering_calibration_valid()) ?
-        mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
+        steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
     /* Hoverboard temperature calibration is deci-degC (358 = 35.8C). */
     v->temp_mos = (float)board_temp_deg_c * 0.1f;
     v->temp_mos_1 = v->temp_mos;
@@ -732,7 +760,7 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
              * not raw motor/ABI shaft angle. Otherwise frequent GET_VALUES
              * overwrites the correct steering-calibration feedback in ROS. */
             const float pos = (!second && mc_interface_steering_calibration_valid()) ?
-                mc_interface_get_steering_deg() : mc_interface_get_pid_pos_now_motor(second);
+                steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
             buffer_append_float32(b, pos, 1e6f, &i);
             uint32_t pv3=DWT->CYCCNT;
             dt=(uint32_t)(pv3-pv2);
@@ -2252,14 +2280,25 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint32(b,s_tx_start_fail,&i);
             buffer_append_uint32(b,s_rx_queue_highwater,&i);
             buffer_append_uint32(b,s_process_gap_max_ms,&i);
-            buffer_append_uint32(b,main_prof_vesc_max_cycles,&i);
-            buffer_append_uint32(b,main_prof_house_max_cycles,&i);
-            buffer_append_uint32(b,main_prof_tail_max_cycles,&i);
+            /* Diagnostic slot: actual ADC/FOC ISR invocation counter. This is
+             * more actionable than a nested-DWT main-loop maximum while timing
+             * the interrupt cadence on real hardware. */
+            buffer_append_uint32(b,m->m_isr_count,&i);
+            /* Reuse two diagnostic-only profiler slots for USART3 recovery. */
 #ifdef STM32F103xE
-            buffer_append_uint32(b,s_prof_values_snapshot_max_cycles,&i);
-            buffer_append_uint32(b,s_prof_values_position_max_cycles,&i);
-            buffer_append_uint32(b,s_prof_values_serialize_max_cycles,&i);
-            buffer_append_uint32(b,s_prof_values_tx_max_cycles,&i);
+            buffer_append_uint32(b,usart3_rx_error_count(),&i);
+            buffer_append_uint32(b,usart3_rx_restart_count(),&i);
+#else
+            buffer_append_uint32(b,0u,&i);
+            buffer_append_uint32(b,0u,&i);
+#endif
+#ifdef STM32F103xE
+            /* Temporary steering commissioning diagnostics. Reuse profiler slots
+             * without growing the already-near-256-byte packet. */
+            buffer_append_uint32(b,(uint32_t)m->m_position_no_motion_ticks,&i);
+            buffer_append_uint32(b,(uint32_t)m->m_position_breakaway_ticks,&i);
+            buffer_append_int32(b,m->m_position_last_motion_count,&i);
+            buffer_append_int32(b,m->m_position_target_counts-m->m_position_counts,&i);
             /* Keep diagnostic reply below the 256-byte local payload buffer.
              * Pre/post were measured separately during profiling; retain the
              * actionable control/step maxima plus explicit overrun counters. */
@@ -2301,7 +2340,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. ALL: LEFT Id=3A adaptive<=15A, RIGHT Hall, then R/L/flux. Encoder: sync+2 stops+save span. Boot encoder: sync only; manual center=span/2=POS180. Hall uses entered A; RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -2351,6 +2390,7 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
         if(k[5]=='p')c->p_pid_kp=v;else if(k[5]=='i')c->p_pid_ki=v;else if(k[5]=='d')c->p_pid_kd=v;else return -1;return 1;
     }
     if(!strncmp(k,"speed_k",7)){if(v<0||v>65535.0f/MCCONF_SPEED_GAIN_SCALE||k[8])return -1;if(k[7]=='p')c->s_pid_kp=v;else if(k[7]=='i')c->s_pid_ki=v;else if(k[7]=='d')c->s_pid_kd=v;else return -1;return 1;}
+    if(!strcmp(k,"speed_ramp")){if(v<100.0f||v>75000.0f)return -1;c->s_pid_ramp_erpms_s=v;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
 }
@@ -2367,11 +2407,11 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
     if(!strcmp(a[0],"encoder")||!strcmp(a[0],"enc")){
         if(second){terminal_send_text("RIGHT Hall-only\n");return;}int32_t sp=mcpwm_foc_steering_span_counts();
         snprintf(o,sizeof(o),"raw=%lu pos=%ld target=%ld span=%ld center=%ld deg=%ldm sync=%u cfg=%u cal=%u homed=%u inv=%u counts=%lu ratio=%.3f off=%.2f\n",
-            (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,(long)(sp/2),(long)(mc_interface_get_steering_deg()*1000.0f),
+            (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,0L,(long)(mc_interface_get_steering_deg()*1000.0f),
             (unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)m->m_encoder_configured,(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)m->m_conf.foc_encoder_inverted,(unsigned long)m->m_conf.m_encoder_counts,(double)m->m_conf.foc_encoder_ratio,(double)m->m_conf.foc_encoder_offset);terminal_send_text(o);return;
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
-    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){snprintf(o,sizeof(o),"isr=%lu/%lu overrun=%lu rx=%lu crc=%lu rxdrop=%lu txdrop=%lu gap=%lums\n",(unsigned long)mcpwm_foc_get_isr_cycles(),(unsigned long)mcpwm_foc_get_isr_cycles_max(),(unsigned long)m->m_overrun_count,(unsigned long)s_rx_ok,(unsigned long)s_rx_crc_err,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,(unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
 
     bool alias_enc=!strcmp(a[0],"foc_encoder_detect");
@@ -2381,7 +2421,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"cancel")){terminal_cancel_detect();terminal_send_text("OK detect cancelled\n");return;}
         if(s_detect_all.active||s_hall_detect.active){terminal_send_text("ERR detect busy\n");return;}
         if(!strcmp(sub,"hall")){float x=3.0f;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}hall_detect_start_current(second,x);terminal_send_text("OK Hall detect started; poll 'detect'\n");return;}
-        if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Encoder detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f inv=%u stops=%ld/%ld span=%ld center=%ld\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp,(long)(sp/2));terminal_send_text(o);return;}
+        if(!strcmp(sub,"encoder")){if(second){terminal_send_text("ERR RIGHT Hall-only\n");return;}float x=MCCONF_STEERING_DETECT_CURRENT_START_A;if(ac>base&&!terminal_float(a[base],&x)){terminal_send_text("ERR current\n");return;}if(x<0.3f||x>I_MOT_MAX){terminal_send_text("ERR 0.3..15A\n");return;}float off=1001,rat=0;bool inv=false;int32_t p0=0,p1=0,sp=0;terminal_send_text("Encoder detect running...\n");bool ok=mc_interface_steering_detect_calibrate(x,&off,&rat,&inv,&p0,&p1,&sp);snprintf(o,sizeof(o),"%s off=%.2f ratio=%.3f inv=%u stops=%ld/%ld span=%ld center=%ld\n",ok?"PASS":"FAIL",(double)off,(double)rat,(unsigned)inv,(long)p0,(long)p1,(long)sp,0L);terminal_send_text(o);return;}
         if(!strcmp(sub,"all")){if(second){terminal_send_text("ERR start from LEFT/ID1\n");return;}float loss=50,minin=cc->l_in_current_min,maxin=cc->l_in_current_max,ol=cc->foc_openloop_rpm,sl=cc->foc_sl_erpm;if(ac-base==5){if(!terminal_float(a[base],&loss)||!terminal_float(a[base+1],&minin)||!terminal_float(a[base+2],&maxin)||!terminal_float(a[base+3],&ol)||!terminal_float(a[base+4],&sl)){terminal_send_text("ERR args\n");return;}}else if(ac!=base){terminal_send_text("ERR detect all [LOSS MIN MAX OPENRPM SLERPM]\n");return;}uint8_t d[21];int32_t k=0;d[k++]=1;buffer_append_float32(d,loss,1e3f,&k);buffer_append_float32(d,minin,1e3f,&k);buffer_append_float32(d,maxin,1e3f,&k);buffer_append_float32(d,ol,1e3f,&k);buffer_append_float32(d,sl,1e3f,&k);detect_all_begin(d,sizeof(d));terminal_send_text("OK Detect-All started; poll 'detect'\n");return;}
         terminal_send_text("ERR detect status|hall|encoder|all|cancel\n");return;
     }
@@ -2714,7 +2754,11 @@ void vesc_protocol_process_pending(void) {
     s_process_last_ms = process_now_ms;
     vesc_tx_service();
     process_rt_mailboxes();
-    for (;;) {
+    /* Process only a small bounded batch before returning to main(). The main
+     * loop immediately calls usart3_rx_check() again, so DMA RX is drained
+     * between batches instead of being ignored while a large telemetry backlog
+     * is serialized. Two packets/pass keeps latency low without starving RX. */
+    for (uint8_t processed = 0u; processed < 2u; ++processed) {
         uint16_t n = 0u;
         uint8_t slot = 0u;
         __disable_irq();

@@ -25,7 +25,11 @@ typedef struct {
 void BLDC_Init(void);
 void Input_Lim_Init(void);
 void Input_Init(void);
-void UART_DisableRxErrors(UART_HandleTypeDef *huart);
+void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart);
+uint32_t usart3_rx_error_count(void);
+uint32_t usart3_rx_restart_count(void);
+uint32_t usart3_forced_recovery_count(void);
+void usart3_recovery_tick(uint32_t now_ms);
 
 void poweronMelody(void);
 void beepCount(uint8_t cnt, uint8_t freq, uint8_t pattern);

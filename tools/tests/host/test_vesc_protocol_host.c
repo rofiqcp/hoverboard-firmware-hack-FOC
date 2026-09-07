@@ -178,8 +178,8 @@ void mcpwm_foc_rl_capture_stop(bool second){rl_capture_on[second?1:0]=false;}
 void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
     const int j=second?1:0; if(!o)return; memset(o,0,sizeof(*o));
     o->samples=200u; o->sum_di2=1000000LL;
-    /* vscale=1 mV/internal count, q4_per_A=800, dt=3/16000. */
-    const double b=(double)plant_l[j]/(0.001*800.0*(3.0/16000.0));
+    /* vscale=1 mV/internal count, q4_per_A=800, dt=control_div/PWM_FREQ. */
+    const double b=(double)plant_l[j]/(0.001*800.0*((double)MCCONF_FOC_CONTROL_DIV/(double)PWM_FREQ));
     o->sum_div=(int64_t)llround(b*(double)o->sum_di2);
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
@@ -311,7 +311,7 @@ static int check_values_reply(const uint8_t *r,uint16_t rn,bool second){
     if(!nearf32(erpm,second?321.0f:123.0f,0.5f)) return fail(second?"right ERPM normalize":"local ERPM");
     if(!nearf32(vin,48.1f,0.11f)) return fail("Vin");
     if(fault!=FAULT_CODE_NONE || idvesc!=(second?2u:1u)) return fail(second?"right fault/id":"local fault/id");
-    if(!nearf32(pos,second?342.0f:12.5f,0.001f)) return fail(second?"right position normalize":"local position");
+    if(!nearf32(pos,second?342.0f:255.0f,0.001f)) return fail(second?"right position normalize":"local VESC position 180-center");
     if(!nearf32(vd,1.2f,0.002f)) return fail(second?"right Vd":"local Vd");
     if(!nearf32(vq,second?5.0f:4.0f,0.002f)) return fail(second?"right Vq normalize":"local Vq");
     return 0;
@@ -522,9 +522,9 @@ int main(void){
             return fail("APP_ADC_UART support");
         ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_UART;
         if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART ||
-           app_vesc_get_configuration(false)->app_uart_baudrate!=1000000u ||
+           app_vesc_get_configuration(false)->app_uart_baudrate!=115200u ||
            !app_vesc_get_configuration(false)->permanent_uart_enabled)
-            return fail("APP_UART permanent 1000000 support");
+            return fail("APP_UART permanent VESC-standard 115200 support");
     }
 
     {

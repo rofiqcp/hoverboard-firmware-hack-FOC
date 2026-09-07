@@ -70,7 +70,7 @@ int main(void){
     mc_configuration duty_conf=m_motor_1.m_conf; duty_conf.l_current_max=2.0f; duty_conf.l_current_min=-2.0f;
     mcpwm_foc_set_configuration(&duty_conf,false);
     mcpwm_foc_set_duty(0.20f,false);
-    mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(abs(m_motor_1.m_iq_target_q4)>1600)return fail("mode1 must honor 2A mcconf current limit");
     if(abs(m_motor_1.m_vq)>2880)return fail("mode1 20pct modulation ceiling");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);

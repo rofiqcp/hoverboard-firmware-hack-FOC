@@ -567,7 +567,9 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     if(aspan<MCCONF_STEERING_MIN_SPAN_COUNTS){steering_stage_set(0xE5u);return false;}
 
     mcpwm_foc_release_motor(false);
-    const int32_t current_logical=inv?0:span; /* second seek ended at +current stop */
+    /* Second seek ended at +current stop. Re-express that physical endpoint
+     * around center-zero: VESC endpoint 0 is -span/2, endpoint 360 is +span/2. */
+    const int32_t current_logical=inv?-(span/2):(span/2);
     m->m_position_counts=current_logical;
     m->m_position_abs_counts=0u;
     m->m_position_target_counts=current_logical;
@@ -578,9 +580,9 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     }
     steering_stage_set(8u);
 
-    /* COMM_SET_POS 180 maps to signed steering 0 deg, i.e. span/2. */
+    /* COMM_SET_POS 180 maps to signed steering 0 deg and internal count 0. */
     if(!mcpwm_foc_set_steering_deg(0.0f)){steering_stage_set(0xE8u);return false;}
-    const bool centered=steering_wait_target(span/2,8000u);
+    const bool centered=steering_wait_target(0,8000u);
     mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
     if(!centered){steering_stage_set(0xE9u);return false;}
     steering_stage_set(9u);

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 void vesc_protocol_init(void);
+void vesc_protocol_transport_reset(void);
 bool vesc_protocol_rx_byte(uint8_t byte);
 bool vesc_protocol_rx_in_progress(void);
 void vesc_protocol_process_pending(void);

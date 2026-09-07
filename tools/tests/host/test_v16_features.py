@@ -72,16 +72,16 @@ for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=
 for token in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
     assert token in off, token
 
-# RX burst handling remains bounded and 8-deep. GET_VALUES stays strict request/reply;
+# RX burst handling remains bounded and 16-deep. GET_VALUES stays strict request/reply;
 # the only standard unsolicited stream is COMM_ROTOR_POSITION after SET_DETECT,
 # matching vedderb/bldc's 10-ms periodic_thread behavior.
-assert re.search(r'#define\s+VESC_RX_QUEUE_DEPTH\s+8u',vp)
+assert re.search(r'#define\s+VESC_RX_QUEUE_DEPTH\s+16u',vp)
 assert 's_pending_payload[VESC_RX_QUEUE_DEPTH][VESC_MAX_PAYLOAD]' in vp
 assert 's_pending_count < VESC_RX_QUEUE_DEPTH' in vp
 assert 'VESC_RT_PERIOD_MS' not in vp and 's_rt_stream' not in vp
 assert 'case COMM_SET_DETECT:' in vp and 'COMM_ROTOR_POSITION' in vp
 assert 'vesc_protocol_periodic(uint32_t now_ms)' in vp
-assert 'vesc_protocol_periodic(HAL_GetTick())' in main
+assert 'const uint32_t vesc_now_ms = HAL_GetTick();' in main and 'vesc_protocol_periodic(vesc_now_ms)' in main and 'usart3_recovery_tick(vesc_now_ms)' in main
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'realtime mailbox latest VESC-tool mapped setpoint' in host and 'request/reply only' in host
@@ -120,7 +120,7 @@ dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
 assert 'Jangan hapus nilai telemetry itu' in mc, 'idle live current telemetry path missing'
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo8=1 vesc_request_reply=1 brake_dynamic=1 std_pos=1 custom_count_cap=1 std_openloop=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo16=1 vesc_request_reply=1 brake_dynamic=1 std_pos=1 custom_count_cap=1 std_openloop=1')
 
 assert 'MCCONF_STEERING_POS_MIN_DEG' in (R/'Src/motor/mcconf_default.h').read_text()
 assert '0 -> -30, 180 -> 0, 360 -> +30' in vp

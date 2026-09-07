@@ -136,7 +136,7 @@ static volatile int16_t s_board_temperature_x10 = 250; /* 25,0 C sampai housekee
 
 static bool encoder_port_active(const mcpwm_foc_motor_t *m, bool second);
 static bool encoder_feedback_selected(const mcpwm_foc_motor_t *m, bool second);
-static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second);
+static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second, uint16_t elapsed_pwm_ticks);
 
 /* VESC FOC Hall table: 0..199 = 0..360 electrical degrees, 255 = invalid.
  * These defaults reproduce the previously proven hard-coded sector centers. */
@@ -193,6 +193,15 @@ static int32_t erpm_to_mech_rpm_q16(float erpm, bool second) {
     return (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
 }
 
+/* RIGHT traction phase/Hall wiring makes increasing calibrated Hall angle
+ * correspond to negative mechanical output rotation.  Keep raw Hall direction
+ * for phase interpolation, but expose one mechanical sign to speed control,
+ * tachometer and VESC telemetry. LEFT ABI steering does not use this path. */
+static int8_t hall_motion_direction(bool second, int8_t raw_dir) {
+    if (raw_dir == 0) return 0;
+    return second ? (int8_t)-raw_dir : raw_dir;
+}
+
 static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
     if (encoder_feedback_selected(m,second) && m->m_encoder_configured)
         return m->m_encoder_mech_rpm_q16;
@@ -214,7 +223,7 @@ static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
             const uint32_t den = (uint32_t)m->m_hall_period * pp;
             uint32_t mag_q12 = ((uint32_t)PWM_FREQ * 10u * 4096u) / den;
             int32_t q16 = (int32_t)(mag_q12 << 4);
-            if (m->m_hall_direction < 0) q16 = -q16;
+            if (hall_motion_direction(second, m->m_hall_direction) < 0) q16 = -q16;
             return q16;
         }
     }
@@ -396,7 +405,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->l_max_erpm = MCCONF_L_MAX_ERPM;
     c->l_min_erpm = MCCONF_L_MIN_ERPM;
     /* Expose VESC configuration in physical units. The ISR remains fixed-point:
-     * Kp ~= 0.800 V/A and Ki ~= 266.7 V/(A*s) at the 5.333-kHz control cadence. */
+     * Kp ~= 0.800 V/A and Ki ~= 266.7 V/(A*s) at the 2.667-kHz control cadence. */
     c->foc_current_kp = 0.80013f;
     c->foc_current_ki = 266.710f;
     c->foc_current_filter_const = MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
@@ -643,21 +652,20 @@ static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     const float ki=(float)m->m_kis_q16/(float)MCCONF_SPEED_GAIN_SCALE;
     const float kd=(float)m->m_kds_q11/(float)MCCONF_SPEED_GAIN_SCALE;
     const float lim=(float)(m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4);
-    /* For error_q2 = ERPM*4:
-     *   P_norm_q15 = error_q2 * kp * 409.6
-     *   I_step(q4Q16) = error_q2 * ki * IqLimit(q4) * 0.1536
-     *   D_q4 = delta_error_q2 * kd * IqLimit(q4) * 66.6666667
-     * Store extra fractional bits once here; ISR uses only 64-bit multiply and
-     * right-shift, which Cortex-M3 handles far cheaper than software division. */
+    /* For error_q2 = ERPM*4, the historical constants below are the exact
+     * DIV=3 implementation. Keep standard VESC gain semantics independent of
+     * regulator cadence: integral gain scales with dt (DIV/3), derivative gain
+     * scales with 1/dt (3/DIV), while proportional gain is unchanged. */
+    const double dt_scale=(double)MCCONF_FOC_CONTROL_DIV/3.0;
     double v=(double)kp*26843545.6;
     if(v<0.0)v=0.0;
     if(v>4294967295.0)v=4294967295.0;
     m->m_speed_kp_coeff_q16=(uint32_t)(v+0.5);
-    v=(double)ki*(double)lim*10066.3296;
+    v=(double)ki*(double)lim*10066.3296*dt_scale;
     if(v<0.0)v=0.0;
     if(v>4294967295.0)v=4294967295.0;
     m->m_speed_ki_coeff_q16=(uint32_t)(v+0.5);
-    v=(double)kd*(double)lim*17066.6666667;
+    v=(double)kd*(double)lim*17066.6666667/dt_scale;
     if(v<0.0)v=0.0;
     if(v>4294967295.0)v=4294967295.0;
     m->m_speed_kd_coeff_q8=(uint32_t)(v+0.5);
@@ -1230,8 +1238,12 @@ bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
     m->m_steering_span_counts=span_counts;
     m->m_steering_calibrated=1u;
     m->m_steering_homed=homed?1u:0u;
-    m->m_position_min_counts=span_counts<0?span_counts:0;
-    m->m_position_max_counts=span_counts>0?span_counts:0;
+    /* Steering uses a center-zero coordinate internally. Only the signed
+     * hard-stop span is persisted; after homing, count 0 is physical center.
+     * Limits are symmetric +/-|span|/2 regardless of raw ABI count direction. */
+    const int32_t half=a/2;
+    m->m_position_min_counts=-half;
+    m->m_position_max_counts= half;
     return true;
 }
 
@@ -1252,10 +1264,9 @@ bool mcpwm_foc_steering_rebase_center(void){
     /* Only the calibrated span is persisted. The operator places the steering
      * physically at center before each power-on, so after ABI/electrical phase
      * synchronization this boot position is the absolute logical center. */
-    const int32_t center=m->m_steering_span_counts/2;
-    m->m_position_counts=center;
+    m->m_position_counts=0;
     m->m_position_abs_counts=0u;
-    m->m_position_target_counts=center;
+    m->m_position_target_counts=0;
     reset_position_pid(m);
     m->m_steering_homed=1u;
     return true;
@@ -1268,9 +1279,10 @@ int32_t mcpwm_foc_steering_span_counts(void){return m_motor_1.m_steering_span_co
 float mcpwm_foc_get_steering_deg(void){
     const mcpwm_foc_motor_t *m=&m_motor_1;
     if(!m->m_steering_calibrated || m->m_steering_span_counts==0)return 0.0f;
-    float f=(float)m->m_position_counts/(float)m->m_steering_span_counts;
-    float d=MCCONF_STEERING_POS_MIN_DEG +
-        f*(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+    /* Internal count 0 is steering center. Signed span preserves whether ABI
+     * counts increase or decrease toward VESC position 360. */
+    float d=((float)m->m_position_counts/(float)m->m_steering_span_counts) *
+        (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
     /* Allow a little overshoot to remain visible in telemetry, but never emit
      * wraparound 330/350-degree values for LEFT steering. */
     if(d<-45.0f)d=-45.0f;
@@ -1284,8 +1296,7 @@ bool mcpwm_foc_set_steering_deg(float deg){
        m->m_steering_span_counts==0){mcpwm_foc_release_motor(false);return false;}
     if(deg<MCCONF_STEERING_POS_MIN_DEG)deg=MCCONF_STEERING_POS_MIN_DEG;
     if(deg>MCCONF_STEERING_POS_MAX_DEG)deg=MCCONF_STEERING_POS_MAX_DEG;
-    const float f=(deg-MCCONF_STEERING_POS_MIN_DEG)/
-        (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+    const float f=deg/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
     const int32_t target=(int32_t)lroundf(f*(float)m->m_steering_span_counts);
     mcpwm_foc_set_position_counts(target,false);
     return true;
@@ -1531,13 +1542,12 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     /* If a hard-stop span is already calibrated, the boot position is assumed
      * to be center (180 deg) as requested. We are currently at electrical
      * phase-zero, displaced by boot_center_to_phase0_counts from that point. */
-    const int32_t boot_center=(m->m_steering_calibrated && m->m_steering_span_counts!=0)?
-                              (m->m_steering_span_counts/2):0;
-    m->m_position_counts=boot_center+boot_center_to_phase0_counts;
+    const int32_t boot_center=0;
+    m->m_position_counts=boot_center_to_phase0_counts;
     m->m_position_target_counts=boot_center;
     m->m_position_abs_counts=(uint32_t)(boot_center_to_phase0_counts<0?
                                         -boot_center_to_phase0_counts:boot_center_to_phase0_counts);
-    encoder_feedback_update(m,false);
+    encoder_feedback_update(m,false,1u);
     m->m_encoder_synced=1u;
     /* A persisted hard-stop span plus the explicit boot-at-center policy gives
      * us an absolute logical reference for this power cycle. Mark homed only
@@ -1969,7 +1979,9 @@ static uint8_t hall_sample_state(mcpwm_foc_motor_t *m, bool second) {
 static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
     const uint8_t angle = hall_table_angle(m, h);
     const bool valid = (h != 0u && h != 7u && angle < 200u);
-    if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
+    /* m_hall_ticks is aged once per 16-kHz ADC frame by hall_update() or the
+     * released-motor path. Keeping the timebase outside this heavier estimator
+     * lets unchanged Hall sectors skip expensive correction math safely. */
 
     /* Upstream foc_correct_hall() clears the previous Hall angle when the
      * Hall code is invalid. This target has no sensorless observer fallback,
@@ -2013,6 +2025,7 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
             if (aad >= 15 && aad <= 50) dir = ad > 0 ? 1 : -1;
 
             if (dir != 0) {
+                const int8_t motion_dir = hall_motion_direction(second, dir);
                 uint16_t period = m->m_hall_ticks;
                 if (period == 0u) period = 1u;
                 const bool period_outlier =
@@ -2081,14 +2094,14 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
                 {
                     int32_t rpm = 10667 / (int32_t)m->m_hall_period;
                     if (rpm > MCCONF_MOTOR_RPM_MAX) rpm = MCCONF_MOTOR_RPM_MAX;
-                    m->m_rpm = (int16_t)(rpm * dir);
+                    m->m_rpm = (int16_t)(rpm * motion_dir);
                 }
                 if (m->m_hall_direction_stable_edges < 0xffu) m->m_hall_direction_stable_edges++;
                 if (m->m_position_abs_counts < UINT32_MAX) m->m_position_abs_counts++;
                 /* With Hall feedback one accepted edge is exactly one VESC
                  * tachometer step (6 steps/electrical revolution). Count it at
                  * the edge instead of re-quantizing electrical phase at 16 kHz. */
-                if(dir>0){
+                if(motion_dir>0){
                     if(m->m_tachometer<INT32_MAX)m->m_tachometer++;
                     if(m->m_position_counts<INT32_MAX)m->m_position_counts++;
                     if(!second){odom_l=(odom_l>=8999)?0:(int16_t)(odom_l+1);}else{odom_r=(odom_r<=0)?8999:(int16_t)(odom_r-1);}
@@ -2216,12 +2229,33 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
     else m->m_phase_hall = desired;
 }
 
-static void hall_update(mcpwm_foc_motor_t *m, bool second) {
-    hall_process_state(m,second,hall_sample_state(m,second));
+static void hall_update(mcpwm_foc_motor_t *m, bool second, bool control_update) {
+    if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
+    const uint8_t before = m->m_hall_state;
+    const uint8_t h = hall_sample_state(m, second);
+    /* GPIO/debounce remains 16 kHz. Full interpolation/correction is required
+     * immediately on an accepted edge, otherwise only at this motor's regulator
+     * cadence. This preserves edge timing/safety while freeing CPU for VESC IO. */
+    if (!m->m_hall_initialized || h != before || control_update) {
+        hall_process_state(m, second, h);
+    } else {
+        /* The heavy target estimator is decimated, but the VESC Hall phase rate
+         * limiter itself must still run every PWM frame. Otherwise phase_hall
+         * advances only 1/control_div as fast, lags the sector target by tens of
+         * electrical degrees, and torque collapses at speed. This fast path is
+         * only a signed compare/add and keeps Park/SVPWM phase at 16 kHz. */
+        uint32_t max_step=m->m_hall_rate_limit_step;
+        if(max_step==0u)max_step=1u;
+        const int16_t pd=phase_diff_u16(m->m_phase_hall_target,m->m_phase_hall);
+        if(pd>(int16_t)max_step)m->m_phase_hall=(uint16_t)(m->m_phase_hall+(uint16_t)max_step);
+        else if(pd<-(int16_t)max_step)m->m_phase_hall=(uint16_t)(m->m_phase_hall-(uint16_t)max_step);
+        else m->m_phase_hall=m->m_phase_hall_target;
+    }
 }
 
 
-static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
+static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second, uint16_t elapsed_pwm_ticks) {
+    if(elapsed_pwm_ticks==0u)elapsed_pwm_ticks=1u;
     if (!encoder_port_active(m,second) || !m->m_encoder_configured || m->m_encoder_counts<4u) return;
 #ifdef STM32F103xE
     if(!second){
@@ -2254,7 +2288,9 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
         m->m_encoder_delta_accum+=delta;
         m->m_encoder_idle_ticks=0u;
     }else if(m->m_encoder_idle_ticks<MCCONF_ENCODER_SPEED_TIMEOUT_TICKS){
-        m->m_encoder_idle_ticks++;
+        uint32_t idle=(uint32_t)m->m_encoder_idle_ticks+(uint32_t)elapsed_pwm_ticks;
+        if(idle>MCCONF_ENCODER_SPEED_TIMEOUT_TICKS)idle=MCCONF_ENCODER_SPEED_TIMEOUT_TICKS;
+        m->m_encoder_idle_ticks=(uint16_t)idle;
     }
 
     uint32_t mech_phase=(uint32_t)(((uint64_t)cnt*m->m_encoder_count_to_phase_q16)>>16);
@@ -2267,7 +2303,12 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second) {
     const uint32_t elec=(uint32_t)(((uint64_t)mech_phase*m->m_encoder_ratio_q16)>>16);
     m->m_phase_encoder=(uint16_t)(elec-(uint32_t)m->m_encoder_offset_phase);
 
-    if(++m->m_encoder_speed_ticks>=MCCONF_ENCODER_SPEED_WINDOW_TICKS){
+    {
+        uint32_t speed_ticks=(uint32_t)m->m_encoder_speed_ticks+(uint32_t)elapsed_pwm_ticks;
+        if(speed_ticks>UINT16_MAX)speed_ticks=UINT16_MAX;
+        m->m_encoder_speed_ticks=(uint16_t)speed_ticks;
+    }
+    if(m->m_encoder_speed_ticks>=MCCONF_ENCODER_SPEED_WINDOW_TICKS){
         const int32_t dc=m->m_encoder_delta_accum;
         const uint32_t ticks=m->m_encoder_speed_ticks;
         if(dc!=0){
@@ -2676,7 +2717,12 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
              * progress through several sticky points without continuous 2-A
              * pressure at a hard stop. */
             const int32_t delta=m->m_position_counts-m->m_position_last_motion_count;
-            const bool toward=(count_error>0 && delta>0) || (count_error<0 && delta<0);
+            const int32_t progress=(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS;
+            /* ABI noise can toggle one count at standstill. Re-arm breakaway only
+             * after meaningful progress toward the target; otherwise a stuck
+             * steering rack continuously looks like motion and never gets assist. */
+            const bool toward=(count_error>0 && delta>=progress) ||
+                              (count_error<0 && delta<=-progress);
             if(toward){
                 m->m_position_last_motion_count=m->m_position_counts;
                 m->m_position_no_motion_ticks=0u;
@@ -2846,32 +2892,14 @@ static int16_t speed_pid_iq_target_step(mcpwm_foc_motor_t *m,bool second){
     if(target64>INT32_MAX)target64=INT32_MAX;
     if(target64<INT32_MIN)target64=INT32_MIN;
     const int32_t full_limit=m->m_current_limit_q4>0?m->m_current_limit_q4:MCCONF_MOTOR_CURRENT_MAX_Q4;
-    int32_t out_q4=speed_pid_iq_target_erpm_step(m,second,(int32_t)target64,full_limit);
 
-    /* Hall traction motors need finite breakaway torque from some rotor sectors.
-     * Do not solve this by an aggressive speed integrator: one bounded startup
-     * kick is deterministic and cannot keep heating a mechanically blocked motor. */
-    const int32_t target_erpm=(int32_t)(target64/65536LL);
-    const int32_t measured_erpm=(int32_t)m->m_rpm*pp;
-    const int32_t at=target_erpm<0?-target_erpm:target_erpm;
-    const int32_t am=measured_erpm<0?-measured_erpm:measured_erpm;
-    const uint32_t kick_max_ticks=((uint32_t)MCCONF_SPEED_BREAKAWAY_MAX_MS*(uint32_t)PWM_FREQ)/
-                                  (1000u*(uint32_t)MCCONF_FOC_CONTROL_DIV);
-    if(at < (int32_t)MCCONF_SPEED_RELEASE_ERPM){
-        m->m_speed_breakaway_ticks=0u;
-    }else if(!m->m_speed_breakaway_done){
-        if(am >= (int32_t)MCCONF_SPEED_BREAKAWAY_EXIT_ERPM ||
-           m->m_speed_breakaway_ticks >= kick_max_ticks){
-            m->m_speed_breakaway_done=1u;
-        }else{
-            int32_t min_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_SPEED_BREAKAWAY_CURRENT_MA)/1000;
-            if(min_q4>full_limit)min_q4=full_limit;
-            const int32_t ao=out_q4<0?-out_q4:out_q4;
-            if(ao<min_q4)out_q4=target_erpm>=0?min_q4:-min_q4;
-            if(m->m_speed_breakaway_ticks<UINT16_MAX)m->m_speed_breakaway_ticks++;
-        }
-    }
-    return (int16_t)CLAMP(out_q4,-full_limit,full_limit);
+    /* COMM_SET_RPM authority is the persisted VESC speed PID only.  Do not
+     * inject a project-specific fixed-current breakaway pulse here: on the
+     * deployed Hall traction motor a 1 A kick can cross several Hall sectors
+     * before the first reliable speed sample and overshoot a 100-200 eRPM
+     * request by nearly an order of magnitude.  Stiction/startup behaviour is
+     * therefore governed by the tuned Kp/Ki/Kd and normal current limits. */
+    return speed_pid_iq_target_erpm_step(m,second,(int32_t)target64,full_limit);
 }
 
 static int16_t duty_control_iq_target_step(mcpwm_foc_motor_t *m) {
@@ -2948,7 +2976,18 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     uint32_t profRegStart=0u;
     /* PB6/PB7 are mutually exclusive: once LEFT ABI owns TIM4, never sample
      * those lines as Hall V/W. Encoder raw/count/phase remains live even OFF. */
-    if (encoder_port_active(m,second)) encoder_feedback_update(m,second);
+    const bool encoder_port=encoder_port_active(m,second);
+    const bool encoder_fast_sample=control_update || m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
+    /* LEFT ABI steering is mechanically slow. TIM4 counts edges in hardware, so
+     * reading/scaling the encoder on every 16-kHz PWM frame only burns Cortex-M3
+     * time. Sample it on the regulator slot (or continuously during encoder
+     * commissioning). Current/DC protection remains in the 16-kHz ADC ISR. */
+    if (encoder_port) {
+        if(encoder_fast_sample){
+            const uint16_t elapsed_pwm_ticks=(m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE)?1u:(uint16_t)MCCONF_FOC_CONTROL_DIV;
+            encoder_feedback_update(m,second,elapsed_pwm_ticks);
+        }
+    }
     else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
         /* Fixed-phase Hall detection only needs the debounced physical code. */
         (void)hall_sample_state(m,second);
@@ -2957,17 +2996,17 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
          * heavier edge estimator only when the debounced sector actually changes.
          * Between edges only age the last period so passive/manual-spin telemetry
          * remains real without paying closed-loop interpolation cost at 16 kHz. */
+        if(m->m_hall_ticks<0xffffu)m->m_hall_ticks++;
         const uint8_t before=m->m_hall_state;
         const uint8_t hs=hall_sample_state(m,second);
         if(!m->m_hall_initialized || hs!=before){
             hall_process_state(m,second,hs);
         }else{
-            if(m->m_hall_ticks<0xffffu)m->m_hall_ticks++;
             if(m->m_hall_ticks>MCCONF_HALL_TIMEOUT_TICKS){
                 m->m_rpm=0; m->m_hall_direction=0; m->m_hall_interp_active=0u;
             }
         }
-    } else hall_update(m, second);
+    } else hall_update(m, second, control_update);
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP) {
         openloop_update(m, second);
     } else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
@@ -2994,8 +3033,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
          * sedangkan m_phase mempertahankan phase aktif terakhir sampai alignment. */
         const bool enc_active=(!second && encoder_port_active(m,false) && m->m_encoder_configured);
         if(enc_active){
-            position_feedback_update(m,m->m_encoder_mech_phase);
-            if(m->m_encoder_synced || openloop_phase) vesc_tachometer_update(m);
+            if(encoder_fast_sample){
+                position_feedback_update(m,m->m_encoder_mech_phase);
+                if(m->m_encoder_synced || openloop_phase) vesc_tachometer_update(m);
+            }
         }else if(m->m_control_mode==CONTROL_MODE_POS ||
                  m->m_pos_pid_ang_div_inv_q16<64251u || m->m_pos_pid_ang_div_inv_q16>66873u){
             /* Hall duty/current/speed modes do not need p_pid_ang_div work.
@@ -3047,11 +3088,23 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         m->m_isr_count++;
         return;
     }
+    if (!control_update && encoder_port && m->m_encoder_synced &&
+        m->m_control_mode!=CONTROL_MODE_OPENLOOP &&
+        m->m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE) {
+        /* Encoder phase, Vd/Vq and therefore PWM vector are intentionally held
+         * until this motor's next regulator slot. The advanced timer continues
+         * switching at 16 kHz with the last safe CCRs. This removes redundant
+         * Park/SVPWM work from five of six steering frames. */
+        m->m_state=MC_STATE_RUNNING;
+        m->m_isr_count++;
+        return;
+    }
+
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE && !control_update) {
         /* Fixed electrical phase + held Vd/Vq means the two non-regulator PWM
          * slots would reproduce identical SVPWM/CCRs. Keep hard DC protection
          * in DMA1_Channel1, but skip redundant Clarke/Park/PI/SVPWM work here.
-         * The regulator slot remains PWM/3 = 5.333 kHz exactly as configured. */
+         * The regulator slot remains PWM/6 = 2.667 kHz exactly as configured. */
         m->m_state=MC_STATE_RUNNING;
         m->m_isr_count++;
         return;
@@ -3067,7 +3120,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
      * sehingga ISR memilih baseline OFF khusus untuk telemetry. Nilai sensor
      * tersebut tetap dipublikasikan saat idle/coast; hanya state kontrol yang
      * dinolkan sebelum keluar agar tidak pernah menghasilkan torsi. */
-    /* The generated PI regulators run at PWM/3 = 5.333 kHz. Clarke/Park is
+    /* The generated PI regulators run at PWM/6 = 2.667 kHz. Clarke/Park is
      * therefore only needed on this motor's regulator slot; on the other two
      * 16-kHz PWM frames Vd/Vq are held while Hall phase and SVPWM still update.
      * This removes four redundant transforms per three ADC interrupts. The LPF
@@ -3162,7 +3215,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
             }
             profRegStart=DWT->CYCCNT;
             /* The proven generated controller updates its regulators once every
-             * three 16-kHz ADC frames (~5.333 kHz). */
+             * three 16-kHz ADC frames (~2.667 kHz). */
             /* Current/speed/position modes may use the same configured physical
              * full-safe modulation ceiling as VESC duty mode. */
             /* VESC duty is normalized to [-1,1], but the physical hoverboard
@@ -3340,7 +3393,7 @@ void mcpwm_foc_adc_int_handler(void) {
             mcpwm_foc_set_mode_command(ctrlModReq,(int16_t)pwmr,motorRunReq!=0u,svpwmOpenloopRpm,true);
         }
     }
-    /* Keep each motor at the configured 5.33-kHz regulator cadence, but do
+    /* Keep each motor at the configured 2.667-kHz regulator cadence, but do
      * not execute both heavy PI updates on the same 16-kHz ADC interrupt. With
      * DIV=3: left updates slot 0, right slot 1, slot 2 is estimator/SVPWM only. */
     const uint8_t control_slot=s_foc_control_div;
@@ -3736,7 +3789,7 @@ void DMA1_Channel1_IRQHandler(void) {
 
     /* odom_l/odom_r are wrapped incrementally on each accepted Hall edge.
      * This is exactly position_counts modulo 9000 without two software integer
-     * divisions at 5.33 kHz inside the highest-priority ADC ISR. */
+     * divisions at 2.667 kHz inside the highest-priority ADC ISR. */
     if(leftBridgeWasOn && leftDriveRequest && m_motor_1.m_bridge_settle_ticks>0u) m_motor_1.m_bridge_settle_ticks--;
     if(rightBridgeWasOn && rightDriveRequest && m_motor_2.m_bridge_settle_ticks>0u) m_motor_2.m_bridge_settle_ticks--;
 
@@ -3938,7 +3991,7 @@ float mcpwm_foc_get_erpm_motor(bool s){
        m->m_hall_period>0u && m->m_hall_period<MCCONF_HALL_TIMEOUT_TICKS &&
        m->m_hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS){
         const float erpm=((float)PWM_FREQ*10.0f)/(float)m->m_hall_period;
-        return erpm*(float)m->m_hall_direction;
+        return erpm*(float)hall_motion_direction(s,m->m_hall_direction);
     }
     return (float)m->m_rpm*(float)motor_pole_pairs(s);
 }
@@ -4023,7 +4076,7 @@ void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *v,bool second){
     v->duty_x1000=duty_i;
     if(encoder_feedback_selected(m,second)&&encoder_cfg_i)v->erpm=encoder_erpm_q16_i/65536;
     else if(hall_init_i&&hall_dir_i!=0&&hall_period_i>0u&&hall_period_i<MCCONF_HALL_TIMEOUT_TICKS&&hall_ticks_i<=MCCONF_HALL_TIMEOUT_TICKS)
-        v->erpm=((int32_t)PWM_FREQ*10/(int32_t)hall_period_i)*(int32_t)hall_dir_i;
+        v->erpm=((int32_t)PWM_FREQ*10/(int32_t)hall_period_i)*(int32_t)hall_motion_direction(second,hall_dir_i);
     else v->erpm=(int32_t)rpm_i*(int32_t)motor_pole_pairs(second);
     const int32_t vin_cv=((int32_t)(batVoltage>0?batVoltage:1)*(int32_t)BAT_CALIB_REAL_VOLTAGE)/(int32_t)BAT_CALIB_ADC;
     v->vin_x10=(int16_t)(vin_cv/10);
@@ -4089,7 +4142,7 @@ void mcpwm_foc_get_values(mc_values *v,bool second){
     if(encoder_feedback_selected(m,second) && encoder_cfg_i)
         v->rpm=(float)encoder_erpm_q16_i/65536.0f;
     else if(hall_init_i && hall_dir_i!=0 && hall_period_i>0u && hall_period_i<MCCONF_HALL_TIMEOUT_TICKS && hall_ticks_i<=MCCONF_HALL_TIMEOUT_TICKS)
-        v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)*(float)hall_dir_i;
+        v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)*(float)hall_motion_direction(second,hall_dir_i);
     else v->rpm=(float)rpm_i*(float)motor_pole_pairs(second);
     /* Wire VESC: tachometer tetap 60 electrical degree per count, bukan raw
      * ABI quadrature count. Position memakai mechanical encoder angle ketika

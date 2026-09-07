@@ -14,14 +14,14 @@ typedef struct { volatile uint32_t CR1,CR2,SMCR,DIER,SR,EGR,CCMR1,CCMR2,CCER,CNT
 typedef struct { volatile uint32_t ISR,IFCR; } DMA_TypeDef;
 typedef struct { volatile uint32_t CTRL,CYCCNT,CPICNT,EXCCNT,SLEEPCNT,LSUCNT,FOLDCNT,PCSR; } DWT_Type;
 typedef struct { volatile uint32_t CR1,CR2,CR3,BRR,DR,SR; } USART_TypeDef;
-typedef struct { volatile uint32_t CNDTR; } DMA_Channel_TypeDef;
+typedef struct { volatile uint32_t CCR,CNDTR; } DMA_Channel_TypeDef;
 typedef struct { DMA_Channel_TypeDef *Instance; } DMA_HandleTypeDef;
-typedef struct { DMA_HandleTypeDef *hdmatx; DMA_HandleTypeDef *hdmarx; USART_TypeDef *Instance; uint32_t gState; } UART_HandleTypeDef;
+typedef struct { DMA_HandleTypeDef *hdmatx; DMA_HandleTypeDef *hdmarx; USART_TypeDef *Instance; uint32_t gState,ErrorCode,RxState; } UART_HandleTypeDef;
 typedef struct { int dummy; } ADC_HandleTypeDef;
 typedef int GPIO_PinState;
 #define GPIO_PIN_RESET 0
 #define GPIO_PIN_SET 1
-extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern DMA_TypeDef _DMA1; extern DWT_Type _DWT;
+extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern DMA_TypeDef _DMA1; extern DWT_Type _DWT; extern USART_TypeDef _USART3;
 #define GPIOA (&_GPIOA)
 #define GPIOB (&_GPIOB)
 #define GPIOC (&_GPIOC)
@@ -29,6 +29,7 @@ extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern
 #define TIM8 (&_TIM8)
 #define DMA1 (&_DMA1)
 #define DWT (&_DWT)
+#define USART3 (&_USART3)
 #define DMA_IFCR_CTCIF1 (1u<<1)
 #define TIM_BDTR_MOE (1u<<15)
 #define GPIO_PIN_0 (1u<<0)
@@ -50,9 +51,15 @@ extern GPIO_TypeDef _GPIOA,_GPIOB,_GPIOC; extern TIM_TypeDef _TIM1,_TIM8; extern
 #define UART_WORDLENGTH_8B 0
 #define HAL_OK 0
 #define HAL_UART_STATE_READY 0u
+#define HAL_UART_ERROR_NONE 0u
+#define UART_IT_IDLE 0u
 #define USART_CR1_PEIE (1u<<8)
 #define USART_CR3_EIE (1u<<0)
+#define USART_CR3_DMAR (1u<<6)
+#define DMA_CCR_EN (1u<<0)
 #define CLEAR_BIT(REG,BIT) ((REG)&=~(BIT))
+#define SET_BIT(REG,BIT) ((REG)|=(BIT))
+#define __HAL_UART_ENABLE_IT(H,I) ((void)(H),(void)(I))
 #define __HAL_DMA_GET_COUNTER(H) ((H) && (H)->Instance ? (H)->Instance->CNDTR : 0u)
 #define FLASH_TYPEPROGRAM_HALFWORD 0u
 #define FLASH_PAGE_SIZE 2048u
@@ -115,6 +122,9 @@ static inline GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *p,uint16_t pin){(void
 static inline int HAL_UART_Transmit(UART_HandleTypeDef *h,uint8_t*d,uint16_t n,uint32_t t){(void)h;(void)d;(void)n;(void)t;return HAL_OK;}
 static inline int HAL_UART_Transmit_DMA(UART_HandleTypeDef *h,uint8_t*d,uint16_t n){(void)h;(void)d;(void)n;return HAL_OK;}
 static inline int HAL_UART_Receive_DMA(UART_HandleTypeDef *h,uint8_t*d,uint16_t n){(void)h;(void)d;(void)n;return HAL_OK;}
+static inline int HAL_UART_DMAStop(UART_HandleTypeDef *h){(void)h;return HAL_OK;}
+static inline int HAL_UART_DeInit(UART_HandleTypeDef *h){(void)h;return HAL_OK;}
+static inline void NVIC_SystemReset(void){}
 static inline int HAL_FLASH_Unlock(void){return HAL_OK;}
 static inline int HAL_FLASH_Lock(void){return HAL_OK;}
 static inline int HAL_FLASH_Program(uint32_t type,uint32_t addr,uint64_t data){(void)type;(void)addr;(void)data;return HAL_OK;}

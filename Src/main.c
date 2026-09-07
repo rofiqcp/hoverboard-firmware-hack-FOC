@@ -211,7 +211,9 @@ int main(void) {
      * cheap when no bytes arrived and guarantees request/reply progress. */
     usart3_rx_check();
     vesc_protocol_process_pending();
-    vesc_protocol_periodic(HAL_GetTick());
+    const uint32_t vesc_now_ms = HAL_GetTick();
+    vesc_protocol_periodic(vesc_now_ms);
+    usart3_recovery_tick(vesc_now_ms);
     uint32_t profd=DWT->CYCCNT-prof0;
     // cppcheck-suppress unsignedLessThanZero -- CYCCNT dan maksimum profiler sama-sama uint32_t.
     if(profd>main_prof_vesc_max_cycles)main_prof_vesc_max_cycles=profd;

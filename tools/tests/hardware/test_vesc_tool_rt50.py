@@ -152,7 +152,8 @@ def poll_one(link,right,count,hz):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
-    a=ap.parse_args(); count=max(1,round(a.hz*a.seconds)); link=Link(a.port)
+    a=ap.parse_args(); count=max(1,round(a.hz*a.seconds))
+    link=Link(a.port, timeout=(0.50 if str(a.port).startswith('tcp://') else 0.06))
     try:
         print('FW:',link.fw(False),'|',link.fw(True))
         for right in (False,True):

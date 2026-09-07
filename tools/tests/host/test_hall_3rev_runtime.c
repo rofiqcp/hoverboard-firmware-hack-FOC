@@ -67,7 +67,8 @@ static int run_motor(int second,const uint8_t table[8]){
             }
         }
     }
-    if(m->m_position_counts!=edges){printf("FAIL forward count motor%d got=%ld\n",second+1,(long)m->m_position_counts);return 3;}
+    const int32_t expected_forward = second ? -edges : edges;
+    if(m->m_position_counts!=expected_forward){printf("FAIL forward count motor%d got=%ld expected=%ld\n",second+1,(long)m->m_position_counts,(long)expected_forward);return 3;}
     if(m->m_hall_sequence_reject_count||m->m_hall_period_reject_count){printf("FAIL forward reject motor%d seq=%lu period=%lu\n",second+1,(unsigned long)m->m_hall_sequence_reject_count,(unsigned long)m->m_hall_period_reject_count);return 4;}
     for(int e=0;e<edges;e++){
         idx=(idx+5)%6; uint8_t h=seq[idx];

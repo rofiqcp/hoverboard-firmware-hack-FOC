@@ -33,6 +33,20 @@ uint16_t VirtAddVarTab[NB_OF_VAR] = {1000, 1001, 1002, 1003, 1004, 1005, 1006, 1
 static int16_t inputMax = 1000;
 static int16_t inputMin = -1000;
 static uint8_t rxBuffer[SERIAL_BUFFER_SIZE];
+static volatile uint32_t usart3RxErrorCount = 0u;
+static volatile uint32_t usart3RxRestartCount = 0u;
+static volatile uint32_t usart3ForcedRecoveryCount = 0u;
+static uint32_t usart3LastByteMs = 0u;
+static uint32_t usart3LastValidFrameMs = 0u;
+static uint32_t usart3LastValidCount = 0u;
+static uint32_t usart3LastForcedRecoveryMs = 0u;
+static uint8_t usart3RecoveryStreak = 0u;
+static uint8_t usart3EverValid = 0u;
+#define USART3_VALID_PROGRESS_TIMEOUT_MS 1500u
+#define USART3_RAW_RECENT_MS 250u
+#define USART3_RECOVERY_COOLDOWN_MS 1500u
+#define USART3_RECOVERY_BEFORE_RESET 4u
+static uint32_t usart3RxOldPos = 0u;
 static uint16_t serialTimeoutCount = SERIAL_TIMEOUT;
 static SerialCommand serialCommand = {SERIAL_START_FRAME, 0, 0, 0};
 
@@ -46,7 +60,7 @@ int _write(int file, char *data, int len) {
   (void)file;
   (void)data;
   if (len <= 0) return 0;
-  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 transport at 1 Mbaud.
+  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 transport at validated 115200 baud.
    * Raw printf/debug bytes are never legal on this wire. */
   return len;
 }
@@ -61,16 +75,40 @@ void Input_Lim_Init(void) {
   inputMin = -1500;
 }
 
-void UART_DisableRxErrors(UART_HandleTypeDef *huart) {
-  CLEAR_BIT(huart->Instance->CR1, USART_CR1_PEIE);
-  CLEAR_BIT(huart->Instance->CR3, USART_CR3_EIE);
+void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart) {
+  if (!huart || huart->Instance != USART3) return;
+  SET_BIT(huart->Instance->CR3, USART_CR3_EIE);
 }
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (!huart || huart->Instance != USART3) return;
+  ++usart3RxErrorCount;
+  usart3RxOldPos = 0u;
+  huart->ErrorCode = HAL_UART_ERROR_NONE;
+  /* HAL has already ended/aborted the DMA RX transfer before this callback.
+   * Restart the same circular buffer immediately so one FE/NE/ORE can lose at
+   * most the current VESC frame, never the complete session. */
+  if (HAL_UART_Receive_DMA(huart, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
+    ++usart3RxRestartCount;
+    __HAL_UART_ENABLE_IT(huart, UART_IT_IDLE);
+  }
+}
+
+uint32_t usart3_rx_error_count(void) { return usart3RxErrorCount; }
+uint32_t usart3_rx_restart_count(void) { return usart3RxRestartCount; }
+uint32_t usart3_forced_recovery_count(void) { return usart3ForcedRecoveryCount; }
 
 void Input_Init(void) {
   UART3_Init();
   vesc_protocol_init();
   HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
-  UART_DisableRxErrors(&huart3);
+  UART_EnableRxErrorRecovery(&huart3);
+  usart3LastByteMs = HAL_GetTick();
+  usart3LastValidFrameMs = usart3LastByteMs;
+  usart3LastValidCount = 0u;
+  usart3LastForcedRecoveryMs = 0u;
+  usart3RecoveryStreak = 0u;
+  usart3EverValid = 0u;
 
   HAL_FLASH_Unlock();
   (void)EE_Init();
@@ -191,17 +229,74 @@ static void serialAcceptByte(uint8_t byte) {
 }
 
 void usart3_rx_check(void) {
-  static uint32_t oldPos = 0;
+  /* Safety net in addition to HAL_UART_ErrorCallback: if a DMA error left RX
+   * disabled for any reason, restart it from main context. */
+  if ((huart3.Instance->CR3 & USART_CR3_DMAR) == 0u ||
+      huart3.hdmarx == NULL || (huart3.hdmarx->Instance->CCR & DMA_CCR_EN) == 0u) {
+    usart3RxOldPos = 0u;
+    huart3.ErrorCode = HAL_UART_ERROR_NONE;
+    huart3.RxState = HAL_UART_STATE_READY;
+    if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
+      ++usart3RxRestartCount;
+      __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+    }
+    return;
+  }
   const uint32_t pos = sizeof(rxBuffer) - __HAL_DMA_GET_COUNTER(huart3.hdmarx);
-  if (pos == oldPos) return;
+  if (pos == usart3RxOldPos) return;
+  usart3LastByteMs = HAL_GetTick();
 
-  if (pos > oldPos) {
-    for (uint32_t i = oldPos; i < pos; ++i) serialAcceptByte(rxBuffer[i]);
+  if (pos > usart3RxOldPos) {
+    for (uint32_t i = usart3RxOldPos; i < pos; ++i) serialAcceptByte(rxBuffer[i]);
   } else {
-    for (uint32_t i = oldPos; i < sizeof(rxBuffer); ++i) serialAcceptByte(rxBuffer[i]);
+    for (uint32_t i = usart3RxOldPos; i < sizeof(rxBuffer); ++i) serialAcceptByte(rxBuffer[i]);
     for (uint32_t i = 0; i < pos; ++i) serialAcceptByte(rxBuffer[i]);
   }
-  oldPos = (pos == sizeof(rxBuffer)) ? 0 : pos;
+  usart3RxOldPos = (pos == sizeof(rxBuffer)) ? 0u : pos;
+}
+
+void usart3_recovery_tick(uint32_t now_ms) {
+  const uint32_t valid = vesc_protocol_rx_ok_count();
+  if (valid != usart3LastValidCount) {
+    usart3LastValidCount = valid;
+    usart3LastValidFrameMs = now_ms;
+    usart3RecoveryStreak = 0u;
+    usart3EverValid = 1u;
+    return;
+  }
+  if ((uint32_t)(now_ms - usart3LastByteMs) > USART3_RAW_RECENT_MS) return;
+  if ((uint32_t)(now_ms - usart3LastValidFrameMs) < USART3_VALID_PROGRESS_TIMEOUT_MS) return;
+  if ((uint32_t)(now_ms - usart3LastForcedRecoveryMs) < USART3_RECOVERY_COOLDOWN_MS) return;
+
+  /* Bytes are physically arriving but no CRC-valid VESC frame has progressed.
+   * Fail closed first, then reset only the communication transport. */
+  mcpwm_foc_release_motor(false);
+  mcpwm_foc_release_motor(true);
+  vesc_protocol_transport_reset();
+  (void)HAL_UART_DMAStop(&huart3);
+  (void)HAL_UART_DeInit(&huart3);
+  UART3_Init();
+  usart3RxOldPos = 0u;
+  huart3.ErrorCode = HAL_UART_ERROR_NONE;
+  huart3.RxState = HAL_UART_STATE_READY;
+  if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
+    ++usart3RxRestartCount;
+    __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+  }
+  UART_EnableRxErrorRecovery(&huart3);
+  ++usart3ForcedRecoveryCount;
+  if (usart3RecoveryStreak < 0xffu) ++usart3RecoveryStreak;
+  usart3LastForcedRecoveryMs = now_ms;
+  usart3LastValidFrameMs = now_ms; // fresh grace interval after UART restart
+
+  if (usart3EverValid && usart3RecoveryStreak >= USART3_RECOVERY_BEFORE_RESET) {
+    /* A once-healthy live link remained corrupt across several peripheral
+     * recoveries. Motors are already released; one MCU reset is the final tier.
+     * After reboot, reset-loop protection requires a valid frame before this
+     * tier can arm again. */
+    HAL_Delay(10u);
+    NVIC_SystemReset();
+  }
 }
 
 void readCommand(void) {

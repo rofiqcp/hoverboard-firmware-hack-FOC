@@ -70,7 +70,7 @@ int main(void){
     mcpwm_foc_set_configuration(&c,false);
     if(m_motor_1.m_encoder_synced)return fail("calibration change must clear sync");
     host_set_deg_synced(90.0f);
-    mcpwm_foc_adc_int_handler();
+    for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(!nearf(mcpwm_foc_get_phase_encoder_motor(false),80.0f,0.25f))
         return fail("electrical inversion semantics");
     /* Corrected VESC phase runs opposite raw ABI when inverted=true, therefore
@@ -104,9 +104,9 @@ int main(void){
     /* VESC p_pid_ang_div=2: one physical encoder revolution advances PID
      * position only 180 deg while preserving continuity through 360->0. */
     c.p_pid_ang_div=2.0f; mcpwm_foc_set_configuration(&c,false);
-    host_set_deg_synced(350.0f); mcpwm_foc_adc_int_handler();
+    host_set_deg_synced(350.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(!nearf(mcpwm_foc_get_pid_pos_now_motor(false),355.0f,0.35f))return fail("p_pid_ang_div reverse wrap");
-    host_set_deg_synced(10.0f); mcpwm_foc_adc_int_handler();
+    host_set_deg_synced(10.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(!nearf(mcpwm_foc_get_pid_pos_now_motor(false),5.0f,0.35f))return fail("p_pid_ang_div forward wrap");
     c.p_pid_ang_div=1.0f; mcpwm_foc_set_configuration(&c,false);
     host_set_deg_synced(0.0f);
@@ -114,7 +114,7 @@ int main(void){
     m_motor_1.m_position_counts=0;
     mcpwm_foc_set_position_counts(1,false);
     mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(abs(m_motor_1.m_iq_target_q4)>8)
         return fail("one ABI count incorrectly scaled as Hall sector");
     mcpwm_foc_release_motor(false);
@@ -125,12 +125,12 @@ int main(void){
     c.p_pid_kd=0.0f; c.p_pid_kd_proc=0.0f; c.p_pid_gain_dec_angle=0.0f;
     mcpwm_foc_set_configuration(&c,false); host_set_deg_synced(0.0f);
     mcpwm_foc_set_pid_pos(20.0f,false); mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     const int iq_full=abs(m_motor_1.m_iq_target_q4);
     mcpwm_foc_release_motor(false);
     c.p_pid_gain_dec_angle=40.0f; mcpwm_foc_set_configuration(&c,false); host_set_deg_synced(0.0f);
     mcpwm_foc_set_pid_pos(20.0f,false); mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     const int iq_half=abs(m_motor_1.m_iq_target_q4);
     if(iq_full<100 || iq_half<40 || iq_half>iq_full*3/5 || iq_half<iq_full*2/5)
         return fail("p_pid_gain_dec_angle VESC proportional scaling");
@@ -152,14 +152,18 @@ int main(void){
     if(m_motor_1.m_tachometer<14 || m_motor_1.m_tachometer>16)
         return fail("VESC tachometer must be 6 counts/electrical revolution");
     mcpwm_foc_get_values(&v,false);
-    if(!nearf(v.position,61.5234f,0.20f))return fail("RT Data mechanical encoder position");
+    /* ABI is sampled on the regulator cadence, so RT position may trail the
+     * hardware counter by at most one control period. Bound the error by that
+     * physical sample interval instead of assuming 16-kHz position scaling. */
+    const float rt_pos_tol=((float)MCCONF_FOC_CONTROL_DIV*360.0f/4096.0f)+0.05f;
+    if(!nearf(v.position,61.5234f,rt_pos_tol))return fail("RT Data mechanical encoder position");
     if(v.tachometer!=m_motor_1.m_tachometer)return fail("RT Data VESC tachometer source");
 
     m_motor_1.m_encoder_mech_rpm_q16=50*65536;
     m_motor_1.m_encoder_idle_ticks=0u; m_motor_1.m_encoder_synced=1u;
     mcpwm_foc_set_brake_current(1.0f,false);
     mcpwm_foc_vesc_override_touch(false);
-    for(int i=0;i<3;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(m_motor_1.m_iq_target_q4>=0)return fail("ABI brake must oppose positive encoder speed");
 
     printf("ENCODER_ABI_RUNTIME_PASS mech=%.3f elec=%.3f erpm=%.1f tacho=%ld poscnt=%ld\n",

@@ -50,7 +50,7 @@ def check_static():
     mc=(ROOT/'Src/motor/mcpwm_foc.c').read_text()
     mathc=(ROOT/'Src/motor/foc_math.c').read_text()
     mcc=(ROOT/'Src/motor/mcconf_default.h').read_text()
-    assert re.search(r'#define\s+MCCONF_FOC_CONTROL_DIV\s+3u',mcc), 'FOC scheduler must match generated 1-of-3 cadence'
+    assert re.search(r'#define\s+MCCONF_FOC_CONTROL_DIV\s+6u',mcc), 'FOC scheduler must match current 1-of-6 CPU-safe cadence'
     assert 'speed_pid_iq_target_step' in mc and 'error_q16' in mc, 'VESC speed PID fixed-point ERPM path missing'
     assert 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc, 'mode2 speed PID must command Iq'
     assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
@@ -169,6 +169,13 @@ def check_static():
     dual=(ROOT/'tools/vesc_dual.py').read_text()
     assert 'RIGHT_ID = 2' in dual and 'COMM_FORWARD_CAN = 34' in dual, 'Python right virtual CAN routing mismatch'
     util=(ROOT/'Src/util.c').read_text()
+    for token in ('usart3_recovery_tick', 'USART3_VALID_PROGRESS_TIMEOUT_MS',
+                  'USART3_RAW_RECENT_MS', 'USART3_RECOVERY_COOLDOWN_MS',
+                  'USART3_RECOVERY_BEFORE_RESET', 'usart3EverValid',
+                  'mcpwm_foc_release_motor(false)', 'mcpwm_foc_release_motor(true)',
+                  'HAL_UART_DMAStop(&huart3)', 'vesc_protocol_transport_reset()', 'NVIC_SystemReset'):
+        assert token in util, f'F103 USART3 robust recovery missing: {token}'
+    assert 'void vesc_protocol_transport_reset(void)' in vp and 's_rx_ok = 0u' not in vp[vp.index('void vesc_protocol_transport_reset(void)'):vp.index('bool vesc_protocol_rx_in_progress')], 'F103 recovery must preserve valid-frame progress counter'
     eeh=(ROOT/'Src/eeprom.h').read_text()
     lds=(ROOT/'STM32F103RCTx_APP.ld').read_text(); bootlds=(ROOT/'STM32F103RCTx_BOOTLOADER.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
