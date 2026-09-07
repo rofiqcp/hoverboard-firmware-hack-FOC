@@ -117,6 +117,7 @@ bool mc_interface_steering_logical_inverted(void){return mock_steering_logical_i
 bool mc_interface_set_steering_logical_inverted(bool v){mock_steering_logical_inv=v;return true;}
 bool mc_interface_store_steering_calibration(void){return true;}
 bool mc_interface_steering_boot_home(void){diag_motors[0].m_encoder_synced=1u;return true;}
+bool mc_interface_steering_set_current_as_center(void){set_pos[0]=0.0f;return true;}
 float mc_interface_get_steering_deg(void){return 12.5f;}
 bool mc_interface_set_steering_deg(float p){set_pos[0]=p;return true;}
 bool mc_interface_steering_detect_calibrate(float current,float *offset,float *ratio,bool *inverted,
@@ -203,6 +204,7 @@ float mcpwm_foc_get_encoder_position_motor(bool second) { return second?0.0f:12.
 bool mcpwm_foc_encoder_is_synced(bool second) { return !second && diag_motors[0].m_encoder_synced!=0u; }
 bool mcpwm_foc_steering_is_homed(void){return true;}
 int32_t mcpwm_foc_steering_span_counts(void){return 683;}
+int32_t mcpwm_foc_steering_safe_span_counts(void){return 648;}
 bool mcpwm_foc_encoder_startup_align(bool second) { if(second)return false; diag_motors[0].m_encoder_synced=1u; return true; }
 bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *ratio,bool *inverted) {
     (void)current; if(second)return false; if(offset)*offset=12.0f; if(ratio)*ratio=15.0f; if(inverted)*inverted=false; return true;

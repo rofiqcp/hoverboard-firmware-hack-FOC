@@ -521,15 +521,24 @@ bool mc_interface_steering_boot_home(void){
     const bool encoder_selected=m && m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
         (m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER ||
          m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
-    /* Saved steering calibration contains only the measured hard-stop span.
-     * The operator always powers up with the wheel physically centered. Hall
-     * selection requires no encoder synchronization. Incremental ABI selection
-     * synchronizes electrical phase first, then the boot point is assigned
-     * directly to span/2 (VESC logical 180 deg). No boot hard-stop search and no
-     * position-control move are performed. */
+    /* Incremental ABI has no absolute index. Boot SOP is therefore explicit:
+     * power on only with the wheels physically straight. After electrical phase
+     * synchronization, that exact boot position becomes logical POS180 and the
+     * position controller immediately holds it. No mechanical-stop sweep occurs. */
     if(!encoder_selected)return true;
     if(!mcpwm_foc_encoder_startup_align(false))return false;
-    return mcpwm_foc_steering_rebase_center();
+    if(!mcpwm_foc_steering_rebase_center())return false;
+    return mcpwm_foc_set_steering_deg(0.0f);
+}
+
+bool mc_interface_steering_set_current_as_center(void){
+    if(!mcpwm_foc_steering_is_calibrated() || !mcpwm_foc_encoder_is_synced(false))return false;
+    /* Runtime straight trim: preserve measured span and electrical FOC config;
+     * only redefine the current accumulated ABI count as logical center/POS180. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_vesc_override_clear(false);
+    if(!mcpwm_foc_steering_rebase_center())return false;
+    return mcpwm_foc_set_steering_deg(0.0f);
 }
 
 bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,

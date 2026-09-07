@@ -1243,17 +1243,29 @@ void mcpwm_foc_steering_clear_calibration(void){
     reset_position_pid(m);
 }
 
+static int32_t steering_safe_span_from_measured(int32_t measured_span){
+    if(measured_span==0)return 0;
+    int64_t a=measured_span<0?-(int64_t)measured_span:(int64_t)measured_span;
+    int64_t safe=(a*(int64_t)MCCONF_STEERING_SAFE_SPAN_PERCENT)/100LL;
+    if(safe<(int64_t)MCCONF_STEERING_MIN_SPAN_COUNTS)safe=MCCONF_STEERING_MIN_SPAN_COUNTS;
+    /* Force an even magnitude so +/-half is exactly symmetric. */
+    safe &= ~1LL;
+    if(safe>(int64_t)INT32_MAX)safe=INT32_MAX-1;
+    return measured_span<0?-(int32_t)safe:(int32_t)safe;
+}
+
 bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
     mcpwm_foc_motor_t *m=&m_motor_1;
     int32_t a=span_counts<0?-span_counts:span_counts;
     if(a<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
-    m->m_steering_span_counts=span_counts;
+    const int32_t safe_span=steering_safe_span_from_measured(span_counts);
+    const int32_t safe_abs=safe_span<0?-safe_span:safe_span;
+    m->m_steering_span_counts=span_counts; /* persist/report measured hard-stop span */
     m->m_steering_calibrated=1u;
     m->m_steering_homed=homed?1u:0u;
-    /* Steering uses a center-zero coordinate internally. Only the signed
-     * hard-stop span is persisted; after homing, count 0 is physical center.
-     * Limits are symmetric +/-|span|/2 regardless of raw ABI count direction. */
-    const int32_t half=a/2;
+    /* Runtime position authority is limited to 95% of measured hard-stop span.
+     * The remaining 5% creates a symmetric 2.5% mechanical margin per side. */
+    const int32_t half=safe_abs/2;
     m->m_position_min_counts=-half;
     m->m_position_max_counts= half;
     return true;
@@ -1287,29 +1299,30 @@ bool mcpwm_foc_steering_rebase_center(void){
 bool mcpwm_foc_steering_is_calibrated(void){return m_motor_1.m_steering_calibrated!=0u;}
 bool mcpwm_foc_steering_is_homed(void){return m_motor_1.m_steering_calibrated&&m_motor_1.m_steering_homed;}
 int32_t mcpwm_foc_steering_span_counts(void){return m_motor_1.m_steering_span_counts;}
+int32_t mcpwm_foc_steering_safe_span_counts(void){return steering_safe_span_from_measured(m_motor_1.m_steering_span_counts);}
 
 float mcpwm_foc_get_steering_deg(void){
     const mcpwm_foc_motor_t *m=&m_motor_1;
-    if(!m->m_steering_calibrated || m->m_steering_span_counts==0)return 0.0f;
-    /* Internal count 0 is steering center. Signed span preserves whether ABI
-     * counts increase or decrease toward VESC position 360. */
-    float d=((float)m->m_position_counts/(float)m->m_steering_span_counts) *
+    const int32_t safe_span=steering_safe_span_from_measured(m->m_steering_span_counts);
+    if(!m->m_steering_calibrated || safe_span==0)return 0.0f;
+    /* Count 0 is center. Logical feedback saturates at the safe 0/360 endpoints;
+     * raw TIM4 and accumulated count remain available separately for diagnostics. */
+    float d=((float)m->m_position_counts/(float)safe_span) *
         (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
-    /* Allow a little overshoot to remain visible in telemetry, but never emit
-     * wraparound 330/350-degree values for LEFT steering. */
-    if(d<-45.0f)d=-45.0f;
-    if(d>45.0f)d=45.0f;
+    if(d<MCCONF_STEERING_POS_MIN_DEG)d=MCCONF_STEERING_POS_MIN_DEG;
+    if(d>MCCONF_STEERING_POS_MAX_DEG)d=MCCONF_STEERING_POS_MAX_DEG;
     return d;
 }
 
 bool mcpwm_foc_set_steering_deg(float deg){
     mcpwm_foc_motor_t *m=&m_motor_1;
+    const int32_t safe_span=steering_safe_span_from_measured(m->m_steering_span_counts);
     if(!m->m_steering_calibrated || !m->m_steering_homed || !m->m_encoder_synced ||
-       m->m_steering_span_counts==0){mcpwm_foc_release_motor(false);return false;}
+       safe_span==0){mcpwm_foc_release_motor(false);return false;}
     if(deg<MCCONF_STEERING_POS_MIN_DEG)deg=MCCONF_STEERING_POS_MIN_DEG;
     if(deg>MCCONF_STEERING_POS_MAX_DEG)deg=MCCONF_STEERING_POS_MAX_DEG;
     const float f=deg/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
-    const int32_t target=(int32_t)lroundf(f*(float)m->m_steering_span_counts);
+    const int32_t target=(int32_t)lroundf(f*(float)safe_span);
     mcpwm_foc_set_position_counts(target,false);
     return true;
 }

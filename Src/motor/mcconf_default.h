@@ -67,6 +67,7 @@
 #define MCCONF_STEERING_STALL_MS                     350u
 #define MCCONF_STEERING_SEEK_TIMEOUT_MS            20000u
 #define MCCONF_STEERING_MIN_SPAN_COUNTS              32
+#define MCCONF_STEERING_SAFE_SPAN_PERCENT             95u /* measured hard-stop span is preserved; runtime uses 95% for 2.5% margin each side */
 #define MCCONF_STEERING_SETTLE_COUNTS                 6
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */
 #define MCCONF_ENCODER_SPEED_TIMEOUT_TICKS         8000u /* 0.5 s -> zero */

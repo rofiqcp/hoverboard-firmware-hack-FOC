@@ -70,6 +70,7 @@ bool mc_interface_reset_steering_calibration(void);
 bool mc_interface_steering_logical_inverted(void);
 bool mc_interface_set_steering_logical_inverted(bool inverted);
 bool mc_interface_steering_boot_home(void);
+bool mc_interface_steering_set_current_as_center(void);
 bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,
                                             int32_t *raw_left, int32_t *raw_right, int32_t *span);
 void mc_interface_get_steering_span_diag(int32_t *neg1,int32_t *pos1,int32_t *neg2,int32_t *pos2,

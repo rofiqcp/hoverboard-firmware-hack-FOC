@@ -436,6 +436,7 @@ bool mcpwm_foc_steering_rebase_center(void);
 bool mcpwm_foc_steering_is_calibrated(void);
 bool mcpwm_foc_steering_is_homed(void);
 int32_t mcpwm_foc_steering_span_counts(void);
+int32_t mcpwm_foc_steering_safe_span_counts(void);
 float mcpwm_foc_get_steering_deg(void);
 bool mcpwm_foc_set_steering_deg(float deg);
 #endif

@@ -51,6 +51,7 @@
 #define HB_CUSTOM_HALL_PIN_TEST            12u /* passive RIGHT Hall electrical test */
 #define HB_CUSTOM_STEERING_HOME             13u /* bounded LEFT ABI startup alignment + home */
 #define HB_CUSTOM_ENCODER_DEBUG             14u /* read-only LEFT ABI alignment/detect black box */
+#define HB_CUSTOM_STEERING_SET_CENTER        15u /* redefine current LEFT ABI position as logical POS180 */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -1928,7 +1929,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_STEERING_CAL) {
-        uint8_t b[32]; int32_t j=0; uint8_t flags=0u;
+        uint8_t b[48]; int32_t j=0; uint8_t flags=0u;
         if(mc_interface_steering_calibration_valid())flags|=0x01u;
         if(mcpwm_foc_steering_is_homed())flags|=0x02u;
         if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
@@ -1946,6 +1947,12 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         b[j++]=mcpwm_foc_get_motor_const(false)->m_encoder_configured?1u:0u;
         b[j++]=(uint8_t)mcpwm_foc_get_motor_const(false)->m_fault;
         buffer_append_uint32(b,mcpwm_foc_get_motor_const(false)->m_encoder_raw_count,&j);
+        buffer_append_int32(b,mcpwm_foc_steering_safe_span_counts(),&j);
+        float pos360=(mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/
+            (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
+        if(pos360<0.0f){pos360=0.0f;}
+        if(pos360>360.0f){pos360=360.0f;}
+        buffer_append_int32(b,(int32_t)lroundf(pos360*1000.0f),&j);
         uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_STEERING_HOME) {
@@ -1963,6 +1970,24 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
         uart_send_payload(b,(uint16_t)j);
         return;
+    }
+    if (op == HB_CUSTOM_STEERING_SET_CENTER) {
+        uint8_t status=0u;
+        if(second)status=1u;
+        else if(!mc_interface_steering_calibration_valid())status=2u;
+        else if(!mcpwm_foc_encoder_is_synced(false))status=3u;
+        else if(!mc_interface_steering_set_current_as_center())status=4u;
+        uint8_t b[24]; int32_t j=0; uint8_t flags=0u;
+        if(mc_interface_steering_calibration_valid())flags|=0x01u;
+        if(mcpwm_foc_steering_is_homed())flags|=0x02u;
+        if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
+        if(mc_interface_steering_logical_inverted())flags|=0x08u;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=status; b[j++]=flags;
+        buffer_append_int32(b,mcpwm_foc_steering_span_counts(),&j);
+        buffer_append_int32(b,mcpwm_foc_steering_safe_span_counts(),&j);
+        buffer_append_int32(b,mcpwm_foc_get_position_user_counts(false),&j);
+        uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
         if(second)return;
@@ -2407,18 +2432,22 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
     if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
     if(!strcmp(a[0],"status")||!strcmp(a[0],"values")||!strcmp(a[0],"faults")){terminal_values(second);return;}
     if(!strcmp(a[0],"encoder")||!strcmp(a[0],"enc")){
-        if(second){terminal_send_text("RIGHT Hall-only\n");return;}int32_t sp=mcpwm_foc_steering_span_counts();
-        snprintf(o,sizeof(o),"raw=%lu pos=%ld target=%ld span=%ld center=%ld deg=%ldm sync=%u cfg=%u cal=%u homed=%u inv=%u counts=%lu ratio=%.3f off=%.2f\n",
-            (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,0L,(long)(mc_interface_get_steering_deg()*1000.0f),
-            (unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)m->m_encoder_configured,(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)m->m_conf.foc_encoder_inverted,(unsigned long)m->m_conf.m_encoder_counts,(double)m->m_conf.foc_encoder_ratio,(double)m->m_conf.foc_encoder_offset);terminal_send_text(o);return;
+        if(second){terminal_send_text("RIGHT Hall-only\n");return;}int32_t sp=mcpwm_foc_steering_span_counts(),safe=mcpwm_foc_steering_safe_span_counts();
+        float p360=(mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);if(p360<0.0f){p360=0.0f;}
+        if(p360>360.0f){p360=360.0f;}
+        snprintf(o,sizeof(o),"raw=%lu pos=%ld target=%ld measured_span=%ld safe_span=%ld pos360=%.1f center=%ld deg=%ldm sync=%u cfg=%u cal=%u homed=%u foc_enc_inv=%u logical_inv=%u counts=%lu ratio=%.3f off=%.2f\n",
+            (unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)mcpwm_foc_get_position_target_user_counts(false),(long)sp,(long)safe,(double)p360,0L,(long)(mc_interface_get_steering_deg()*1000.0f),
+            (unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)m->m_encoder_configured,(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)m->m_conf.foc_encoder_inverted,(unsigned)mc_interface_steering_logical_inverted(),(unsigned long)m->m_conf.m_encoder_counts,(double)m->m_conf.foc_encoder_ratio,(double)m->m_conf.foc_encoder_offset);terminal_send_text(o);return;
     }
     if(!strcmp(a[0],"steering")){
         if(second){terminal_send_text("ERR LEFT steering only\n");return;}
         const char *sub=ac>1?a[1]:"status"; terminal_lower((char *)sub);
-        if(!strcmp(sub,"status")){int32_t n1=0,p1=0,n2=0,p2=0,s1=0,s2=0,tol=0;mc_interface_get_steering_span_diag(&n1,&p1,&n2,&p2,&s1,&s2,&tol);snprintf(o,sizeof(o),"steering cal=%u home=%u sync=%u logical_inv=%u span=%ld deg=%.3f pos360=%.1f sweep1=%ld/%ld span1=%ld sweep2=%ld/%ld span2=%ld tol=%ld\n",(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)mc_interface_steering_logical_inverted(),(long)mcpwm_foc_steering_span_counts(),(double)mc_interface_get_steering_deg(),(double)((mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG)),(long)n1,(long)p1,(long)s1,(long)n2,(long)p2,(long)s2,(long)tol);terminal_send_text(o);return;}
+        if(!strcmp(sub,"status")){int32_t n1=0,p1=0,n2=0,p2=0,s1=0,s2=0,tol=0;mc_interface_get_steering_span_diag(&n1,&p1,&n2,&p2,&s1,&s2,&tol);float p360=(mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);if(p360<0.0f){p360=0.0f;}
+        if(p360>360.0f){p360=360.0f;}snprintf(o,sizeof(o),"steering cal=%u home=%u sync=%u logical_inv=%u foc_enc_inv=%u measured_span=%ld safe_span=%ld deg=%.3f pos360=%.1f raw=%lu count=%ld sweep1=%ld/%ld span1=%ld sweep2=%ld/%ld span2=%ld tol=%ld\n",(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)mc_interface_steering_logical_inverted(),(unsigned)m->m_conf.foc_encoder_inverted,(long)mcpwm_foc_steering_span_counts(),(long)mcpwm_foc_steering_safe_span_counts(),(double)mc_interface_get_steering_deg(),(double)p360,(unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)n1,(long)p1,(long)s1,(long)n2,(long)p2,(long)s2,(long)tol);terminal_send_text(o);return;}
+        if(!strcmp(sub,"center")||!strcmp(sub,"zero")){terminal_send_text(mc_interface_steering_set_current_as_center()?"OK current steering position is now POS180/0deg\n":"ERR steering center requires valid span + synced encoder\n");return;}
         if(!strcmp(sub,"reset")){terminal_send_text(mc_interface_reset_steering_calibration()?"OK steering span reset; electrical encoder config preserved\n":"ERR steering reset\n");return;}
         if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
-        terminal_send_text("ERR steering status|reset|invert 0|1\n");return;
+        terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
     if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
