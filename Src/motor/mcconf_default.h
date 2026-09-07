@@ -10,12 +10,23 @@
 #define MCCONF_L_CURRENT_MIN                -15.0f
 #define MCCONF_L_IN_CURRENT_MAX              15.0f
 #define MCCONF_L_IN_CURRENT_MIN             -15.0f
+/* Batas dinamis standar VESC. Nilai disiapkan di luar ISR lalu runtime hanya
+ * memakai perbandingan, perkalian, dan shift integer agar ringan di F103. */
+#define MCCONF_L_ERPM_START                    0.80f
+#define MCCONF_L_DUTY_START                    1.00f
+#define MCCONF_L_TEMP_ACCEL_DEC                0.15f
+#define MCCONF_L_IN_CURRENT_MAP_START           0.90f
+#define MCCONF_L_IN_CURRENT_MAP_FILTER          0.002f
 /* Nilai konfigurasi VESC yang sebelumnya nol akibat memset. Battery cut
  * mengikuti batas baterai 10S pada firmware hardware masteran (3.50/3.37 V/cell). */
 #define MCCONF_L_CURRENT_MAX_SCALE             1.0f
 #define MCCONF_L_CURRENT_MIN_SCALE             1.0f
 #define MCCONF_L_BATTERY_CUT_START            35.0f
 #define MCCONF_L_BATTERY_CUT_END              33.7f
+/* Derating regen dibuat sebelum hard over-voltage. Nilai ini masih aman untuk
+ * bus 50 V dan dapat diubah dari VESC Tool sesuai pack baterai yang digunakan. */
+#define MCCONF_L_BATTERY_REGEN_CUT_START       48.0f
+#define MCCONF_L_BATTERY_REGEN_CUT_END         49.5f
 #define MCCONF_L_MIN_VIN                      30.0f
 #define MCCONF_L_MAX_VIN                      50.0f
 #define MCCONF_L_TEMP_FET_START                60.0f
@@ -88,6 +99,7 @@
 #define MCCONF_SPEED_KP_Q11                   200u /* 0.00200 */
 #define MCCONF_SPEED_KI_Q16                   200u /* 0.00200 */
 #define MCCONF_SPEED_KD_Q11                     0u
+#define MCCONF_SPEED_KD_FILTER_DEFAULT         0.20f
 #define MCCONF_POSITION_KP_Q11                  25u /* 0.025: upstream VESC default position Kp */
 #define MCCONF_POSITION_KI_Q16                   0u
 #define MCCONF_POSITION_KD_Q11                   0u

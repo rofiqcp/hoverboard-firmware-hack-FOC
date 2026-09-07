@@ -33,6 +33,8 @@ typedef struct {
     int32_t m_duty_i_q15;
     uint32_t m_duty_kp_q12_per_permille;
     uint32_t m_duty_ki_q12_per_permille;
+    uint32_t m_duty_kp_base_q12_x100; /* numerator gain untuk pembagian Vin di slow path */
+    uint32_t m_duty_ki_base_q12_x100; /* numerator Ki*dt untuk pembagian Vin */
     uint8_t m_duty_pi_active;
 
     volatile uint16_t m_kpq_q11, m_kiq_q16;
@@ -52,6 +54,8 @@ typedef struct {
     uint32_t m_speed_kp_coeff_q16;
     uint32_t m_speed_ki_coeff_q16;
     uint32_t m_speed_kd_coeff_q8;
+    uint16_t m_speed_kd_filter_q16;      /* alpha LPF D speed, standar VESC */
+    int32_t m_speed_d_filter_q4;         /* state D terfilter dalam arus Q4 */
     volatile uint16_t m_kpp_q11, m_kip_q16, m_kdp_q11;
     /* Extension posisi multi-putaran proyek. Pada Hall satu count = satu edge
      * Hall; pada ABI satu count = satu quadrature count. Jangan gunakan field
@@ -88,6 +92,8 @@ typedef struct {
     volatile int16_t m_current_limit_neg_q4;  /* magnitudo batas Iq regen/brake (-), Q4 */
     volatile uint16_t m_battery_cut_start_adc;/* awal derating baterai dalam hitungan ADC */
     volatile uint16_t m_battery_cut_end_adc;  /* arus motoring nol dalam hitungan ADC */
+    volatile uint16_t m_battery_regen_cut_start_adc; /* awal derating regen */
+    volatile uint16_t m_battery_regen_cut_end_adc;   /* regen nol sebelum hard OV */
     volatile int16_t m_input_current_max_q4;   /* batas arus DC positif */
     volatile int16_t m_input_current_regen_q4; /* magnitudo batas arus DC regeneratif */
     volatile uint16_t m_vin_min_adc;           /* l_min_vin dalam hitungan ADC baterai */
@@ -99,6 +105,18 @@ typedef struct {
     volatile uint32_t m_wrong_voltage_integrator;
     volatile int16_t m_abs_current_limit_counts; /* precomputed l_abs_current_max * A2BIT_CONV */
     volatile int16_t m_duty_limit_permille;      /* precomputed l_max_duty * 1000 */
+    volatile int16_t m_duty_start_permille;      /* awal current derating terhadap duty */
+    volatile int16_t m_duty_end_current_q4;      /* VESC: 5*cc_min_current di max duty */
+    volatile int16_t m_cc_min_current_q4;         /* floor current controller standar VESC */
+    volatile int32_t m_erpm_pos_start;            /* +ERPM awal derating */
+    volatile int32_t m_erpm_pos_end;              /* +ERPM current nol */
+    volatile int32_t m_erpm_neg_start;            /* -ERPM awal derating */
+    volatile int32_t m_erpm_neg_end;              /* -ERPM current nol */
+    volatile int16_t m_temp_fet_accel_start_x10;  /* batas suhu akselerasi awal */
+    volatile int16_t m_temp_fet_accel_end_x10;    /* batas suhu akselerasi akhir */
+    uint16_t m_in_current_map_start_q15;           /* l_in_current_map_start */
+    uint16_t m_in_current_map_filter_q16;          /* alpha LPF measured Iin */
+    int32_t m_in_current_map_lpf_q20;              /* Iin Q4 disimpan Q20 */
 
     /* Current state, same Q4 current-count unit as the legacy generated FOC. */
     volatile int16_t m_i_alpha_q4;
@@ -291,6 +309,9 @@ typedef struct {
      * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */
     int16_t m_brake_current_q4;
     int16_t m_handbrake_current_q4;
+    int16_t m_brake_vq_prev;            /* Vq sebelumnya untuk deteksi sign crossing */
+    int8_t m_brake_speed_dir_prev;       /* arah gerak sebelumnya */
+    uint8_t m_brake_zero_duty_samples;   /* minimum zero-vector transition VESC */
     int32_t m_current_lpf_q16[2];
 
     uint32_t m_openloop_phase_acc_q32;

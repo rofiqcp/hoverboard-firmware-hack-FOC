@@ -1268,130 +1268,14 @@ bool mc_interface_load_configuration_motor(bool second) {
     }
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
     m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);
+    /* Jangan duplikasi rumus turunan MC config di loader. Semua limit, PID,
+     * Hall, posisi, dan encoder diterapkan lewat jalur yang sama dengan
+     * SET_MCCONF agar hasil boot == hasil write VESC Tool. */
     {
-        float tf=m->m_conf.foc_current_filter_const;
-        if (!(tf>=0.001f && tf<=1.0f)) tf=MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
-        int32_t a=(int32_t)(tf*65535.0f+0.5f);
-        if(a<1)a=1;
-        if(a>65535)a=65535;
-        m->m_telem_current_filter_q16=(uint16_t)a;
-        m->m_conf.foc_current_filter_const=tf;
+        mc_configuration loaded=m->m_conf;
+        mcpwm_foc_set_configuration(&loaded,second);
+        if(!second) mcpwm_foc_refresh_encoder_configuration(false,true);
     }
-    /* Rebuild every derived runtime coefficient that corresponds to persisted
-     * VESC Tool fields. A value is not considered restored merely because
-     * GET_MCCONF shows it; the ISR/controller must use it after reboot too. */
-    {
-        float cc=m->m_conf.cc_min_current;
-        if(!(cc>=0.001f && cc<=1.0f))cc=MCCONF_CC_MIN_CURRENT;
-        m->m_conf.cc_min_current=cc;
-        float imax=m->m_conf.l_in_current_max;
-        float imin=m->m_conf.l_in_current_min;
-        if(!(imax>=0.1f) || imax>(float)I_DC_MAX)imax=MCCONF_L_IN_CURRENT_MAX;
-        if(!(imin<=-0.1f) || imin<-(float)I_DC_MAX)imin=MCCONF_L_IN_CURRENT_MIN;
-        m->m_conf.l_in_current_max=imax; m->m_conf.l_in_current_min=imin;
-        float smx=m->m_conf.l_current_max_scale; if(!(smx>=0.0f&&smx<=1.0f))smx=MCCONF_L_CURRENT_MAX_SCALE;
-        float smn=m->m_conf.l_current_min_scale; if(!(smn>=0.0f&&smn<=1.0f))smn=MCCONF_L_CURRENT_MIN_SCALE;
-        m->m_conf.l_current_max_scale=smx; m->m_conf.l_current_min_scale=smn;
-        int32_t lim_pos=(int32_t)(m->m_conf.l_current_max*smx*(float)(A2BIT_CONV*16)+0.5f);
-        int32_t lim_neg=(int32_t)(-m->m_conf.l_current_min*smn*(float)(A2BIT_CONV*16)+0.5f);
-        if (lim_pos < 1) {
-            lim_pos = 1;
-        }
-        if (lim_pos > MCCONF_MOTOR_CURRENT_MAX_Q4) {
-            lim_pos = MCCONF_MOTOR_CURRENT_MAX_Q4;
-        }
-        if (lim_neg < 1) {
-            lim_neg = 1;
-        }
-        if (lim_neg > MCCONF_MOTOR_CURRENT_MAX_Q4) {
-            lim_neg = MCCONF_MOTOR_CURRENT_MAX_Q4;
-        }
-        m->m_current_limit_q4=(int16_t)lim_pos; m->m_current_limit_neg_q4=(int16_t)lim_neg;
-        float bcs=m->m_conf.l_battery_cut_start, bce=m->m_conf.l_battery_cut_end;
-        if(!(bcs>bce&&bce>=0.0f)){bcs=MCCONF_L_BATTERY_CUT_START;bce=MCCONF_L_BATTERY_CUT_END;}
-        m->m_conf.l_battery_cut_start=bcs; m->m_conf.l_battery_cut_end=bce;
-        int32_t bsa=(int32_t)(bcs*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
-        int32_t bea=(int32_t)(bce*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
-        if (bsa < 1) {
-            bsa = 1;
-        }
-        if (bsa > 4095) {
-            bsa = 4095;
-        }
-        if (bea < 0) {
-            bea = 0;
-        }
-        if (bea > 4094) {
-            bea = 4094;
-        }
-        m->m_battery_cut_start_adc=(uint16_t)bsa; m->m_battery_cut_end_adc=(uint16_t)bea;
-        float vmin=m->m_conf.l_min_vin, vmax=m->m_conf.l_max_vin;
-        if(!(vmin>=5.0f&&vmax>vmin&&vmax<=80.0f)){vmin=MCCONF_L_MIN_VIN;vmax=MCCONF_L_MAX_VIN;}
-        m->m_conf.l_min_vin=vmin; m->m_conf.l_max_vin=vmax;
-        m->m_vin_min_adc=(uint16_t)(vmin*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
-        m->m_vin_max_adc=(uint16_t)(vmax*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
-        float wmax=m->m_conf.l_watt_max, wmin=m->m_conf.l_watt_min;
-        if(!(wmax>0.0f&&wmax<=200000000.0f))wmax=MCCONF_L_WATT_MAX;
-        if(!(wmin<0.0f&&wmin>=-200000000.0f))wmin=MCCONF_L_WATT_MIN;
-        m->m_conf.l_watt_max=wmax; m->m_conf.l_watt_min=wmin;
-        m->m_watt_max_x10=(uint32_t)(wmax*10.0f+0.5f);
-        m->m_watt_regen_x10=(uint32_t)(-wmin*10.0f+0.5f);
-        float ts=m->m_conf.l_temp_fet_start, te=m->m_conf.l_temp_fet_end;
-        if(!(te>ts&&ts>=-40.0f&&te<=180.0f)){ts=MCCONF_L_TEMP_FET_START;te=MCCONF_L_TEMP_FET_END;}
-        m->m_conf.l_temp_fet_start=ts; m->m_conf.l_temp_fet_end=te;
-        m->m_temp_fet_start_x10=(int16_t)(ts*10.0f+(ts>=0.0f?0.5f:-0.5f));
-        m->m_temp_fet_end_x10=(int16_t)(te*10.0f+(te>=0.0f?0.5f:-0.5f));
-        m->m_wrong_voltage_integrator=0u;
-        m->m_conf.m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
-        int32_t imax_q4=(int32_t)(imax*(float)(A2BIT_CONV*16)+0.5f);
-        int32_t iregen_q4=(int32_t)(-imin*(float)(A2BIT_CONV*16)+0.5f);
-        const int32_t idc_q4_max=I_DC_MAX*A2BIT_CONV*16;
-        if(imax_q4<1)imax_q4=1;
-        if(imax_q4>idc_q4_max)imax_q4=idc_q4_max;
-        if(iregen_q4<1)iregen_q4=1;
-        if(iregen_q4>idc_q4_max)iregen_q4=idc_q4_max;
-        m->m_input_current_max_q4=(int16_t)imax_q4;
-        m->m_input_current_regen_q4=(int16_t)iregen_q4;
-        float dr=m->m_conf.m_duty_ramp_step;
-        if(!(dr>=0.0001f && dr<=0.20f))dr=MCCONF_DUTY_RAMP_STEP_DEFAULT;
-        m->m_conf.m_duty_ramp_step=dr;
-        float abs_i=m->m_conf.l_abs_current_max;
-        float commanded_abs=m->m_conf.l_current_max;
-        if(-m->m_conf.l_current_min>commanded_abs)commanded_abs=-m->m_conf.l_current_min;
-        if(!(abs_i>=commanded_abs) || abs_i>MCCONF_L_ABS_CURRENT_MAX) abs_i=MCCONF_L_ABS_CURRENT_MAX;
-        m->m_conf.l_abs_current_max=abs_i;
-        int32_t ac=(int32_t)(abs_i*(float)A2BIT_CONV+0.5f);
-        if(ac<1) ac=1;
-        if(ac>32767) ac=32767;
-        m->m_abs_current_limit_counts=(int16_t)ac;
-
-        float md=m->m_conf.l_max_duty;
-        if(!(md>0.0f) || md>MCCONF_L_MAX_DUTY)md=MCCONF_L_MAX_DUTY;
-        m->m_conf.l_max_duty=md;
-        int32_t dp=(int32_t)(md*1000.0f+0.5f);
-        if(dp<1) dp=1;
-        if(dp>1000) dp=1000;
-        m->m_duty_limit_permille=(int16_t)dp;
-
-        float pdf=m->m_conf.p_pid_kd_filter;
-        if(!(pdf>=0.0f && pdf<=1.0f))pdf=(float)MCCONF_POSITION_KD_FILTER_Q16/65536.0f;
-        m->m_conf.p_pid_kd_filter=pdf;
-        int32_t pf=(int32_t)(pdf*65535.0f+0.5f);
-        if(pf<0) pf=0;
-        if(pf>65535) pf=65535;
-        m->m_position_kd_filter_q16=(uint16_t)pf;
-
-        float dkp=m->m_conf.foc_duty_dowmramp_kp; if(!(dkp>0.0f))dkp=MCCONF_FOC_DUTY_DOWNRAMP_KP;
-        float dki=m->m_conf.foc_duty_dowmramp_ki; if(!(dki>0.0f))dki=MCCONF_FOC_DUTY_DOWNRAMP_KI;
-        m->m_conf.foc_duty_dowmramp_kp=dkp; m->m_conf.foc_duty_dowmramp_ki=dki;
-        const float kscale=(32768.0f*4096.0f)/(1000.0f*MCCONF_DUTY_PI_BUS_NOMINAL_V);
-        const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
-        m->m_duty_kp_q12_per_permille=(uint32_t)(dkp*kscale+0.5f);
-        m->m_duty_ki_q12_per_permille=(uint32_t)(dki*dt*kscale+0.5f);
-    }
-    mcpwm_foc_refresh_hall_interpolation(second);
-    mcpwm_foc_refresh_position_configuration(second);
-    mcpwm_foc_refresh_encoder_configuration(second,true);
     if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp || migrate_encoder || migrate_hall_extra || migrate_motor_model || migrate_exact_pid) {
         /* Rewrite only after a complete successful load; signature is written last. */
         (void)mc_interface_store_configuration_motor(second);

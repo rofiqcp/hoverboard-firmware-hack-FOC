@@ -84,6 +84,7 @@ int16_t batVoltage = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE;
 static int32_t batVoltageFixdt = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE << 16;
 
 static float bus_voltage_now(void);
+static void duty_pi_apply_vbus(mcpwm_foc_motor_t *m, uint32_t vin_cv);
 /* VESC: mod = Vdq * 1.5 / Vbus. Internal 16000 == mod 1.0.
  * Cache reciprocal scales when the slow battery filter updates so the 5.33-kHz
  * current regulator needs only multiply/shift, no floating point or division. */
@@ -98,6 +99,10 @@ static void current_voltage_scale_refresh(void) {
     s_mod_counts_per_volt_q16=(uint32_t)(a/cv);
     s_volt_q24_per_mod_count=(uint32_t)(((uint64_t)cv*16777216u+1200000u)/2400000u);
     if(s_volt_q24_per_mod_count==0u)s_volt_q24_per_mod_count=1u;
+    /* Gain duty down-ramp VESC berbanding terbalik dengan Vbus. Pembagian ini
+     * sengaja dilakukan di housekeeping 5 ms, bukan di ISR 16 kHz. */
+    duty_pi_apply_vbus(&m_motor_1,cv);
+    duty_pi_apply_vbus(&m_motor_2,cv);
     s_voltage_scale_bat_adc=batVoltage;
 }
 
@@ -371,8 +376,49 @@ static void foc_isr_monitor_end(uint32_t start) {
     if (elapsed > foc_isr_cycles_max) foc_isr_cycles_max = elapsed;
 }
 
+
+/* Normalisasi fitur generic VESC yang memang tidak tersedia pada hardware F103.
+ * Prinsipnya: konfigurasi harus benar-benar bekerja atau dibaca kembali sebagai
+ * mode disabled/fixed. Tidak boleh ada opsi "diterima tetapi diam-diam diabaikan". */
+static void f103_mcconf_canonicalize_unsupported(mc_configuration *c) {
+    if (!c) return;
+    c->pwm_mode=PWM_MODE_SYNCHRONOUS;
+    c->comm_mode=COMM_MODE_INTEGRATE;
+    c->motor_type=MOTOR_TYPE_FOC;
+    c->foc_control_sample_mode=FOC_CONTROL_SAMPLE_MODE_V0;
+    c->foc_current_sample_mode=FOC_CURRENT_SAMPLE_MODE_LONGEST_ZERO;
+    c->foc_sat_comp_mode=SAT_COMP_DISABLED;
+    c->foc_sat_comp=0.0f;
+    c->foc_temp_comp=false;
+    c->foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
+    c->foc_observer_type=FOC_OBSERVER_ORTEGA_ORIGINAL;
+    c->foc_phase_filter_enable=false;
+    c->foc_phase_filter_disable_fault=true;
+    c->foc_phase_filter_max_erpm=0.0f;
+    c->foc_mtpa_mode=MTPA_MODE_OFF;
+    c->foc_fw_current_max=0.0f;
+    c->foc_fw_duty_start=1.0f;
+    c->foc_fw_ramp_time=0.0f;
+    c->foc_fw_q_current_factor=0.0f;
+    c->foc_fw_backoff=0.0f;
+    c->foc_speed_soure=FOC_SPEED_SRC_CORRECTED;
+    c->s_pid_speed_source=S_PID_SPEED_SRC_FAST;
+    c->m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
+    c->m_out_aux_mode=OUT_AUX_MODE_OFF;
+    c->foc_hfi_voltage_start=0.0f;
+    c->foc_hfi_voltage_run=0.0f;
+    c->foc_hfi_voltage_max=0.0f;
+    c->foc_hfi_gain=0.0f;
+    c->foc_hfi_hyst=0.0f;
+    c->foc_sl_erpm_hfi=0.0f;
+    c->foc_hfi_start_samples=0u;
+    c->foc_hfi_obs_ovr_sec=0.0f;
+    c->foc_hfi_samples=0u;
+}
+
 static void conf_defaults(mc_configuration *c, bool second) {
     memset(c, 0, sizeof(*c));
+    f103_mcconf_canonicalize_unsupported(c);
     c->motor_type = MOTOR_TYPE_FOC;
     c->sensor_mode = SENSOR_MODE_SENSORED;
     /* Project hardware is mixed-sensor: LEFT steering uses the 4096-count ABI
@@ -397,11 +443,19 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_duty_dowmramp_ki = MCCONF_FOC_DUTY_DOWNRAMP_KI;
     c->l_in_current_max = MCCONF_L_IN_CURRENT_MAX;
     c->l_in_current_min = MCCONF_L_IN_CURRENT_MIN;
+    c->l_in_current_map_start = MCCONF_L_IN_CURRENT_MAP_START;
+    c->l_in_current_map_filter = MCCONF_L_IN_CURRENT_MAP_FILTER;
     c->l_current_max_scale = MCCONF_L_CURRENT_MAX_SCALE;
     c->l_current_min_scale = MCCONF_L_CURRENT_MIN_SCALE;
+    c->l_erpm_start = MCCONF_L_ERPM_START;
+    c->l_duty_start = MCCONF_L_DUTY_START;
+    c->l_temp_accel_dec = MCCONF_L_TEMP_ACCEL_DEC;
+    c->l_additional_faults = 0;
     c->l_battery_cut_start = MCCONF_L_BATTERY_CUT_START;
     c->l_battery_cut_end = MCCONF_L_BATTERY_CUT_START > MCCONF_L_BATTERY_CUT_END ?
                          MCCONF_L_BATTERY_CUT_END : MCCONF_L_BATTERY_CUT_START;
+    c->l_battery_regen_cut_start = MCCONF_L_BATTERY_REGEN_CUT_START;
+    c->l_battery_regen_cut_end = MCCONF_L_BATTERY_REGEN_CUT_END;
     c->l_min_vin = MCCONF_L_MIN_VIN;
     c->l_max_vin = MCCONF_L_MAX_VIN;
     c->l_temp_fet_start = MCCONF_L_TEMP_FET_START;
@@ -423,6 +477,23 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_current_kp = 0.80013f;
     c->foc_current_ki = 266.710f;
     c->foc_current_filter_const = MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+    /* Fitur generic VESC yang tidak mempunyai jalur hardware pada hoverboard
+     * F103 dikunci ke mode aman. Ini mencegah VESC Tool menampilkan seolah-olah
+     * sebuah opsi aktif padahal runtime tidak pernah mengeksekusinya. */
+    c->foc_control_sample_mode = FOC_CONTROL_SAMPLE_MODE_V0;
+    c->foc_current_sample_mode = FOC_CURRENT_SAMPLE_MODE_LONGEST_ZERO;
+    c->foc_sat_comp_mode = SAT_COMP_DISABLED;
+    c->foc_sat_comp = 0.0f;
+    c->foc_temp_comp = false;
+    c->foc_cc_decoupling = FOC_CC_DECOUPLING_DISABLED;
+    c->foc_phase_filter_enable = false;
+    c->foc_phase_filter_disable_fault = true;
+    c->foc_mtpa_mode = MTPA_MODE_OFF;
+    c->foc_fw_current_max = 0.0f;
+    c->foc_fw_duty_start = 1.0f;
+    c->foc_fw_ramp_time = 0.0f;
+    c->foc_fw_q_current_factor = 0.0f;
+    c->foc_speed_soure = FOC_SPEED_SRC_CORRECTED;
     /* VESC 6.00 defaults for the independent FOC rotor observer. The model
      * R/L/flux and main gain are populated by motor detection or MC config. */
     c->foc_observer_type = FOC_OBSERVER_ORTEGA_ORIGINAL;
@@ -438,6 +509,8 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->s_pid_ramp_erpms_s = (float)MCCONF_SPEED_RAMP_ERPMS_S;
     c->s_pid_min_erpm = (float)MCCONF_SPEED_RELEASE_ERPM;
     c->s_pid_allow_braking = true;
+    c->s_pid_kd_filter = MCCONF_SPEED_KD_FILTER_DEFAULT;
+    c->s_pid_speed_source = S_PID_SPEED_SRC_FAST;
     c->s_pid_kp = (float)MCCONF_SPEED_KP_Q11 / (float)MCCONF_SPEED_GAIN_SCALE;
     c->s_pid_ki = (float)MCCONF_SPEED_KI_Q16 / (float)MCCONF_SPEED_GAIN_SCALE;
     c->s_pid_kd = (float)MCCONF_SPEED_KD_Q11 / (float)MCCONF_SPEED_GAIN_SCALE;
@@ -721,6 +794,23 @@ static void position_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     }
 }
 
+
+/* Terapkan gain duty PI terhadap tegangan bus aktual.
+ * Fungsi ini hanya dipanggil dari jalur konfigurasi/housekeeping, sehingga
+ * pembagian integer tidak pernah masuk ke ISR ADC 16 kHz. */
+static void duty_pi_apply_vbus(mcpwm_foc_motor_t *m, uint32_t vin_cv) {
+    if (!m) return;
+    if (vin_cv < 500u) vin_cv = 500u;
+    uint64_t v=(uint64_t)m->m_duty_kp_base_q12_x100 + vin_cv/2u;
+    v/=vin_cv;
+    if(v>UINT32_MAX)v=UINT32_MAX;
+    m->m_duty_kp_q12_per_permille=(uint32_t)v;
+    v=(uint64_t)m->m_duty_ki_base_q12_x100 + vin_cv/2u;
+    v/=vin_cv;
+    if(v>UINT32_MAX)v=UINT32_MAX;
+    m->m_duty_ki_q12_per_permille=(uint32_t)v;
+}
+
 static uint16_t position_gain_scale_q15(const mcpwm_foc_motor_t *m,int32_t error_mdeg){
     if(!m || m->m_position_gain_dec_mdeg==0u)return 32768u;
     uint32_t ae=(uint32_t)(error_mdeg<0?-(int64_t)error_mdeg:error_mdeg);
@@ -780,20 +870,34 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_current_limit_neg_q4=(int16_t)(-MCCONF_L_CURRENT_MIN*MCCONF_L_CURRENT_MIN_SCALE*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_battery_cut_start_adc=(uint16_t)(MCCONF_L_BATTERY_CUT_START*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
     m->m_battery_cut_end_adc=(uint16_t)(MCCONF_L_BATTERY_CUT_END*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
+    m->m_battery_regen_cut_start_adc=(uint16_t)(MCCONF_L_BATTERY_REGEN_CUT_START*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
+    m->m_battery_regen_cut_end_adc=(uint16_t)(MCCONF_L_BATTERY_REGEN_CUT_END*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
     m->m_vin_min_adc=(uint16_t)(MCCONF_L_MIN_VIN*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
     m->m_vin_max_adc=(uint16_t)(MCCONF_L_MAX_VIN*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
     m->m_watt_max_x10=(uint32_t)(MCCONF_L_WATT_MAX*10.0f+0.5f);
     m->m_watt_regen_x10=(uint32_t)(-MCCONF_L_WATT_MIN*10.0f+0.5f);
     m->m_temp_fet_start_x10=(int16_t)(MCCONF_L_TEMP_FET_START*10.0f+0.5f);
     m->m_temp_fet_end_x10=(int16_t)(MCCONF_L_TEMP_FET_END*10.0f+0.5f);
+    m->m_temp_fet_accel_start_x10=(int16_t)((MCCONF_L_TEMP_FET_START+MCCONF_L_TEMP_ACCEL_DEC*(25.0f-MCCONF_L_TEMP_FET_START))*10.0f+0.5f);
+    m->m_temp_fet_accel_end_x10=(int16_t)((MCCONF_L_TEMP_FET_END+MCCONF_L_TEMP_ACCEL_DEC*(25.0f-MCCONF_L_TEMP_FET_END))*10.0f+0.5f);
+    m->m_erpm_pos_end=(int32_t)MCCONF_L_MAX_ERPM;
+    m->m_erpm_neg_end=(int32_t)MCCONF_L_MIN_ERPM;
+    m->m_erpm_pos_start=(int32_t)(MCCONF_L_MAX_ERPM*MCCONF_L_ERPM_START);
+    m->m_erpm_neg_start=(int32_t)(MCCONF_L_MIN_ERPM*MCCONF_L_ERPM_START);
     m->m_input_current_max_q4=(int16_t)(MCCONF_L_IN_CURRENT_MAX*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_input_current_regen_q4=(int16_t)(-MCCONF_L_IN_CURRENT_MIN*FOC_CURRENT_Q4_PER_A+0.5f);
+    m->m_in_current_map_start_q15=(uint16_t)(MCCONF_L_IN_CURRENT_MAP_START*32768.0f+0.5f);
+    m->m_in_current_map_filter_q16=(uint16_t)(MCCONF_L_IN_CURRENT_MAP_FILTER*65535.0f+0.5f);
     current_pid_recompute_coeff(m);
     speed_pid_recompute_coeff(m);
     position_pid_recompute_coeff(m);
     hall_interp_recompute(m);
     m->m_abs_current_limit_counts=(int16_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV+0.5f);
     m->m_duty_limit_permille=(int16_t)(MCCONF_L_MAX_DUTY*1000.0f+0.5f);
+    m->m_duty_start_permille=(int16_t)(MCCONF_L_MAX_DUTY*MCCONF_L_DUTY_START*1000.0f+0.5f);
+    m->m_cc_min_current_q4=(int16_t)(MCCONF_CC_MIN_CURRENT*FOC_CURRENT_Q4_PER_A+0.5f);
+    m->m_duty_end_current_q4=(int16_t)(MCCONF_CC_MIN_CURRENT*5.0f*FOC_CURRENT_Q4_PER_A+0.5f);
+    m->m_speed_kd_filter_q16=(uint16_t)(MCCONF_SPEED_KD_FILTER_DEFAULT*65535.0f+0.5f);
     m->m_telem_current_filter_q16=(uint16_t)(MCCONF_FOC_TELEMETRY_FILTER_DEFAULT*65535.0f+0.5f);
     {
         const uint16_t pp = motor_pole_pairs(second);
@@ -803,10 +907,12 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
         if (m->m_speed_release_rpm == 0u) m->m_speed_release_rpm = 1u;
     }
     {
-        const float kscale=(32768.0f*4096.0f)/(1000.0f*MCCONF_DUTY_PI_BUS_NOMINAL_V);
+        const float base=13421772.8f;
         const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
-        m->m_duty_kp_q12_per_permille=(uint32_t)(MCCONF_FOC_DUTY_DOWNRAMP_KP*kscale+0.5f);
-        m->m_duty_ki_q12_per_permille=(uint32_t)(MCCONF_FOC_DUTY_DOWNRAMP_KI*dt*kscale+0.5f);
+        m->m_duty_kp_base_q12_x100=(uint32_t)(MCCONF_FOC_DUTY_DOWNRAMP_KP*base+0.5f);
+        m->m_duty_ki_base_q12_x100=(uint32_t)(MCCONF_FOC_DUTY_DOWNRAMP_KI*dt*base+0.5f);
+        const uint32_t vin_cv=((uint32_t)(batVoltage>0?batVoltage:1)*(uint32_t)BAT_CALIB_REAL_VOLTAGE)/(uint32_t)BAT_CALIB_ADC;
+        duty_pi_apply_vbus(m,vin_cv?vin_cv:1u);
     }
     m->m_hall_pos_prev = 0;
     m->m_hall_reject_counted_state = 0xffu;
@@ -851,6 +957,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (!conf) return;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     mc_configuration next = *conf;
+    f103_mcconf_canonicalize_unsupported(&next);
     /* VESC stores the number of motor poles (not pole-pairs). FOC speed math
      * uses this value at runtime, so changing Motor Poles in VESC Tool really
      * changes ERPM <-> mechanical RPM conversion without recompiling. */
@@ -861,6 +968,12 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     }
     if (!(next.si_gear_ratio >= 0.01f && next.si_gear_ratio <= 1000.0f)) next.si_gear_ratio = 1.0f;
     if (!(next.l_max_duty > 0.0f) || next.l_max_duty > MCCONF_L_MAX_DUTY) next.l_max_duty=MCCONF_L_MAX_DUTY;
+    if (!(next.l_erpm_start >= 0.0f && next.l_erpm_start <= 1.0f)) next.l_erpm_start=MCCONF_L_ERPM_START;
+    if (!(next.l_duty_start >= 0.0f && next.l_duty_start <= 1.0f)) next.l_duty_start=MCCONF_L_DUTY_START;
+    if (!(next.l_temp_accel_dec >= 0.0f && next.l_temp_accel_dec <= 1.0f)) next.l_temp_accel_dec=MCCONF_L_TEMP_ACCEL_DEC;
+    if (!(next.l_in_current_map_start >= 0.0f && next.l_in_current_map_start <= 1.0f)) next.l_in_current_map_start=MCCONF_L_IN_CURRENT_MAP_START;
+    if (!(next.l_in_current_map_filter >= 0.00001f && next.l_in_current_map_filter <= 1.0f)) next.l_in_current_map_filter=MCCONF_L_IN_CURRENT_MAP_FILTER;
+    if (!(next.s_pid_kd_filter >= 0.0f && next.s_pid_kd_filter <= 1.0f)) next.s_pid_kd_filter=MCCONF_SPEED_KD_FILTER_DEFAULT;
     if (!(next.l_current_max_scale >= 0.0f && next.l_current_max_scale <= 1.0f)) next.l_current_max_scale=MCCONF_L_CURRENT_MAX_SCALE;
     if (!(next.l_current_min_scale >= 0.0f && next.l_current_min_scale <= 1.0f)) next.l_current_min_scale=MCCONF_L_CURRENT_MIN_SCALE;
     if (!(next.l_battery_cut_start > next.l_battery_cut_end && next.l_battery_cut_end >= 0.0f)) {
@@ -869,6 +982,11 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     }
     if (!(next.l_min_vin >= 5.0f && next.l_max_vin > next.l_min_vin && next.l_max_vin <= 80.0f)) {
         next.l_min_vin=MCCONF_L_MIN_VIN; next.l_max_vin=MCCONF_L_MAX_VIN;
+    }
+    if (!(next.l_battery_regen_cut_end > next.l_battery_regen_cut_start &&
+          next.l_battery_regen_cut_start >= 0.0f && next.l_battery_regen_cut_end <= next.l_max_vin)) {
+        next.l_battery_regen_cut_start=MCCONF_L_BATTERY_REGEN_CUT_START;
+        next.l_battery_regen_cut_end=MCCONF_L_BATTERY_REGEN_CUT_END;
     }
     if (!(next.l_watt_max > 0.0f && next.l_watt_max <= 200000000.0f)) next.l_watt_max=MCCONF_L_WATT_MAX;
     if (!(next.l_watt_min < 0.0f && next.l_watt_min >= -200000000.0f)) next.l_watt_min=MCCONF_L_WATT_MIN;
@@ -993,31 +1111,46 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (release_mech < 1.0f) release_mech = 1.0f;
     if (release_mech > 100.0f) release_mech = 100.0f;
     m->m_speed_release_rpm = (uint16_t)(release_mech + 0.5f);
-    int32_t kpc=(int32_t)(conf->foc_current_kp*1536.0f+0.5f);
-    int32_t kic=(int32_t)(conf->foc_current_ki*4.608f+0.5f);
+    int32_t kpc=(int32_t)(next.foc_current_kp*1536.0f+0.5f);
+    int32_t kic=(int32_t)(next.foc_current_ki*4.608f+0.5f);
     kpc=CLAMP(kpc,0,65535); kic=CLAMP(kic,0,65535);
     m->m_kpq_q11=m->m_kpd_q11=(uint16_t)kpc;
     m->m_kiq_q16=m->m_kid_q16=(uint16_t)kic;
     m->m_kps_q11=(uint16_t)CLAMP((int32_t)(next.s_pid_kp*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
     m->m_kis_q16=(uint16_t)CLAMP((int32_t)(next.s_pid_ki*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
     m->m_kds_q11=(uint16_t)CLAMP((int32_t)(next.s_pid_kd*(float)MCCONF_SPEED_GAIN_SCALE+0.5f),0,65535);
-    m->m_kpp_q11=(uint16_t)CLAMP((int32_t)(conf->p_pid_kp*1000.0f+0.5f),0,65535);
-    m->m_kip_q16=(uint16_t)CLAMP((int32_t)(conf->p_pid_ki*1000.0f+0.5f),0,65535);
-    m->m_kdp_q11=(uint16_t)CLAMP((int32_t)(conf->p_pid_kd*1000.0f+0.5f),0,65535);
+    m->m_kpp_q11=(uint16_t)CLAMP((int32_t)(next.p_pid_kp*1000.0f+0.5f),0,65535);
+    m->m_kip_q16=(uint16_t)CLAMP((int32_t)(next.p_pid_ki*1000.0f+0.5f),0,65535);
+    m->m_kdp_q11=(uint16_t)CLAMP((int32_t)(next.p_pid_kd*1000.0f+0.5f),0,65535);
     m->m_position_kd_filter_q16=(uint16_t)CLAMP((int32_t)(next.p_pid_kd_filter*65535.0f+0.5f),0,65535);
     m->m_current_limit_q4=(int16_t)CLAMP((int32_t)(next.l_current_max*next.l_current_max_scale*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
     m->m_current_limit_neg_q4=(int16_t)CLAMP((int32_t)(-next.l_current_min*next.l_current_min_scale*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
     m->m_battery_cut_start_adc=(uint16_t)CLAMP((int32_t)(next.l_battery_cut_start*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),1,4095);
     m->m_battery_cut_end_adc=(uint16_t)CLAMP((int32_t)(next.l_battery_cut_end*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),0,4094);
+    m->m_battery_regen_cut_start_adc=(uint16_t)CLAMP((int32_t)(next.l_battery_regen_cut_start*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),0,4094);
+    m->m_battery_regen_cut_end_adc=(uint16_t)CLAMP((int32_t)(next.l_battery_regen_cut_end*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),1,4095);
     m->m_vin_min_adc=(uint16_t)CLAMP((int32_t)(next.l_min_vin*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),1,4094);
     m->m_vin_max_adc=(uint16_t)CLAMP((int32_t)(next.l_max_vin*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f),2,4095);
     m->m_watt_max_x10=(uint32_t)CLAMP((int64_t)(next.l_watt_max*10.0f+0.5f),1,2000000000LL);
     m->m_watt_regen_x10=(uint32_t)CLAMP((int64_t)(-next.l_watt_min*10.0f+0.5f),1,2000000000LL);
     m->m_temp_fet_start_x10=(int16_t)CLAMP((int32_t)(next.l_temp_fet_start*10.0f+0.5f),-400,1800);
     m->m_temp_fet_end_x10=(int16_t)CLAMP((int32_t)(next.l_temp_fet_end*10.0f+0.5f),-399,1800);
+    {
+        const float tas=next.l_temp_fet_start+next.l_temp_accel_dec*(25.0f-next.l_temp_fet_start);
+        const float tae=next.l_temp_fet_end+next.l_temp_accel_dec*(25.0f-next.l_temp_fet_end);
+        m->m_temp_fet_accel_start_x10=(int16_t)CLAMP((int32_t)(tas*10.0f+0.5f),-400,1800);
+        m->m_temp_fet_accel_end_x10=(int16_t)CLAMP((int32_t)(tae*10.0f+0.5f),-399,1800);
+    }
+    m->m_erpm_pos_end=(int32_t)(next.l_max_erpm+0.5f);
+    m->m_erpm_neg_end=(int32_t)(next.l_min_erpm-0.5f);
+    m->m_erpm_pos_start=(int32_t)(next.l_max_erpm*next.l_erpm_start+0.5f);
+    m->m_erpm_neg_start=(int32_t)(next.l_min_erpm*next.l_erpm_start-0.5f);
     m->m_wrong_voltage_integrator=0u;
     m->m_input_current_max_q4=(int16_t)CLAMP((int32_t)(next.l_in_current_max*FOC_CURRENT_Q4_PER_A+0.5f),1,I_DC_MAX*FOC_CURRENT_Q4_PER_A);
     m->m_input_current_regen_q4=(int16_t)CLAMP((int32_t)(-next.l_in_current_min*FOC_CURRENT_Q4_PER_A+0.5f),1,I_DC_MAX*FOC_CURRENT_Q4_PER_A);
+    m->m_in_current_map_start_q15=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_start*32768.0f+0.5f),0,32768);
+    m->m_in_current_map_filter_q16=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_filter*65535.0f+0.5f),1,65535);
+    m->m_in_current_map_lpf_q20=0;
     {
         int32_t a=(int32_t)(next.foc_current_filter_const*65535.0f+0.5f);
         m->m_telem_current_filter_q16=(uint16_t)CLAMP(a,1,65535);
@@ -1027,11 +1160,17 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     position_pid_recompute_coeff(m);
     m->m_abs_current_limit_counts=(int16_t)CLAMP((int32_t)(next.l_abs_current_max*(float)A2BIT_CONV+0.5f),1,32767);
     m->m_duty_limit_permille=(int16_t)CLAMP((int32_t)(next.l_max_duty*1000.0f+0.5f),1,1000);
+    m->m_duty_start_permille=(int16_t)CLAMP((int32_t)(next.l_max_duty*next.l_duty_start*1000.0f+0.5f),0,m->m_duty_limit_permille);
+    m->m_cc_min_current_q4=(int16_t)CLAMP((int32_t)(next.cc_min_current*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
+    m->m_duty_end_current_q4=(int16_t)CLAMP((int32_t)(next.cc_min_current*5.0f*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
+    m->m_speed_kd_filter_q16=(uint16_t)CLAMP((int32_t)(next.s_pid_kd_filter*65535.0f+0.5f),0,65535);
     {
-        const float kscale=(32768.0f*4096.0f)/(1000.0f*MCCONF_DUTY_PI_BUS_NOMINAL_V);
+        const float base=13421772.8f; /* (32768*4096/1000)*100 */
         const float dt=(float)MCCONF_FOC_CONTROL_DIV/(float)PWM_FREQ;
-        m->m_duty_kp_q12_per_permille=(uint32_t)(next.foc_duty_dowmramp_kp*kscale+0.5f);
-        m->m_duty_ki_q12_per_permille=(uint32_t)(next.foc_duty_dowmramp_ki*dt*kscale+0.5f);
+        m->m_duty_kp_base_q12_x100=(uint32_t)(next.foc_duty_dowmramp_kp*base+0.5f);
+        m->m_duty_ki_base_q12_x100=(uint32_t)(next.foc_duty_dowmramp_ki*dt*base+0.5f);
+        const uint32_t vin_cv=((uint32_t)(batVoltage>0?batVoltage:1)*(uint32_t)BAT_CALIB_REAL_VOLTAGE)/(uint32_t)BAT_CALIB_ADC;
+        duty_pi_apply_vbus(m,vin_cv?vin_cv:1u);
     }
 }
 void mcpwm_foc_sync_tuning_to_conf(bool second) {
@@ -1170,8 +1309,9 @@ static void speed_mode_enter(mcpwm_foc_motor_t *m) {
 static void set_control_mode(mcpwm_foc_motor_t *m, mc_control_mode mode) {
     if (m->m_control_mode != mode) {
         reset_current_pi(m);
-        m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; reset_position_pid(m);
+        m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0; reset_position_pid(m);
         m->m_duty_i_q15=0; m->m_duty_pi_active=0u;
+        m->m_brake_vq_prev=0; m->m_brake_speed_dir_prev=0; m->m_brake_zero_duty_samples=0u;
         /* Never seed a new torque reference from measured Iq. With low-side
          * shunts the phase current is not observable in high-impedance/coast
          * states, so OFF telemetry can legitimately be biased/noisy. Preserve
