@@ -31,6 +31,7 @@
 #define VESC_RX_INTERBYTE_TIMEOUT_MS 100u
 #define VESC_RX_QUEUE_DEPTH          16u
 #define VESC_TX_QUEUE_DEPTH          8u
+#define DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS 2000
 
 /* Project-specific extensions are transported inside standard
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
@@ -230,6 +231,11 @@ typedef struct {
     float low_i[2], low_v[2], high_i[2], high_v[2];
     float low_i_raw[2], low_v_raw[2], high_i_raw[2], high_v_raw[2];
     uint8_t hall[2][8];
+    int32_t steering_span_backup;
+    uint8_t steering_cal_backup;
+    uint8_t steering_homed_backup;
+    uint8_t left_sensor_encoder;
+    uint8_t steering_span_pending;
 } detect_all_job_t;
 
 static detect_all_job_t s_detect_all;
@@ -1336,6 +1342,12 @@ static void detect_all_restore_backups(void) {
         mc_interface_set_configuration(&c);
     }
     mc_interface_select_motor_thread(1);
+    if(s_detect_all.steering_span_pending){
+        if(s_detect_all.steering_cal_backup && s_detect_all.steering_span_backup!=0)
+            (void)mcpwm_foc_steering_set_span(s_detect_all.steering_span_backup,s_detect_all.steering_homed_backup!=0u);
+        else mcpwm_foc_steering_clear_calibration();
+        s_detect_all.steering_span_pending=0u;
+    }
 }
 
 static void detect_all_reset_sample(void) {
@@ -1366,7 +1378,6 @@ static void detect_all_apply_common_limits(mc_configuration *c) {
 
 static void detect_all_prepare_hall(uint8_t mi) {
     mc_configuration *c=&s_detect_all.result[mi];
-    *c=s_detect_all.backup[mi];
     detect_all_apply_common_limits(c);
     memcpy(c->foc_hall_table,s_detect_all.hall[mi],8u);
     c->motor_type=MOTOR_TYPE_FOC;
@@ -1376,20 +1387,9 @@ static void detect_all_prepare_hall(uint8_t mi) {
 }
 
 static bool detect_all_prepare_encoder_left(void) {
-    /* Detect-All uses the same complete LEFT commissioning path as the VESC
-     * Tool Detect Encoder button: ABI phase/inversion detect, adaptive current,
-     * both mechanical hard stops, logical 0..360 mapping, center return and
-     * persistence. Automatic detection starts at 3 A and can rise only as far
-     * as the configured/board 15-A motor-current ceiling. */
     float off=1001.0f, ratio=0.0f; bool inv=false;
-    int32_t raw_neg=0,raw_pos=0,span=0;
-    if(!mc_interface_steering_detect_calibrate(MCCONF_STEERING_DETECT_CURRENT_START_A,
-                                                &off,&ratio,&inv,
-                                                &raw_neg,&raw_pos,&span))return false;
-    (void)raw_neg; (void)raw_pos; (void)span;
-
+    if(!mcpwm_foc_encoder_detect(MCCONF_STEERING_DETECT_CURRENT_START_A,false,&off,&ratio,&inv))return false;
     mc_configuration *c=&s_detect_all.result[0];
-    *c=*mc_interface_get_configuration_motor(false);
     detect_all_apply_common_limits(c);
     c->motor_type=MOTOR_TYPE_FOC;
     c->sensor_mode=SENSOR_MODE_SENSORED;
@@ -1397,12 +1397,10 @@ static bool detect_all_prepare_encoder_left(void) {
     c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
     c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
     c->si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
-    c->foc_encoder_offset=off;
-    c->foc_encoder_ratio=ratio;
-    c->foc_encoder_inverted=inv;
-    s_detect_all.encoder_offset=off;
-    s_detect_all.encoder_ratio=ratio;
-    s_detect_all.encoder_inverted=inv?1u:0u;
+    c->foc_encoder_offset=off; c->foc_encoder_ratio=ratio; c->foc_encoder_inverted=inv;
+    s_detect_all.encoder_offset=off; s_detect_all.encoder_ratio=ratio; s_detect_all.encoder_inverted=inv?1u:0u;
+    if(!mcpwm_foc_steering_set_span(DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS,true))return false;
+    s_detect_all.steering_span_pending=1u;
     return true;
 }
 
@@ -1414,6 +1412,10 @@ static bool detect_all_commit(void) {
         mc_interface_set_configuration(&c);
         if(!mc_interface_store_configuration_motor(mi!=0u)){ok=false;break;}
         s_last_hall_store_ok[mi]=(mi==1u)?1u:0u;
+    }
+    if(ok && s_detect_all.steering_span_pending){
+        mc_interface_select_motor_thread(1);
+        if(!mc_interface_store_steering_calibration())ok=false;
     }
     if(!ok){
         /* Best-effort atomic rollback: restore RAM and rewrite both old configs.
@@ -1474,51 +1476,36 @@ static void detect_all_start_rl(uint8_t mi, uint32_t now_time) {
     detect_all_reset_sample();
 }
 
-static void hall_detect_reply_and_stop(bool success) {
-    uint8_t table[8];
-    uint8_t fails=0u;
-    for(uint8_t h=0u;h<8u;++h){
-        const uint8_t a=hall_detect_angle200(s_hall_detect.sum_s[h],s_hall_detect.sum_c[h],
-                                             s_hall_detect.samples[h]);
-        table[h]=a;
-        if(a==255u)fails++;
+static void detect_all_start_sensors(uint32_t now_time) {
+    detect_all_release_all();
+    s_detect_all.motor_index=0u;
+    s_detect_all.stage_start_time=now_time;
+    s_detect_all.next_sample_time=now_time;
+    detect_all_apply_runtime(0u);
+    if(s_detect_all.left_sensor_encoder){
+        s_detect_all.stage=DETECT_ALL_ENCODER;
+    }else{
+        s_detect_all.stage=DETECT_ALL_HALL;
+        hall_detect_start_current(false,2.0f);
     }
+}
+
+static void hall_detect_reply_and_stop(bool success) {
+    uint8_t table[8]; uint8_t fails=0u;
+    for(uint8_t h=0u;h<8u;++h){const uint8_t a=hall_detect_angle200(s_hall_detect.sum_s[h],s_hall_detect.sum_c[h],s_hall_detect.samples[h]);table[h]=a;if(a==255u)fails++;}
     if(fails!=2u || !mcpwm_foc_hall_table_sane(table))success=false;
     const bool second=s_hall_detect.second!=0u;
-    mc_interface_select_motor_thread(second?2:1);
-    mc_interface_release_motor();
-    mcpwm_foc_vesc_override_clear(second);
-    mc_interface_select_motor_thread(1);
-
+    mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor(); mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
     if(s_detect_all.active){
-        /* Mixed-sensor hardware: Detect-All must never sweep Hall on LEFT,
-         * because PB6/PB7 are occupied by the steering ABI encoder. Only the
-         * RIGHT virtual VESC is Hall. */
-        if(!second || !success){
-            /* Keep a distinct internal detail code even when there is no VESC
-             * fault, so a GUI "flux linkage" umbrella error can be traced to
-             * the actual Hall stage from the terminal diagnostics. */
-            s_detect_all_last_detail = !second ? 11 : 10;
-            detect_all_finish(!second ? -11 : detect_all_fault_result(second));
-            return;
-        }
-        memcpy(s_detect_all.hall[1],table,8u);
-        detect_all_prepare_hall(1u);
-        detect_all_apply_runtime(1u); /* calibrate Hall coordinates now; do not store yet */
+        if(!success){s_detect_all_last_detail=second?10:11;detect_all_finish(detect_all_fault_result(second));return;}
+        const uint8_t mi=second?1u:0u; memcpy(s_detect_all.hall[mi],table,8u); detect_all_prepare_hall(mi); detect_all_apply_runtime(mi);
         memset(&s_hall_detect,0,sizeof(s_hall_detect));
-        /* LEFT encoder and RIGHT Hall are now synchronized. Identify the motor
-         * model one bridge at a time to keep DC-link stress bounded. */
-        detect_all_start_rl(0u,detect_time_now());
+        if(!second){s_detect_all.stage=DETECT_ALL_HALL;s_detect_all.motor_index=1u;hall_detect_start_current(true,2.0f);}
+        else detect_all_finish(2);
         return;
     }
-
-    uint8_t reply[10];
-    reply[0]=COMM_DETECT_HALL_FOC;
-    memcpy(&reply[1],table,8u);
-    reply[9]=success?0u:1u;
-    s_last_hall_store_ok[second?1u:0u]=0u; /* standalone detect is not a store */
-    memset(&s_hall_detect,0,sizeof(s_hall_detect));
-    uart_send_payload(reply,sizeof(reply));
+    uint8_t reply[10]; reply[0]=COMM_DETECT_HALL_FOC; memcpy(&reply[1],table,8u); reply[9]=success?0u:1u;
+    s_last_hall_store_ok[second?1u:0u]=0u; memset(&s_hall_detect,0,sizeof(s_hall_detect)); uart_send_payload(reply,sizeof(reply));
 }
 
 static void hall_detect_begin(bool second, const uint8_t *data, uint16_t len) {
@@ -1537,36 +1524,37 @@ static void detect_all_begin(const uint8_t *data,uint16_t len) {
     if(s_hall_detect.active || s_detect_all.active) return;
     if(len<21u){ detect_all_reply(-1); return; }
     int32_t k=0;
-    const uint8_t detect_can=data[k++];
-    (void)detect_can; /* virtual ID2 is the on-board second VESC */
+    const uint8_t detect_can=data[k++]; (void)detect_can;
     const float max_power_loss=buffer_get_float32(data,1e3f,&k);
     const float min_current_in=buffer_get_float32(data,1e3f,&k);
     const float max_current_in=buffer_get_float32(data,1e3f,&k);
     const float openloop_rpm=buffer_get_float32(data,1e3f,&k);
     const float sl_erpm=buffer_get_float32(data,1e3f,&k);
     if(!(max_power_loss>=0.5f && max_power_loss<=5000.0f)){detect_all_reply(-1);return;}
-
     memset(&s_detect_all,0,sizeof(s_detect_all));
-    s_detect_all_last_detail=0;
-    s_detect_all.active=1u;
-    s_detect_all.stage=DETECT_ALL_ENCODER;
-    s_detect_all.max_power_loss=max_power_loss;
-    s_detect_all.min_current_in=min_current_in;
-    s_detect_all.max_current_in=max_current_in;
-    s_detect_all.openloop_rpm=openloop_rpm;
-    s_detect_all.sl_erpm=sl_erpm;
+    s_detect_all_last_detail=0; s_detect_all.active=1u;
+    s_detect_all.max_power_loss=max_power_loss; s_detect_all.min_current_in=min_current_in;
+    s_detect_all.max_current_in=max_current_in; s_detect_all.openloop_rpm=openloop_rpm; s_detect_all.sl_erpm=sl_erpm;
     for(uint8_t mi=0u;mi<2u;++mi){
         s_detect_all.backup[mi]=*mc_interface_get_configuration_motor(mi!=0u);
         s_detect_all.result[mi]=s_detect_all.backup[mi];
+        detect_all_apply_common_limits(&s_detect_all.result[mi]);
+        s_detect_all.result[mi].motor_type=MOTOR_TYPE_FOC;
+        s_detect_all.result[mi].sensor_mode=SENSOR_MODE_SENSORLESS;
+        s_detect_all.result[mi].foc_sensor_mode=FOC_SENSOR_MODE_SENSORLESS;
     }
-
+    s_detect_all.steering_span_backup=mcpwm_foc_steering_span_counts();
+    s_detect_all.steering_cal_backup=mcpwm_foc_steering_is_calibrated()?1u:0u;
+    s_detect_all.steering_homed_backup=mcpwm_foc_steering_is_homed()?1u:0u;
+    s_detect_all.left_sensor_encoder=(s_detect_all.backup[0].m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
+        (s_detect_all.backup[0].foc_sensor_mode==FOC_SENSOR_MODE_ENCODER ||
+         s_detect_all.backup[0].foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB))?1u:0u;
     app_vesc_disable_output(180000);
     detect_all_release_all();
-    /* Stage order follows the actual vehicle hardware: LEFT ABI encoder first
-     * (electrical offset/ratio/inversion + physical plausibility alignment),
-     * then RIGHT Hall table, then R/L/flux identification for both bridges. */
-    s_detect_all.stage_start_time=detect_time_now();
-    s_detect_all.next_sample_time=s_detect_all.stage_start_time;
+    /* Upstream VESC Detect-All order: motor model first (R/L/Imax -> flux),
+     * then sensor commissioning. Rotor sensors are not used for these model
+     * measurements. */
+    detect_all_start_rl(0u,detect_time_now());
 }
 
 static void hall_detect_periodic(uint32_t now_time) {
@@ -1688,7 +1676,7 @@ static void detect_all_finalize_motor(uint8_t mi) {
     c->foc_motor_l=s_detect_all.l[mi];
     c->foc_motor_ld_lq_diff=s_detect_all.ld_lq[mi];
     c->foc_motor_flux_linkage=s_detect_all.flux[mi];
-    c->foc_current_kp=c->foc_motor_l*1000.0f; /* VESC tc=1000 us */
+    c->foc_current_kp=c->foc_motor_l*1000.0f;
     c->foc_current_ki=c->foc_motor_r*1000.0f;
     if(c->foc_motor_flux_linkage>0.000001f)
         c->foc_observer_gain=1000.0f/(c->foc_motor_flux_linkage*c->foc_motor_flux_linkage);
@@ -1699,17 +1687,8 @@ static void detect_all_finalize_motor(uint8_t mi) {
     if(absmax<s_detect_all.imax[mi])absmax=s_detect_all.imax[mi];
     c->l_abs_current_max=absmax;
     c->motor_type=MOTOR_TYPE_FOC;
-    c->sensor_mode=SENSOR_MODE_SENSORED;
-    if(mi==0u){
-        c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
-        c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
-        c->foc_encoder_offset=s_detect_all.encoder_offset;
-        c->foc_encoder_ratio=s_detect_all.encoder_ratio;
-        c->foc_encoder_inverted=s_detect_all.encoder_inverted!=0u;
-    }else{
-        c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
-        c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
-    }
+    c->sensor_mode=SENSOR_MODE_SENSORLESS;
+    c->foc_sensor_mode=FOC_SENSOR_MODE_SENSORLESS;
 }
 
 static void detect_all_periodic(uint32_t now_time) {
@@ -1722,6 +1701,7 @@ static void detect_all_periodic(uint32_t now_time) {
             detect_all_finish(-10);
             return;
         }
+        detect_all_apply_runtime(0u);
         s_detect_all.stage=DETECT_ALL_HALL;
         s_detect_all.motor_index=1u;
         /* The RIGHT traction motor needs enough d-axis alignment torque for
@@ -1860,7 +1840,7 @@ static void detect_all_periodic(uint32_t now_time) {
             mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
             if(mi==0u){detect_all_start_rl(1u,now_time);}
-            else detect_all_finish(2);
+            else detect_all_start_sensors(now_time);
         } else if(elapsed>=3000u && s_detect_all.sample_n<40u){
             s_detect_all_last_detail=5; detect_all_finish(-10); return;
         }

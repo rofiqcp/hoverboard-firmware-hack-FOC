@@ -51,7 +51,7 @@
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   4500u 
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u 
 #define MCCONF_STEERING_SLEW_RATE_DEG_S          60u /* physical wheel slew; center-to-endpoint ~=0.5 s */
 #define MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u /* 0.025 VESC base -> 0.075 effective; proportional through ~13 deg before 3-A ceiling */
 #define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       3500u /* measured minimum to cross worst static steering stiction */

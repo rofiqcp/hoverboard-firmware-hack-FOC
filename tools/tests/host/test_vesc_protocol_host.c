@@ -110,7 +110,11 @@ void mc_interface_set_brake_current_rel(float val) {
 void mc_interface_set_handbrake(float c) { set_current[selected_motor==2?1:0]=c; }
 void mc_interface_set_pid_speed(float r) { set_rpm[selected_motor==2?1:0]=r; }
 void mc_interface_set_pid_pos(float p) { set_pos[selected_motor==2?1:0]=p; }
-bool mc_interface_steering_calibration_valid(void){return true;}
+static int32_t mock_steering_span=683;
+static bool mock_steering_cal=true;
+static bool mock_steering_homed=true;
+static unsigned steering_span_hw_calls=0u;
+bool mc_interface_steering_calibration_valid(void){return mock_steering_cal;}
 bool mc_interface_reset_steering_calibration(void){return true;}
 static bool mock_steering_logical_inv=false;
 bool mc_interface_steering_logical_inverted(void){return mock_steering_logical_inv;}
@@ -126,6 +130,7 @@ bool mc_interface_steering_detect_calibrate(float current,float *offset,float *r
     if(raw_left)*raw_left=0;
     if(raw_right)*raw_right=683;
     if(span)*span=683;
+    mock_steering_span=683; mock_steering_cal=true; mock_steering_homed=true; steering_span_hw_calls++;
     return true;
 }
 void mc_interface_get_steering_span_diag(int32_t *neg1,int32_t *pos1,int32_t *neg2,int32_t *pos2,
@@ -204,12 +209,15 @@ float mcpwm_foc_get_phase_observer_motor(bool second) { return second?210.0f:100
 float mcpwm_foc_get_phase_encoder_motor(bool second) { return second?0.0f:12.5f; }
 float mcpwm_foc_get_encoder_position_motor(bool second) { return second?0.0f:12.5f; }
 bool mcpwm_foc_encoder_is_synced(bool second) { return !second && diag_motors[0].m_encoder_synced!=0u; }
-bool mcpwm_foc_steering_is_homed(void){return true;}
-int32_t mcpwm_foc_steering_span_counts(void){return 683;}
+bool mcpwm_foc_steering_is_calibrated(void){return mock_steering_cal;}
+bool mcpwm_foc_steering_is_homed(void){return mock_steering_homed;}
+void mcpwm_foc_steering_clear_calibration(void){mock_steering_cal=false;mock_steering_homed=false;mock_steering_span=0;}
+bool mcpwm_foc_steering_set_span(int32_t span,bool homed){if(span==0)return false;mock_steering_span=span;mock_steering_cal=true;mock_steering_homed=homed;return true;}
+int32_t mcpwm_foc_steering_span_counts(void){return mock_steering_span;}
 int32_t mcpwm_foc_steering_safe_span_counts(void){return 648;}
 bool mcpwm_foc_encoder_startup_align(bool second) { if(second)return false; diag_motors[0].m_encoder_synced=1u; return true; }
 bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *ratio,bool *inverted) {
-    (void)current; if(second)return false; if(offset)*offset=12.0f; if(ratio)*ratio=15.0f; if(inverted)*inverted=false; return true;
+    (void)current; if(second)return false; if(offset)*offset=0.0f; if(ratio)*ratio=4.0f; if(inverted)*inverted=false; return true;
 }
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
@@ -715,6 +723,19 @@ int main(void){
     if(!pump_until_reply(14000u,r,&rn)||rn!=10u||r[0]!=COMM_DETECT_HALL_FOC||r[9]!=0u)return fail("right VESC Tool hall reply");
     if(store_count[1]!=st1||memcmp(oldhall1,confs[1].foc_hall_table,8)!=0)return fail("right detect must not apply/store mcconf");
 
+    /* Project contract: standalone VESC Tool Detect Encoder is translated to
+     * the real steering hard-stop span calibration. Detect-All must not call
+     * that hard-stop sweep. */
+    confs[0].m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
+    confs[0].foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+    confs[0].m_encoder_counts=1024; confs[0].si_motor_poles=8u; confs[0].foc_encoder_ratio=4.0f;
+    {
+        const unsigned hw_before=steering_span_hw_calls;
+        uint8_t de[5]={COMM_DETECT_ENCODER,0,0,0,0}; int32_t ei=1; buffer_append_int32(de,3000,&ei);
+        if(!transact(de,sizeof(de),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_ENCODER)return fail("standalone encoder detect reply");
+        if(steering_span_hw_calls!=hw_before+1u || mock_steering_span!=683)return fail("standalone encoder must measure hardware span");
+    }
+
     /* VESC Tool Detect All (COMM 58): non-blocking on this bare-metal target,
      * app outputs gated, dual Hall detection applied/stored, and an int16
      * non-negative result is returned after both virtual motors complete. */
@@ -728,12 +749,15 @@ int main(void){
         buffer_append_float32(da,250.0f,1e3f,&ai);
         buffer_append_float32(da,2500.0f,1e3f,&ai);
         const unsigned b0=store_count[0], b1=store_count[1];
+        const unsigned hw_before_all=steering_span_hw_calls;
         if(ai!=22 || !transact(da,(uint16_t)ai,r,&rn) || rn!=0u)return fail("detect all must start asynchronously");
         for(int z=0;z<100;z++){tick_ms++;vesc_protocol_periodic(tick_ms);}
         { uint8_t qv[1]={COMM_GET_VALUES}; if(!transact(qv,1u,r,&rn)||rn==0u||r[0]!=COMM_GET_VALUES)return fail("request/reply stalled during detect all"); }
         if(!pump_until_cmd(45000u,COMM_DETECT_APPLY_ALL_FOC,r,&rn)||rn!=3u)return fail("detect all result timeout");
         { int32_t ri=1; if(buffer_get_int16(r,&ri)<0)return fail("detect all returned failure"); }
         if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
+        if(steering_span_hw_calls!=hw_before_all)return fail("detect all encoder must not sweep hardware span");
+        if(mock_steering_span!=2000 || !mock_steering_cal || !mock_steering_homed)return fail("detect all encoder fixed span 2000");
         if(confs[0].m_sensor_port_mode!=SENSOR_PORT_MODE_ABI ||
            confs[0].foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
            fabsf(confs[0].foc_encoder_offset-0.0f)>0.01f ||
