@@ -1,8 +1,30 @@
-# Hoverboard STM32F103RCT6 — VESC 6.00 Dual FOC V16
+# hoverboard-vesc — STM32F103RCT6 VESC 6.00 Dual FOC
 
-Firmware dual-motor FOC bare-metal untuk board hoverboard STM32F103RCT6.
+Firmware dual-motor FOC bare-metal untuk board hoverboard STM32F103RCT6 dengan
+protokol dan perilaku kontrol yang diarahkan kompatibel dengan VESC 6.00/VESC Tool.
 Jalur ADC dual-DMA, PWM TIM8/TIM1, dan ISR FOC 16 kHz tetap memakai basis EFeru
 yang sudah digunakan pada hardware ini. USART3 PB10/PB11 = 2000000 baud.
+
+Repository utama: `https://github.com/rofiqcp/hoverboard-vesc`.
+Di workspace AGV, repository ini dipasang sebagai Git submodule pada
+`/home/otomasi/ros/hoverboard-vesc` sehingga riwayat firmware tetap terpisah dari ROS 2.
+
+## Git submodule
+
+Setelah clone repository AGV, inisialisasi firmware dengan:
+
+```bash
+git submodule update --init --recursive
+```
+
+Untuk mengambil commit terbaru branch `v1` dari submodule:
+
+```bash
+git submodule update --remote --merge hoverboard-vesc
+```
+
+Setiap perubahan firmware harus di-commit dan di-push dari folder `hoverboard-vesc`
+terlebih dahulu, kemudian commit pointer submodule yang baru pada repository AGV.
 
 ## Mapping motor
 
@@ -89,9 +111,9 @@ speed ramp, dan speed release tetap dipersist per motor seperti V14.
 
 Tidak ada lagi `LIVEON`, `LIVEOFF`, atau parameter `LIVE`.
 
-- Saat tidak ada link VESC binary, legacy 72-byte telemetry dikirim otomatis 50 Hz.
-- Saat VESC Tool aktif, legacy bytes dihentikan agar tidak mencemari parser VESC.
-- RX VESC sekarang memakai FIFO 4 paket; burst request tidak lagi hilang karena satu slot pending.
+- USART3 hanya membawa frame protokol VESC; telemetri legacy 72-byte sudah dihapus.
+- Tidak ada byte debug/legacy yang disisipkan ke stream VESC Tool.
+- RX VESC memakai FIFO 4 paket agar burst request tidak hilang karena satu slot pending.
 - `COMM_GET_VALUES`, `COMM_GET_VALUES_SELECTIVE`, `COMM_GET_VALUES_SETUP`, dan
   `COMM_GET_VALUES_SETUP_SELECTIVE` tetap selalu mendapat reply langsung.
 - Request realtime terakhir juga mengaktifkan pengiriman paket dengan ID/mask yang sama
@@ -263,8 +285,9 @@ Semua motor-moving test sengaja membutuhkan `--arm`.
 pio run -e VARIANT_USART
 ```
 
-Environment pembuat V15 ini tidak memiliki `pio` maupun `arm-none-eabi-gcc`,
-sehingga ARM build dan pengujian motor fisik tidak diklaim PASS di sini.
+Build utama menggunakan PlatformIO environment `VARIANT_USART`. Setelah build,
+validasi host dijalankan dengan `tools/run_all_checks.py`; pengujian yang menggerakkan
+motor tetap harus dilakukan pada hardware dengan interlock/arming yang sesuai.
 
 ## Host regression
 
