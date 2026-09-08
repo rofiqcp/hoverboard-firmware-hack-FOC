@@ -90,6 +90,10 @@
 /* VESC default foc_current_filter_const is 0.1. The current PI uses raw Park
  * feedback; this standard field controls monitoring/telemetry filtering only. */
 #define MCCONF_FOC_TELEMETRY_FILTER_DEFAULT     0.10f
+/* Upstream VESC 6.x PLL defaults. Runtime F103 mengubahnya menjadi koefisien
+ * fixed-point pada saat konfigurasi berubah; tidak ada float di ADC ISR. */
+#define MCCONF_FOC_PLL_KP_DEFAULT              2000.0f
+#define MCCONF_FOC_PLL_KI_DEFAULT             30000.0f
 /* VESC speed PID uses normalized output/current scaling. Hardware step tests at
  * +/-750 ERPM selected Kp=0.002, Ki=0.002, Kd=0 for this Hall hoverboard: the
  * doubled Ki removed ~3.3% steady error without excessive current; Kd stays 0
@@ -123,6 +127,23 @@
 #define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */
 #define MCCONF_PWM_MARGIN_COUNTS          FOC_PWM_MARGIN_COUNTS
 #define MCCONF_ABS_CURRENT_QUAL_SAMPLES           3u /* ~0.19 ms @16 kHz: reject transient D/Q spikes */
+/* Safety tambahan yang tetap ringan untuk Cortex-M3. Overspeed memakai Hall
+ * period mentah agar fault tidak tertutup clamp telemetry 1000 mechanical RPM. */
+#define MCCONF_ABS_OVERSPEED_MARGIN_PERCENT      110u /* hard fault 10% di atas soft ERPM limit */
+#define MCCONF_ABS_OVERSPEED_QUAL_SAMPLES          8u /* 0,5 ms @16 kHz, menolak satu glitch timing */
+/* Dua shunt fase FOC normalnya berpusat dekat ADC midscale. Toleransi sengaja
+ * lebar agar pergeseran common-mode board hoverboard tidak memicu false fault. */
+#define MCCONF_CURRENT_OFFSET_CENTER_ADC         2048
+#define MCCONF_CURRENT_OFFSET_MAX_DEVIATION_ADC   900
+#define MCCONF_CURRENT_OFFSET_MAX_PAIR_DELTA_ADC  900
+/* LEFT ABI: batas delta dibuat jauh di atas kecepatan steering normal. Nilai
+ * ini hanya menangkap loncatan counter/glitch; hard-stop calibration OPENLOOP
+ * tetap diizinkan karena gerak aktualnya sangat lambat. */
+#define MCCONF_ENCODER_FAULT_MAX_RPM             1500u
+#define MCCONF_ENCODER_FAULT_DELTA_MARGIN_COUNTS    2u
+#define MCCONF_ENCODER_STUCK_MIN_ERPM             100u
+#define MCCONF_ENCODER_STUCK_CURRENT_MA           1000u
+#define MCCONF_ENCODER_STUCK_TIMEOUT_TICKS       8000u /* 0,5 s @16 kHz */
 /* OFF->RUN ADC/gate-driver settling. Unlike the old per-start offset calibration,
  * this never learns a new offset. It only holds a zero vector for 8 PWM frames
  * (0.5 ms @16 kHz) so the first LOW-FET shunt sample belongs to the driven

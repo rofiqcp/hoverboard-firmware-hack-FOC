@@ -138,7 +138,7 @@ def check_static():
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
-        'EE_CFG_SIGNATURE_VALUE 0x6021u' in mci and 'EE_CFG_SIGNATURE_V34   0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
+        'EE_CFG_SIGNATURE_VALUE 0x6022u' in mci and 'EE_CFG_SIGNATURE_V35   0x6021u' in mci and 'EE_CFG_SIGNATURE_V34   0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \
         'EE_CFG_SIGNATURE_V30   0x601Cu' in mci and 'EE_CFG_SIGNATURE_V29   0x601Bu' in mci and \
         'EE_CFG_SIGNATURE_V28   0x601Au' in mci and 'EE_CFG_SIGNATURE_V27   0x6019u' in mci and \
         'EE_CFG_SIGNATURE_V26   0x6018u' in mci and 'EE_CFG_SIGNATURE_V25   0x6017u' in mci and \
@@ -195,8 +195,8 @@ def check_static():
     lds=(ROOT/'STM32F103RCTx_APP.ld').read_text(); bootlds=(ROOT/'STM32F103RCTx_BOOTLOADER.ld').read_text()
     assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in eeh, 'EEPROM must use two distinct 2-KiB xE flash pages'
     assert 'FLASH_PAGE_SIZE != 0x800U' in eeh, 'EEPROM must assert STM32F103xE 2-KiB page size'
-    assert re.search(r'#define\s+NB_OF_VAR\s+260u', eeh), 'EEPROM virtual variable count mismatch'
-    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==260 and addrs[0]==1000 and addrs[-1]==1259 and addrs==list(range(1000,1260)), 'EEPROM VirtAddVarTab must exactly cover all 260 append-only variables'
+    assert re.search(r'#define\s+NB_OF_VAR\s+270u', eeh), 'EEPROM virtual variable count mismatch'
+    util=(ROOT/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert len(addrs)==270 and addrs[0]==1000 and addrs[-1]==1269 and addrs==list(range(1000,1270)), 'EEPROM VirtAddVarTab must exactly cover all 270 append-only variables'
     assert 'app_vesc_load_configuration(false)' in util and 'app_vesc_load_configuration(true)' in util, 'App Config EEPROM load hook missing'
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()

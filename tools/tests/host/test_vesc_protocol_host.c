@@ -159,6 +159,13 @@ mc_fault_code mc_interface_get_fault_motor(bool second) { (void)second; return F
 void mcpwm_foc_vesc_timeout_configure(bool second, uint32_t timeout_ms, float brake_current) {
     (void)second; (void)timeout_ms; (void)brake_current;
 }
+static uint16_t estop_hold_ms=0u;
+void mcpwm_foc_estop_both(uint16_t duration_ms) {
+    estop_hold_ms=duration_ms;
+    diag_motors[0].m_control_mode=CONTROL_MODE_NONE;
+    diag_motors[1].m_control_mode=CONTROL_MODE_NONE;
+}
+bool mcpwm_foc_estop_active(void) { return estop_hold_ms!=0u; }
 void mcpwm_foc_vesc_override_touch(bool second) { touch_count[second?1:0]++; }
 void mcpwm_foc_vesc_override_clear(bool second) { touch_count[second?1:0]=0u; }
 bool mcpwm_foc_vesc_override_active(bool second) { return touch_count[second?1:0] != 0u; }

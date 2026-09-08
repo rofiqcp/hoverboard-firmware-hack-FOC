@@ -216,7 +216,7 @@
 #define PAGE_FULL             ((uint8_t)0x80)
 
 /* Variables' number */
-#define NB_OF_VAR             260u                  /* 123 legacy/App + 137 append-only MC extension slots */
+#define NB_OF_VAR             270u                  /* 123 legacy/App + 147 append-only MC extension slots */
 _Static_assert((NB_OF_VAR * 4u + 4u) <= FLASH_PAGE_SIZE, "EEPROM live-variable set no longer fits one physical page");
 
 /* Exported types ------------------------------------------------------------*/

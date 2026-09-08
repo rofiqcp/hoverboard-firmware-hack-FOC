@@ -20,6 +20,11 @@ typedef struct {
     mc_fault_code m_fault;
     volatile uint32_t m_fault_recovery_ticks;
     uint32_t m_fault_stop_ticks; /* m_fault_stop_time_ms -> tick PWM, dihitung di slow path */
+    /* Safety runtime per motor. Semua threshold mahal dihitung saat config
+     * berubah; ISR hanya melakukan compare/counter integer. */
+    volatile uint8_t m_current_offset_valid;
+    volatile uint8_t m_overspeed_streak;
+    uint32_t m_abs_erpm_fault;
 
     /* VESC-style setpoints. Fixed-point values are authoritative in the ISR. */
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
@@ -180,6 +185,22 @@ typedef struct {
     volatile uint16_t m_phase_openloop;
     volatile uint8_t m_phase_override;
 
+    /* PLL VESC dalam fixed-point. phase_acc memakai satu putaran = 2^32;
+     * speed_step_q32 adalah increment phase-Q32 per slot kontrol (DIV/PWM_FREQ). */
+    uint32_t m_pll_phase_acc_q32;
+    int32_t m_pll_speed_step_q32;
+    volatile int32_t m_pll_erpm_q16;
+    volatile int32_t m_pll_mech_rpm_q16;
+    uint32_t m_pll_kp_dt_q16;
+    uint32_t m_pll_ki_dt2_q16;
+    int32_t m_pll_speed_limit_step_q32;
+    volatile uint8_t m_pll_valid;
+    /* Feed-forward decoupling D/Q VESC, koefisien Q24 langsung menghasilkan
+     * satuan modulation-count internal dari current-Q4 dan ERPM. */
+    int32_t m_dec_lq_coeff_q24;
+    int32_t m_dec_ld_coeff_q24;
+    int32_t m_dec_flux_coeff_q24;
+
     /* Independent VESC FOC flux observer used by the standard Rotor Position
      * diagnostics. It is deliberately separate from m_phase: Encoder/Hall may
      * be authoritative for Park/SVPWM while Observer must remain an estimator. */
@@ -205,6 +226,7 @@ typedef struct {
     volatile int32_t m_encoder_mech_rpm_q16;
     volatile uint8_t m_encoder_configured;
     volatile uint8_t m_encoder_synced;
+    uint16_t m_encoder_max_delta_per_tick; /* glitch ceiling precomputed */
 
     /* Hall estimator and fixed point regulators. */
     uint8_t m_hall_state;              /* debounced Hall state used by FOC */

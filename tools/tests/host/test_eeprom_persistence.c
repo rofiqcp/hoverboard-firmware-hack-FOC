@@ -107,6 +107,10 @@ int main(void){
     cr.p_pid_kd_proc=0.0023456f; cr.p_pid_gain_dec_angle=45.6f;
     cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f; cr.foc_hall_interp_erpm=900.0f; cr.m_hall_extra_samples=2;
     cr.foc_motor_r=0.220456f; cr.foc_motor_l=0.00042156f; cr.foc_motor_ld_lq_diff=-0.0000098f; cr.foc_motor_flux_linkage=0.020876f;
+    cl.foc_pll_kp=2100.125f; cl.foc_pll_ki=31000.5f;
+    cl.s_pid_speed_source=S_PID_SPEED_SRC_PLL; cl.foc_cc_decoupling=FOC_CC_DECOUPLING_CROSS_BEMF;
+    cr.foc_pll_kp=1800.25f; cr.foc_pll_ki=28000.75f;
+    cr.s_pid_speed_source=S_PID_SPEED_SRC_FAST; cr.foc_cc_decoupling=FOC_CC_DECOUPLING_BEMF;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
     m_motor_1.m_kpq_q11=1111u; m_motor_1.m_kiq_q16=2222u;
@@ -202,6 +206,15 @@ int main(void){
        fabsf(m_motor_1.m_conf.foc_motor_l-0.00035123f)>1e-9f || fabsf(m_motor_2.m_conf.foc_motor_l-0.00042156f)>1e-9f ||
        fabsf(m_motor_1.m_conf.foc_motor_flux_linkage-0.018765f)>1e-7f || fabsf(m_motor_2.m_conf.foc_motor_flux_linkage-0.020876f)>1e-7f)
         return fail("Detect-All motor model exact persistence");
+    if(fabsf(m_motor_1.m_conf.foc_pll_kp-2100.125f)>1e-6f ||
+       fabsf(m_motor_1.m_conf.foc_pll_ki-31000.5f)>1e-4f ||
+       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_PLL ||
+       m_motor_1.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_CROSS_BEMF ||
+       fabsf(m_motor_2.m_conf.foc_pll_kp-1800.25f)>1e-6f ||
+       fabsf(m_motor_2.m_conf.foc_pll_ki-28000.75f)>1e-4f ||
+       m_motor_2.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST ||
+       m_motor_2.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_BEMF)
+        return fail("PLL/decoupling exact persistence");
     if(m_motor_1.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_ABI || m_motor_1.m_conf.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
        m_motor_1.m_conf.m_encoder_counts!=4096 || !m_motor_1.m_conf.foc_encoder_inverted ||
        fabsf(m_motor_1.m_conf.foc_encoder_offset-17.251234f)>0.000001f ||
@@ -270,6 +283,23 @@ int main(void){
             return fail("right exact PID float32 persistence");
     }
 
+    /* V35 (0x6021) sudah memiliki motor model dan exact PID tetapi belum
+     * menyimpan PLL/decoupling. Migrasi wajib memakai default aman lalu append
+     * EXT11 dan menulis signature V36 tanpa merusak field lama. */
+    ee_value[43]=0x6021u; ee_value[44]=0x6021u;
+    for(unsigned i=260u;i<270u;i++)ee_valid[i]=0u;
+    mcpwm_foc_init();
+    if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
+        return fail("V35 PLL/decoupling migration load");
+    if(fabsf(m_motor_1.m_conf.foc_pll_kp-MCCONF_FOC_PLL_KP_DEFAULT)>0.001f ||
+       fabsf(m_motor_2.m_conf.foc_pll_ki-MCCONF_FOC_PLL_KI_DEFAULT)>0.001f ||
+       m_motor_1.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED ||
+       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST)
+        return fail("V35 PLL/decoupling migration defaults");
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u)
+        return fail("V35 migration signature");
+    for(unsigned i=260u;i<270u;i++)if(!ee_valid[i])return fail("V35 EXT11 rewrite");
+
     /* V34 (0x6020) already has Hall-extra but not the R/L/flux model slots.
      * Migration must preserve every old field and append zero "not detected yet"
      * values without treating the absence as corruption. */
@@ -283,7 +313,7 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.foc_motor_r)>1e-9f || fabsf(m_motor_2.m_conf.foc_motor_l)>1e-9f ||
        fabsf(m_motor_1.m_conf.foc_motor_flux_linkage)>1e-9f)
         return fail("V34 motor-model migration defaults");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u)
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u)
         return fail("V34 migration signature");
     for(unsigned i=207u;i<223u;i++)if(!ee_valid[i])return fail("V34 motor-model slot rewrite");
 
@@ -298,7 +328,7 @@ int main(void){
         return fail("V33 Hall-extra migration load");
     if(m_motor_1.m_conf.m_hall_extra_samples!=3 || m_motor_2.m_conf.m_hall_extra_samples!=3)
         return fail("V33 Hall-extra migration default");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u || !ee_valid[205] || !ee_valid[206] ||
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u || !ee_valid[205] || !ee_valid[206] ||
        ee_value[205]!=3u || ee_value[206]!=3u)
         return fail("V33 Hall-extra migration rewrite");
 
@@ -320,7 +350,7 @@ int main(void){
        fabsf(m_motor_1.m_conf.p_pid_kd_proc-0.00035f)>0.0000001f ||
        fabsf(m_motor_1.m_conf.p_pid_gain_dec_angle)>0.000001f)
         return fail("V31 user-field/direction migration defaults");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u)
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u)
         return fail("V31 migration signature");
     for(unsigned i=186u;i<223u;i++)if(!ee_valid[i])return fail("V31 V34-slot rewrite");
 
@@ -336,7 +366,7 @@ int main(void){
         return fail("V30 Hall interpolation preservation");
     if(m_motor_1.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_HALL || m_motor_1.m_conf.m_encoder_counts!=4096)
         return fail("V30 encoder default migration");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u || !ee_valid[181] || !ee_valid[185])
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u || !ee_valid[181] || !ee_valid[185])
         return fail("V30 encoder schema rewrite");
 
     /* V29 (0x601B) sudah punya seluruh safety persistence tetapi belum punya
@@ -352,7 +382,7 @@ int main(void){
        fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-500.0f)>0.5f ||
        m_motor_1.m_hall_interp_erpm!=500u || m_motor_2.m_hall_interp_erpm!=500u)
         return fail("V29 Hall interpolation migration default/runtime");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u || !ee_valid[179] || !ee_valid[180] ||
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u || !ee_valid[179] || !ee_valid[180] ||
        ee_value[179]!=500u || ee_value[180]!=500u || !ee_valid[181] || !ee_valid[182] ||
        !ee_valid[183] || !ee_valid[184] || !ee_valid[185])
         return fail("V29 migration Hall/encoder slots/signature");
@@ -375,7 +405,7 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.l_min_vin-MCCONF_L_MIN_VIN)>0.011f ||
        fabsf(m_motor_2.m_conf.l_temp_fet_end-MCCONF_L_TEMP_FET_END)>0.051f)
         return fail("V28 safety default migration");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u)
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u)
         return fail("V28 migration signature");
     for(unsigned i=163u;i<179u;i++)if(!ee_valid[i])return fail("V28 migration safety slots");
     if(!ee_valid[179] || !ee_valid[180] || ee_value[179]!=500u || ee_value[180]!=500u ||
@@ -390,7 +420,7 @@ int main(void){
     mcpwm_foc_init();
     if(!mc_interface_load_configuration_motor(false) || !mc_interface_load_configuration_motor(true))
         return fail("V27 migration load");
-    if(ee_value[43]!=0x6021u || ee_value[44]!=0x6021u || !ee_valid[161] || !ee_valid[162] ||
+    if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u || !ee_valid[161] || !ee_valid[162] ||
        !ee_valid[179] || !ee_valid[180] || !ee_valid[181] || !ee_valid[185])
         return fail("V27 migration rewrite/signature");
 

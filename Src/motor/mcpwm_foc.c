@@ -97,6 +97,8 @@ static int32_t batVoltageFixdt = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_R
 
 static float bus_voltage_now(void);
 static void duty_pi_apply_vbus(mcpwm_foc_motor_t *m, uint32_t vin_cv);
+static void pll_coeff_recompute(mcpwm_foc_motor_t *m);
+static void decoupling_coeff_recompute(mcpwm_foc_motor_t *m);
 /* VESC: mod = Vdq * 1.5 / Vbus. Internal 16000 == mod 1.0.
  * Cache reciprocal scales when the slow battery filter updates so the 5.33-kHz
  * current regulator needs only multiply/shift, no floating point or division. */
@@ -134,6 +136,10 @@ static void current_voltage_scale_refresh(void) {
     duty_pi_apply_vbus(&m_motor_2,cv);
     watt_current_limits_refresh(&m_motor_1,cv);
     watt_current_limits_refresh(&m_motor_2,cv);
+    /* Feed-forward D/Q memakai skala modulation-count per volt. Saat Vbus
+     * berubah, hanya koefisien slow-path ini yang diperbarui; ISR tetap integer. */
+    decoupling_coeff_recompute(&m_motor_1);
+    decoupling_coeff_recompute(&m_motor_2);
     s_voltage_scale_bat_adc=batVoltage;
 }
 
@@ -246,7 +252,7 @@ static int8_t hall_motion_direction(bool second, int8_t raw_dir) {
     return raw_dir;
 }
 
-static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
+static int32_t measured_mech_rpm_raw_q16(const mcpwm_foc_motor_t *m, bool second) {
     if (encoder_feedback_selected(m,second) && m->m_encoder_configured)
         return m->m_encoder_mech_rpm_q16;
     /* One Hall transition is 60 electrical degrees, i.e. six transitions per
@@ -272,6 +278,12 @@ static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
         }
     }
     return (int32_t)m->m_rpm << 16;
+}
+
+static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
+    if(m && m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL && m->m_pll_valid)
+        return m->m_pll_mech_rpm_q16;
+    return measured_mech_rpm_raw_q16(m,second);
 }
 
 static bool encoder_motion_fresh(const mcpwm_foc_motor_t *m, bool second) {
@@ -411,7 +423,6 @@ static void f103_mcconf_canonicalize_unsupported(mc_configuration *c) {
     c->foc_sat_comp_mode=SAT_COMP_DISABLED;
     c->foc_sat_comp=0.0f;
     c->foc_temp_comp=false;
-    c->foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
     c->foc_observer_type=FOC_OBSERVER_ORTEGA_ORIGINAL;
     c->foc_phase_filter_enable=false;
     c->foc_phase_filter_disable_fault=true;
@@ -423,7 +434,6 @@ static void f103_mcconf_canonicalize_unsupported(mc_configuration *c) {
     c->foc_fw_q_current_factor=0.0f;
     c->foc_fw_backoff=0.0f;
     c->foc_speed_soure=FOC_SPEED_SRC_CORRECTED;
-    c->s_pid_speed_source=S_PID_SPEED_SRC_FAST;
     c->m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
     c->m_out_aux_mode=OUT_AUX_MODE_OFF;
     c->foc_hfi_voltage_start=0.0f;
@@ -498,6 +508,12 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_current_kp = 0.80013f;
     c->foc_current_ki = 266.710f;
     c->foc_current_filter_const = MCCONF_FOC_TELEMETRY_FILTER_DEFAULT;
+    c->foc_pll_kp = MCCONF_FOC_PLL_KP_DEFAULT;
+    c->foc_pll_ki = MCCONF_FOC_PLL_KI_DEFAULT;
+    /* Fitur yang sudah mempunyai runtime nyata tetap default konservatif.
+     * PLL tersedia sebagai source speed pilihan; decoupling harus diaktifkan
+     * eksplisit setelah R/L/flux motor teridentifikasi. */
+    c->foc_cc_decoupling = FOC_CC_DECOUPLING_DISABLED;
     /* Fitur generic VESC yang tidak mempunyai jalur hardware pada hoverboard
      * F103 dikunci ke mode aman. Ini mencegah VESC Tool menampilkan seolah-olah
      * sebuah opsi aktif padahal runtime tidak pernah mengeksekusinya. */
@@ -506,7 +522,6 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->foc_sat_comp_mode = SAT_COMP_DISABLED;
     c->foc_sat_comp = 0.0f;
     c->foc_temp_comp = false;
-    c->foc_cc_decoupling = FOC_CC_DECOUPLING_DISABLED;
     c->foc_phase_filter_enable = false;
     c->foc_phase_filter_disable_fault = true;
     c->foc_mtpa_mode = MTPA_MODE_OFF;
@@ -675,6 +690,14 @@ static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool re
     m->m_encoder_count_to_phase_q16=(uint32_t)((1ULL<<32)/counts);
     m->m_encoder_mdeg_per_count_q12=(uint32_t)((((uint64_t)360000u<<12)+(counts/2u))/counts);
     m->m_encoder_mech_rpm_coeff_q3=(uint32_t)((60ULL*(uint64_t)PWM_FREQ*8ULL+counts/2u)/counts);
+    {
+        const uint64_t num=(uint64_t)counts*(uint64_t)MCCONF_ENCODER_FAULT_MAX_RPM;
+        const uint32_t den=60u*(uint32_t)PWM_FREQ;
+        uint32_t d=(uint32_t)((num+den-1u)/den)+MCCONF_ENCODER_FAULT_DELTA_MARGIN_COUNTS;
+        if(d<1u)d=1u;
+        if(d>UINT16_MAX)d=UINT16_MAX;
+        m->m_encoder_max_delta_per_tick=(uint16_t)d;
+    }
     float ratio=m->m_conf.foc_encoder_ratio;
     if(!(ratio>=0.01f && ratio<=MCCONF_ENCODER_RATIO_MAX)) ratio=(float)motor_pole_pairs(false);
     m->m_encoder_ratio_q16=(uint32_t)(ratio*65536.0f+0.5f);
@@ -864,6 +887,102 @@ static uint32_t fault_stop_ticks_from_ms(int32_t configured_ms) {
     return (uint32_t)ticks;
 }
 
+static bool current_offset_pair_plausible(int16_t a, int16_t b) {
+    const int32_t da=(int32_t)a-MCCONF_CURRENT_OFFSET_CENTER_ADC;
+    const int32_t db=(int32_t)b-MCCONF_CURRENT_OFFSET_CENTER_ADC;
+    const int32_t pair=(int32_t)a-(int32_t)b;
+    return ABS(da)<=MCCONF_CURRENT_OFFSET_MAX_DEVIATION_ADC &&
+           ABS(db)<=MCCONF_CURRENT_OFFSET_MAX_DEVIATION_ADC &&
+           ABS(pair)<=MCCONF_CURRENT_OFFSET_MAX_PAIR_DELTA_ADC;
+}
+
+static uint32_t motor_abs_erpm_for_fault(const mcpwm_foc_motor_t *m, bool second) {
+    if(!m)return 0u;
+    if(encoder_feedback_selected(m,second) && m->m_encoder_configured){
+        int32_t e=m->m_encoder_erpm_q16;
+        if(e<0)e=(e==INT32_MIN)?INT32_MAX:-e;
+        return (uint32_t)e>>16;
+    }
+    if(m->m_hall_initialized && m->m_hall_direction!=0 &&
+       m->m_hall_period>0u && m->m_hall_period<MCCONF_HALL_TIMEOUT_TICKS &&
+       m->m_hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS){
+        /* 1 Hall edge = 60 derajat elektrik, sehingga ERPM = 10*Fs/period.
+         * Gunakan periode mentah/filtered Hall sebelum m_rpm di-clamp 1000 RPM. */
+        return ((uint32_t)PWM_FREQ*10u)/(uint32_t)m->m_hall_period;
+    }
+    return 0u;
+}
+
+static void safety_thresholds_recompute(mcpwm_foc_motor_t *m) {
+    if(!m)return;
+    float lim=m->m_conf.l_max_erpm;
+    if(-m->m_conf.l_min_erpm>lim)lim=-m->m_conf.l_min_erpm;
+    if(!(lim>0.0f))lim=MCCONF_L_MAX_ERPM;
+    float hard=lim*((float)MCCONF_ABS_OVERSPEED_MARGIN_PERCENT/100.0f);
+    if(hard<lim+50.0f)hard=lim+50.0f;
+    if(hard>100000.0f)hard=100000.0f;
+    m->m_abs_erpm_fault=(uint32_t)(hard+0.5f);
+}
+
+
+static void pll_coeff_recompute(mcpwm_foc_motor_t *m) {
+    if(!m)return;
+    const double dt=(double)MCCONF_FOC_CONTROL_DIV/(double)PWM_FREQ;
+    double kp=(double)m->m_conf.foc_pll_kp;
+    double ki=(double)m->m_conf.foc_pll_ki;
+    if(!(kp>=0.0 && kp<=10000.0))kp=(double)MCCONF_FOC_PLL_KP_DEFAULT;
+    if(!(ki>=0.0 && ki<=200000.0))ki=(double)MCCONF_FOC_PLL_KI_DEFAULT;
+    double a=kp*dt*65536.0;
+    double b=ki*dt*dt*65536.0;
+    if(a<0.0)a=0.0;
+    if(a>4294967295.0)a=4294967295.0;
+    if(b<0.0)b=0.0;
+    if(b>4294967295.0)b=4294967295.0;
+    m->m_pll_kp_dt_q16=(uint32_t)(a+0.5);
+    m->m_pll_ki_dt2_q16=(uint32_t)(b+0.5);
+    /* speed_step_q32 = ERPM/60 * dt * 2^32. Clamp memakai hard
+     * overspeed threshold agar PLL tidak wind-up melewati envelope hardware. */
+    double lim=(double)(m->m_abs_erpm_fault?m->m_abs_erpm_fault:1u)*dt*(4294967296.0/60.0);
+    if(lim<1.0)lim=1.0;
+    if(lim>(double)INT32_MAX)lim=(double)INT32_MAX;
+    m->m_pll_speed_limit_step_q32=(int32_t)(lim+0.5);
+    m->m_pll_valid=0u;
+    m->m_pll_phase_acc_q32=(uint32_t)m->m_phase<<16;
+    m->m_pll_speed_step_q32=0;
+    m->m_pll_erpm_q16=0;
+    m->m_pll_mech_rpm_q16=0;
+}
+
+static void decoupling_coeff_recompute(mcpwm_foc_motor_t *m) {
+    if(!m)return;
+    /* Satuan upstream: omega_e [rad/s], I [A], L [H], lambda [Wb].
+     * Internal F103 menyimpan current Q4 dan voltage sebagai modulation-count.
+     * Semua konversi float dilakukan di sini; control ISR hanya multiply/shift. */
+    const double l=(double)m->m_conf.foc_motor_l;
+    const double diff=(double)m->m_conf.foc_motor_ld_lq_diff;
+    double ld=l-diff*0.5;
+    double lq=l+diff*0.5;
+    if(!(ld>0.0 && ld<=0.1))ld=0.0;
+    if(!(lq>0.0 && lq<=0.1))lq=0.0;
+    double flux=(double)m->m_conf.foc_motor_flux_linkage;
+    if(!(flux>0.0 && flux<=1.0))flux=0.0;
+    const double counts_per_v=(double)s_mod_counts_per_volt_q16/65536.0;
+    const double omega_per_erpm=0.10471975511965977; /* 2*pi/60 */
+    const double q24=16777216.0;
+    double kd=omega_per_erpm*ld*counts_per_v*q24/(double)FOC_CURRENT_Q4_PER_A;
+    double kq=omega_per_erpm*lq*counts_per_v*q24/(double)FOC_CURRENT_Q4_PER_A;
+    double kf=omega_per_erpm*flux*counts_per_v*q24;
+    if(kd>(double)INT32_MAX)kd=(double)INT32_MAX;
+    if(kd<0.0)kd=0.0;
+    if(kq>(double)INT32_MAX)kq=(double)INT32_MAX;
+    if(kq<0.0)kq=0.0;
+    if(kf>(double)INT32_MAX)kf=(double)INT32_MAX;
+    if(kf<0.0)kf=0.0;
+    m->m_dec_ld_coeff_q24=(int32_t)(kd+0.5);
+    m->m_dec_lq_coeff_q24=(int32_t)(kq+0.5);
+    m->m_dec_flux_coeff_q24=(int32_t)(kf+0.5);
+}
+
 static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
     if(!m)return;
     m->m_fault=code;
@@ -907,6 +1026,9 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_watt_max_x10=(uint32_t)(MCCONF_L_WATT_MAX*10.0f+0.5f);
     m->m_watt_regen_x10=(uint32_t)(-MCCONF_L_WATT_MIN*10.0f+0.5f);
     m->m_fault_stop_ticks=fault_stop_ticks_from_ms(m->m_conf.m_fault_stop_time_ms);
+    safety_thresholds_recompute(m);
+    pll_coeff_recompute(m);
+    decoupling_coeff_recompute(m);
     m->m_temp_fet_start_x10=(int16_t)(MCCONF_L_TEMP_FET_START*10.0f+0.5f);
     m->m_temp_fet_end_x10=(int16_t)(MCCONF_L_TEMP_FET_END*10.0f+0.5f);
     m->m_temp_fet_accel_start_x10=(int16_t)((MCCONF_L_TEMP_FET_START+MCCONF_L_TEMP_ACCEL_DEC*(25.0f-MCCONF_L_TEMP_FET_START))*10.0f+0.5f);
@@ -1029,6 +1151,22 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     /* Hardware tidak mempunyai sensor temperatur motor eksternal. Jangan
      * mengarang temperatur motor; tandai port temperatur motor sebagai disabled. */
     next.m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
+    if(!(next.foc_pll_kp>=0.0f && next.foc_pll_kp<=10000.0f))next.foc_pll_kp=MCCONF_FOC_PLL_KP_DEFAULT;
+    if(!(next.foc_pll_ki>=0.0f && next.foc_pll_ki<=200000.0f))next.foc_pll_ki=MCCONF_FOC_PLL_KI_DEFAULT;
+    /* F103 menyediakan source PLL dan FAST. FASTER belum mempunyai estimator
+     * terpisah, sehingga canonicalize ke FAST agar readback tidak berbohong. */
+    if(next.s_pid_speed_source!=S_PID_SPEED_SRC_PLL && next.s_pid_speed_source!=S_PID_SPEED_SRC_FAST)
+        next.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
+    if((uint8_t)next.foc_cc_decoupling>(uint8_t)FOC_CC_DECOUPLING_CROSS_BEMF)
+        next.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
+    {
+        const bool l_ok=isfinite(next.foc_motor_l)&&next.foc_motor_l>0.000001f&&next.foc_motor_l<=0.1f;
+        const bool flux_ok=isfinite(next.foc_motor_flux_linkage)&&next.foc_motor_flux_linkage>0.000001f&&next.foc_motor_flux_linkage<=1.0f;
+        if((next.foc_cc_decoupling==FOC_CC_DECOUPLING_CROSS && !l_ok) ||
+           (next.foc_cc_decoupling==FOC_CC_DECOUPLING_BEMF && !flux_ok) ||
+           (next.foc_cc_decoupling==FOC_CC_DECOUPLING_CROSS_BEMF && (!l_ok || !flux_ok)))
+            next.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
+    }
     /* Physical sensor contract for this board is deliberately narrower than a
      * generic VESC: LEFT is either ABI Encoder or Hall, RIGHT is Hall-only.
      * R/L/Flux commissioning is sensor-independent because OPENLOOP overrides
@@ -1119,7 +1257,10 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (encoder_requires_resync) m->m_encoder_synced=0u;
     m->m_conf = next;
     m->m_fault_stop_ticks=fault_stop_ticks_from_ms(next.m_fault_stop_time_ms);
+    safety_thresholds_recompute(m);
     openloop_phase_coeff_recompute(m,second);
+    pll_coeff_recompute(m);
+    decoupling_coeff_recompute(m);
     hall_interp_recompute(m);
     position_ang_div_recompute(m);
     encoder_runtime_configure(m,second,encoder_reinit);
@@ -2197,6 +2338,63 @@ static bool hall_feedback_valid(const mcpwm_foc_motor_t *m) {
     return angle<200u && angle==m->m_hall_pos_prev;
 }
 
+
+static void foc_pll_update_fixed(mcpwm_foc_motor_t *m, bool second, bool control_update) {
+    if(!m || !control_update)return;
+    const bool sensor_ready=encoder_feedback_selected(m,second)?
+        (m->m_encoder_configured&&m->m_encoder_synced):hall_feedback_valid(m);
+    const bool synthetic_phase=m->m_control_mode==CONTROL_MODE_OPENLOOP ||
+        m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE ||
+        m->m_control_mode==CONTROL_MODE_HANDBRAKE;
+    if(!sensor_ready || synthetic_phase){
+        m->m_pll_valid=0u;
+        m->m_pll_speed_step_q32=0;
+        m->m_pll_erpm_q16=0;
+        m->m_pll_mech_rpm_q16=0;
+        return;
+    }
+    if(!m->m_pll_valid){
+        m->m_pll_phase_acc_q32=(uint32_t)m->m_phase<<16;
+        m->m_pll_speed_step_q32=0;
+        m->m_pll_erpm_q16=0;
+        m->m_pll_mech_rpm_q16=0;
+        m->m_pll_valid=1u;
+        return;
+    }
+
+    /* Bentuk persamaan sama dengan foc_pll_run() upstream VESC:
+     * phase += (speed + Kp*error)*dt; speed += Ki*error*dt.
+     * Setelah dt dan konversi radian->putaran dilipat ke koefisien slow-path,
+     * ISR tinggal multiply integer. Wrap int16 memberi error sudut terpendek. */
+    const uint16_t est_phase=(uint16_t)(m->m_pll_phase_acc_q32>>16);
+    const int32_t err=(int32_t)(int16_t)(m->m_phase-est_phase);
+    int64_t prop=(int64_t)err*(int64_t)m->m_pll_kp_dt_q16;
+    if(prop>INT32_MAX)prop=INT32_MAX;
+    if(prop<INT32_MIN)prop=INT32_MIN;
+    const int64_t phase_step=(int64_t)m->m_pll_speed_step_q32+prop;
+    m->m_pll_phase_acc_q32+=(uint32_t)(int32_t)phase_step;
+
+    int64_t next_speed=(int64_t)m->m_pll_speed_step_q32+
+        (int64_t)err*(int64_t)m->m_pll_ki_dt2_q16;
+    const int64_t lim=m->m_pll_speed_limit_step_q32>0?m->m_pll_speed_limit_step_q32:INT32_MAX;
+    if(next_speed>lim)next_speed=lim;
+    if(next_speed<-lim)next_speed=-lim;
+    m->m_pll_speed_step_q32=(int32_t)next_speed;
+
+    /* ERPM_Q16 = phase_step_Q32 * (60/dt) / 2^16. Faktor 60*Fs/DIV
+     * konstan 160000 pada 16 kHz/DIV6; SMULL+shift, tanpa software divide. */
+    const int32_t rate=(int32_t)((60u*(uint32_t)PWM_FREQ)/(uint32_t)MCCONF_FOC_CONTROL_DIV);
+    int64_t eq16=((int64_t)m->m_pll_speed_step_q32*(int64_t)rate)>>16;
+    if(eq16>INT32_MAX)eq16=INT32_MAX;
+    if(eq16<INT32_MIN)eq16=INT32_MIN;
+    const int32_t eq32=(int32_t)eq16;
+    m->m_pll_erpm_q16=eq32;
+    const int32_t pp=(int32_t)motor_pole_pairs(second);
+    /* Setelah clamp nilai sudah int32; paksa pembagian 32-bit agar Cortex-M3
+     * memakai SDIV hardware dan tidak menarik __aeabi_ldivmod ke ADC ISR. */
+    m->m_pll_mech_rpm_q16=pp>0?(eq32/pp):eq32;
+}
+
 static int16_t hall_angle_diff(uint8_t now, uint8_t prev) {
     int16_t d = (int16_t)now - (int16_t)prev;
     if (d > 100) d -= 200;
@@ -2221,6 +2419,8 @@ static uint8_t hall_midpoint200(uint8_t previous_center, int16_t center_delta) {
 
 static uint8_t hall_sample_state(mcpwm_foc_motor_t *m, bool second) {
     const uint8_t raw_h = hall_read(m,second);
+    if(raw_h==0u || raw_h==7u){
+    }
 
     /* GPIO Hall inputs are asynchronous to the 16-kHz ADC ISR. One transient
      * sample during a switching edge must never become an electrical-sector
@@ -2549,6 +2749,24 @@ static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second, uint16_t 
     else if(delta<-half)delta+=(int32_t)counts;
     m->m_encoder_prev_count=cnt;
     m->m_encoder_raw_count=cnt;
+    {
+        const uint32_t ad=(uint32_t)(delta<0?-delta:delta);
+        uint32_t allowed=(uint32_t)(m->m_encoder_max_delta_per_tick?m->m_encoder_max_delta_per_tick:1u)*
+                         (uint32_t)elapsed_pwm_ticks;
+        if(allowed>counts/2u)allowed=counts/2u;
+        if(ad>allowed){
+            /* Lompatan ABI yang secara fisik mustahil dianggap slip/counter
+             * corruption. Putus sinkronisasi agar bridge tidak pernah memakai
+             * phase elektrik hasil counter yang meragukan. */
+            m->m_encoder_synced=0u;
+            m->m_encoder_delta_accum=0;
+            m->m_encoder_erpm_q16=0;
+            m->m_encoder_mech_rpm_q16=0;
+            m->m_rpm=0;
+            motor_fault_set(m,FAULT_CODE_ENCODER_SLIP);
+            return;
+        }
+    }
 
     if(delta!=0){
         int64_t pos=(int64_t)m->m_position_counts+(int64_t)delta;
@@ -3384,6 +3602,49 @@ static void foc_observer_update_diag(mcpwm_foc_motor_t *m, float dt) {
     }
 }
 
+static int32_t motor_erpm_for_decoupling(const mcpwm_foc_motor_t *m, bool second) {
+    if(m->m_pll_valid)return m->m_pll_erpm_q16>>16;
+    int64_t e=(int64_t)measured_mech_rpm_raw_q16(m,second)*(int64_t)motor_pole_pairs(second);
+    e>>=16;
+    if(e>INT32_MAX)e=INT32_MAX;
+    if(e<INT32_MIN)e=INT32_MIN;
+    return (int32_t)e;
+}
+
+static void current_decoupling_apply(mcpwm_foc_motor_t *m, bool second, foc_dq_t *v, int16_t vector_limit) {
+    if(!m||!v||m->m_control_mode>=CONTROL_MODE_HANDBRAKE)return;
+    const mc_foc_cc_decoupling_mode mode=m->m_conf.foc_cc_decoupling;
+    if(mode==FOC_CC_DECOUPLING_DISABLED)return;
+    const int32_t erpm=motor_erpm_for_decoupling(m,second);
+    if(erpm==0)return;
+
+    int32_t dec_vd=0, dec_vq=0, bemf=0;
+    if(mode==FOC_CC_DECOUPLING_CROSS || mode==FOC_CC_DECOUPLING_CROSS_BEMF){
+        int64_t x=(int64_t)m->m_iq_q4*(int64_t)erpm;
+        x=(x*(int64_t)m->m_dec_lq_coeff_q24)>>24;
+        if(x>vector_limit)x=vector_limit;
+        if(x<-(int64_t)vector_limit)x=-(int64_t)vector_limit;
+        dec_vd=(int32_t)x;
+        x=(int64_t)m->m_id_q4*(int64_t)erpm;
+        x=(x*(int64_t)m->m_dec_ld_coeff_q24)>>24;
+        if(x>vector_limit)x=vector_limit;
+        if(x<-(int64_t)vector_limit)x=-(int64_t)vector_limit;
+        dec_vq=(int32_t)x;
+    }
+    if(mode==FOC_CC_DECOUPLING_BEMF || mode==FOC_CC_DECOUPLING_CROSS_BEMF){
+        int64_t x=((int64_t)erpm*(int64_t)m->m_dec_flux_coeff_q24)>>24;
+        if(x>vector_limit)x=vector_limit;
+        if(x<-(int64_t)vector_limit)x=-(int64_t)vector_limit;
+        bemf=(int32_t)x;
+    }
+    /* Tanda identik PMSM/VESC: vd -= omega*Lq*Iq;
+     * vq += omega*Ld*Id + omega*lambda. */
+    int32_t vd=(int32_t)v->d-dec_vd;
+    int32_t vq=(int32_t)v->q+dec_vq+bemf;
+    v->d=(int16_t)CLAMP(vd,-vector_limit,vector_limit);
+    v->q=(int16_t)CLAMP(vq,-vector_limit,vector_limit);
+}
+
 static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_counts,
                                int16_t i1_counts, int16_t idc_counts, bool control_update) {
     const uint32_t profSensorStart=DWT->CYCCNT;
@@ -3459,6 +3720,24 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         }
     }
 
+    /* LEFT ABI frozen detection hanya aktif pada SPEED mode. Position hold,
+     * hard-stop steering detect, dan fixed-phase commissioning sengaja dikecualikan
+     * karena kondisi tersebut memang dapat menghasilkan arus tanpa gerakan. */
+    if(!second && encoder_feedback_selected(m,false) && m->m_encoder_configured && m->m_encoder_synced &&
+       m->m_control_mode==CONTROL_MODE_SPEED){
+        int32_t tr=m->m_speed_target_rpm_q16;
+        uint32_t atr=(uint32_t)(tr<0?-tr:tr);
+        const uint32_t target_erpm_q16=atr*(uint32_t)motor_pole_pairs(false);
+        const int32_t iq=m->m_iq_set_q4<0?-(int32_t)m->m_iq_set_q4:(int32_t)m->m_iq_set_q4;
+        const int32_t iq_min=(int32_t)MCCONF_ENCODER_STUCK_CURRENT_MA*(int32_t)FOC_CURRENT_Q4_PER_A/1000;
+        if(target_erpm_q16>((uint32_t)MCCONF_ENCODER_STUCK_MIN_ERPM<<16) && iq>=iq_min &&
+           m->m_encoder_idle_ticks>=MCCONF_ENCODER_STUCK_TIMEOUT_TICKS){
+            m->m_encoder_synced=0u;
+            motor_fault_set(m,FAULT_CODE_ENCODER_FAULT);
+        }
+    }
+
+    foc_pll_update_fixed(m,second,control_update);
     if(control_update){ const uint32_t c=DWT->CYCCNT-profSensorStart; if(c>foc_prof_sensor_max_cycles)foc_prof_sensor_max_cycles=c; }
     const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
     const bool openloop_feedback = m->m_control_mode==CONTROL_MODE_OPENLOOP ||
@@ -3744,6 +4023,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                                  q_lim,(int16_t)-q_lim,
                                  &m->m_iq_integrator,&m->m_iq_sat_hold);
             }
+            /* Feed-forward D/Q decoupling VESC dijalankan sesudah kedua PI.
+             * Default tetap DISABLED; CROSS/BEMF hanya lolos config bila model
+             * L/flux valid. Voltage circle di bawah tetap menjadi safety akhir. */
+            current_decoupling_apply(m,second,&v,vector_limit);
             /* Backup only; q_lim already enforces the voltage circle before
              * the Iq PI, so its anti-windup sees the real available headroom. */
             foc_vector_limit(&v,vector_limit);
@@ -3899,6 +4182,10 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
             m_motor_1.m_driven_offset0=offsetrlA; m_motor_1.m_driven_offset1=offsetrlB; m_motor_1.m_driven_offsetdc=offsetdcl;
             m_motor_2.m_driven_offset0=offsetrrB; m_motor_2.m_driven_offset1=offsetrrC; m_motor_2.m_driven_offsetdc=offsetdcr;
             m_motor_1.m_driven_offset_valid=1u; m_motor_2.m_driven_offset_valid=1u;
+            m_motor_1.m_current_offset_valid=current_offset_pair_plausible(offsetrlA,offsetrlB)?1u:0u;
+            m_motor_2.m_current_offset_valid=current_offset_pair_plausible(offsetrrB,offsetrrC)?1u:0u;
+            if(!m_motor_1.m_current_offset_valid)motor_fault_set(&m_motor_1,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
+            if(!m_motor_2.m_current_offset_valid)motor_fault_set(&m_motor_2,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
             m_motor_1.m_driven_offset_calibrating=0u; m_motor_2.m_driven_offset_calibrating=0u;
             m_motor_1.m_driven_offset_samples=2000u; m_motor_2.m_driven_offset_samples=2000u;
         }
@@ -3923,8 +4210,10 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     const bool leftFeedbackReady=leftOpenloopRequest ||
         (encoder_feedback_selected(&m_motor_1,false) ? m_motor_1.m_encoder_synced : hall_feedback_valid(&m_motor_1));
     const bool rightFeedbackReady=rightOpenloopRequest || hall_feedback_valid(&m_motor_2);
-    const uint8_t leftDriveRequest=(leftSourceEnable!=0u)&&(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)&&leftFeedbackReady;
-    const uint8_t rightDriveRequest=(rightSourceEnable!=0u)&&(m_motor_2.m_control_mode!=CONTROL_MODE_NONE)&&rightFeedbackReady;
+    const uint8_t leftDriveRequest=(leftSourceEnable!=0u)&&(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)&&
+        leftFeedbackReady&&m_motor_1.m_current_offset_valid;
+    const uint8_t rightDriveRequest=(rightSourceEnable!=0u)&&(m_motor_2.m_control_mode!=CONTROL_MODE_NONE)&&
+        rightFeedbackReady&&m_motor_2.m_current_offset_valid;
     /* Semantik fault Vin VESC 6.00: integrasikan besar pelanggaran agar noise
      * satu sampel tidak langsung memicu fault, lalu fault tetap auto-recover
      * melalui m_fault_stop_time_ms sementara telemetry USART tetap berjalan. */
@@ -3946,6 +4235,21 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         }else if(fm->m_wrong_voltage_integrator>0u){
             fm->m_wrong_voltage_integrator--;
         }
+        {
+            const uint32_t ae=motor_abs_erpm_for_fault(fm,fi!=0u);
+            if(fm->m_abs_erpm_fault>0u && ae>fm->m_abs_erpm_fault){
+                if(fm->m_overspeed_streak<MCCONF_ABS_OVERSPEED_QUAL_SAMPLES)fm->m_overspeed_streak++;
+                if(fm->m_fault==FAULT_CODE_NONE && fm->m_overspeed_streak>=MCCONF_ABS_OVERSPEED_QUAL_SAMPLES)
+                    motor_fault_set(fm,FAULT_CODE_ABS_OVERSPEED);
+            }else{
+                fm->m_overspeed_streak=0u;
+            }
+        }
+        /* Offset fase yang invalid adalah fault persisten sampai reboot/re-kalibrasi.
+         * Auto-recovery fault VESC boleh menghapus kode, tetapi gate ini segera
+         * mengembalikannya dan tidak pernah memberi MOE pada data arus tak valid. */
+        if(!fm->m_current_offset_valid && fm->m_fault==FAULT_CODE_NONE)
+            motor_fault_set(fm,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
         if(fm->m_fault==FAULT_CODE_NONE && fm->m_temp_fet_end_x10>fm->m_temp_fet_start_x10 &&
            s_board_temperature_x10>=fm->m_temp_fet_end_x10){
             motor_fault_set(fm,FAULT_CODE_OVER_TEMP_FET);
@@ -4075,6 +4379,9 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         }
         if(n<UINT16_MAX)m_motor_1.m_driven_offset_samples=(uint16_t)(n+1u);
         m_motor_1.m_driven_offset_valid=1u;
+        m_motor_1.m_current_offset_valid=current_offset_pair_plausible(m_motor_1.m_driven_offset0,m_motor_1.m_driven_offset1)?1u:0u;
+        if((uint32_t)n+1u>=MCCONF_BRIDGE_SETTLE_SAMPLES && !m_motor_1.m_current_offset_valid)
+            motor_fault_set(&m_motor_1,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
     }
     if(rightBridgeWasOn && rightDriveRequest && m_motor_2.m_bridge_settle_ticks>0u){
         uint16_t n=m_motor_2.m_driven_offset_samples;
@@ -4093,6 +4400,9 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         }
         if(n<UINT16_MAX)m_motor_2.m_driven_offset_samples=(uint16_t)(n+1u);
         m_motor_2.m_driven_offset_valid=1u;
+        m_motor_2.m_current_offset_valid=current_offset_pair_plausible(m_motor_2.m_driven_offset0,m_motor_2.m_driven_offset1)?1u:0u;
+        if((uint32_t)n+1u>=MCCONF_BRIDGE_SETTLE_SAMPLES && !m_motor_2.m_current_offset_valid)
+            motor_fault_set(&m_motor_2,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
     }
 
     /* Three current-sampling states are kept deliberately separate:

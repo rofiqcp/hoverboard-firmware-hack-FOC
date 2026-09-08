@@ -30,8 +30,8 @@ assert mc.count('for (uint8_t pass = 0u; pass < 3u; ++pass)') >= 2 and 'deg = 36
 assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++)' in halltest and 'isr<16u' in halltest
 
 # VESC ownership/bridge gating is per motor, not one shared any-motor flag.
-assert 'leftSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(false)' in mc
-assert 'rightSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(true)' in mc
+assert re.search(r'leftSourceEnable=\(!estopActive\)&&\(\(enable!=0u\)\|\|mcpwm_foc_vesc_override_active\(false\)\)', mc), 'LEFT source gate must include VESC ownership and E-stop'
+assert re.search(r'rightSourceEnable=\(!estopActive\)&&\(\(enable!=0u\)\|\|mcpwm_foc_vesc_override_active\(true\)\)', mc), 'RIGHT source gate must include VESC ownership and E-stop'
 assert 'leftOpenloop = (m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||' in mc
 assert 'CONTROL_MODE_OPENLOOP_PHASE);' in mc and 'leftDcLimit=leftOpenloop' in mc and 'rightDcLimit=rightOpenloop' in mc
 
