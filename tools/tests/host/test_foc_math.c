@@ -24,6 +24,20 @@ int main(void){
   foc_ab_t ab={1200,-700},ab2={0,0}; foc_dq_t dq={0,0};
   foc_park_q4(&ab,10000,&dq); foc_inv_park(&dq,10000,&ab2);
   if(abs(ab.alpha-ab2.alpha)>3||abs(ab.beta-ab2.beta)>3)return fail("park roundtrip");
+  /* ISR sqrt harus exact integer sqrt tetapi berbasis Flash LUT, bukan loop
+   * restoring bit-by-bit. Uji seluruh rentang kecil dan sampel uint32 penuh. */
+  for(uint32_t x=0u;x<1000000u;++x){
+    uint32_t r=foc_isqrt_u32(x);
+    uint32_t ref=(uint32_t)sqrt((double)x);
+    if(r!=ref)return fail("sqrt LUT exact small range");
+  }
+  uint32_t prng=0x13579bdfu;
+  for(uint32_t k=0u;k<200000u;++k){
+    prng=prng*1664525u+1013904223u;
+    uint32_t r=foc_isqrt_u32(prng);
+    uint32_t ref=(uint32_t)sqrt((double)prng);
+    if(r!=ref)return fail("sqrt LUT exact uint32 sample");
+  }
   foc_dq_t v={20000,20000};foc_vector_limit(&v,14400);
   uint32_t mag=(uint32_t)((int32_t)v.d*v.d+(int32_t)v.q*v.q); if(mag>(uint32_t)14420u*14420u)return fail("vector limit");
   foc_abc_t pwm;foc_centered_svpwm(&v,12345,&pwm);

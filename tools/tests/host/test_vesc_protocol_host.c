@@ -819,7 +819,7 @@ int main(void){
         if(store_count[0]!=(b0+1u)||store_count[1]!=(b1+1u))return fail("detect all must persist both motor configs");
         if(steering_span_hw_calls!=hw_before_all)return fail("detect all encoder must not sweep hardware span");
         if(!encoder_detect_saw_motor_model)return fail("detect all must identify R/L/flux before encoder sensor stage");
-        if(mock_steering_span!=2000 || !mock_steering_cal || !mock_steering_homed)return fail("detect all encoder fixed span 2000");
+        if(mock_steering_span!=683 || !mock_steering_cal || !mock_steering_homed)return fail("detect all must preserve existing steering span");
         if(confs[0].m_sensor_port_mode!=SENSOR_PORT_MODE_ABI ||
            confs[0].foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
            fabsf(confs[0].foc_encoder_offset-0.0f)>0.01f ||

@@ -31,7 +31,6 @@
 #define VESC_RX_INTERBYTE_TIMEOUT_MS 100u
 #define VESC_RX_QUEUE_DEPTH          16u
 #define VESC_TX_QUEUE_DEPTH          8u
-#define DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS 2000
 
 /* Project-specific extensions are transported inside standard
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
@@ -227,11 +226,7 @@ typedef struct {
     float low_i[2], low_v[2], high_i[2], high_v[2];
     float low_i_raw[2], low_v_raw[2], high_i_raw[2], high_v_raw[2];
     uint8_t hall[2][8];
-    int32_t steering_span_backup;
-    uint8_t steering_cal_backup;
-    uint8_t steering_homed_backup;
     uint8_t left_sensor_encoder;
-    uint8_t steering_span_pending;
     /* 0 = Detect-All. Otherwise this same cooperative motor-model worker is
      * serving a stock VESC measurement command (25/26/57) for one endpoint. */
     uint8_t standalone_cmd;
@@ -1331,12 +1326,6 @@ static void detect_all_restore_backups(void) {
         mc_interface_set_configuration(&c);
     }
     mc_interface_select_motor_thread(1);
-    if(s_detect_all.steering_span_pending){
-        if(s_detect_all.steering_cal_backup && s_detect_all.steering_span_backup!=0)
-            (void)mcpwm_foc_steering_set_span(s_detect_all.steering_span_backup,s_detect_all.steering_homed_backup!=0u);
-        else mcpwm_foc_steering_clear_calibration();
-        s_detect_all.steering_span_pending=0u;
-    }
 }
 
 static void detect_all_reset_sample(void) {
@@ -1388,8 +1377,9 @@ static bool detect_all_prepare_encoder_left(void) {
     c->si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
     c->foc_encoder_offset=off; c->foc_encoder_ratio=ratio; c->foc_encoder_inverted=inv;
     s_detect_all.encoder_offset=off; s_detect_all.encoder_ratio=ratio; s_detect_all.encoder_inverted=inv?1u:0u;
-    if(!mcpwm_foc_steering_set_span(DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS,true))return false;
-    s_detect_all.steering_span_pending=1u;
+    /* Detect-All mengikuti semantik VESC: komisioning sensor hanya mencari
+     * parameter elektrik encoder. Hard-stop dan span steering LEFT adalah
+     * kalibrasi mekanik proyek dan hanya boleh disentuh oleh Detect Encoder. */
     return true;
 }
 
@@ -1401,10 +1391,6 @@ static bool detect_all_commit(void) {
         mc_interface_set_configuration(&c);
         if(!mc_interface_store_configuration_motor(mi!=0u)){ok=false;break;}
         s_last_hall_store_ok[mi]=(mi==1u)?1u:0u;
-    }
-    if(ok && s_detect_all.steering_span_pending){
-        mc_interface_select_motor_thread(1);
-        if(!mc_interface_store_steering_calibration())ok=false;
     }
     if(!ok){
         /* Best-effort atomic rollback: restore RAM and rewrite both old configs.
@@ -1706,9 +1692,6 @@ static void conf_general_detect_apply_all_foc_can_start(const uint8_t *data,uint
          * safer on the steering LEFT endpoint than exposing a temporary
          * SENSORLESS configuration that is valid only while OPENLOOP is active. */
     }
-    s_detect_all.steering_span_backup=mcpwm_foc_steering_span_counts();
-    s_detect_all.steering_cal_backup=mcpwm_foc_steering_is_calibrated()?1u:0u;
-    s_detect_all.steering_homed_backup=mcpwm_foc_steering_is_homed()?1u:0u;
     s_detect_all.left_sensor_encoder=(s_detect_all.backup[0].m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
         (s_detect_all.backup[0].foc_sensor_mode==FOC_SENSOR_MODE_ENCODER ||
          s_detect_all.backup[0].foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB))?1u:0u;
@@ -2598,7 +2581,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
     terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
-    terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. ALL: LEFT Id=3A adaptive<=15A, RIGHT Hall, then R/L/flux. Encoder: sync+2 stops+save span. Boot encoder: sync only; manual center=span/2=POS180. Hall uses entered A; RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
+    terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
 static void terminal_values(bool second){

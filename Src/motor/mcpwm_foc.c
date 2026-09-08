@@ -29,6 +29,16 @@ uint8_t buzzerCount = 0;
 volatile uint32_t buzzerTimer = 0;
 static uint8_t buzzerPrev = 0;
 static uint8_t buzzerIdx = 0;
+
+static inline void buzzer_pin_toggle_fast(void) {
+    /* ISR F103: akses register langsung, deterministic beberapa cycle. */
+    BUZZER_PORT->ODR ^= BUZZER_PIN;
+}
+
+static inline void buzzer_pin_low_fast(void) {
+    BUZZER_PORT->ODR &= ~(uint32_t)BUZZER_PIN;
+}
+
 uint8_t enable = 0;
 volatile uint8_t motorRunReq = 1u;
 volatile uint16_t svpwmOpenloopRpm = SVPWM_OPENLOOP_RPM_DEFAULT;
@@ -92,6 +102,23 @@ static uint32_t s_mod_counts_per_volt_q16 = 39321600u; /* 40 V startup */
 static uint32_t s_volt_q24_per_mod_count = 27962u;      /* 40 V startup */
 static int16_t s_voltage_scale_bat_adc = INT16_MIN;
 
+static void watt_current_limits_refresh(mcpwm_foc_motor_t *m, uint32_t vin_cv) {
+    if(!m)return;
+    const uint32_t cv=vin_cv?vin_cv:1u;
+    /* VESC 6.00: I_in <= P_limit / V_in. Konversi P(0,1 W), V(cV) ke
+     * current Q4 menghasilkan P_x10*8000/V_cV. Operasi 64-bit/division ini
+     * hanya berjalan di slow path; ISR cukup membaca cache int16. */
+    uint64_t q=((uint64_t)m->m_watt_max_x10*8000u)/cv;
+    uint32_t hard=(uint32_t)I_DC_MAX*(uint32_t)FOC_CURRENT_Q4_PER_A;
+    if(q>hard)q=hard;
+    if(q>INT16_MAX)q=INT16_MAX;
+    m->m_watt_current_max_q4=(int16_t)q;
+    q=((uint64_t)m->m_watt_regen_x10*8000u)/cv;
+    if(q>hard)q=hard;
+    if(q>INT16_MAX)q=INT16_MAX;
+    m->m_watt_current_regen_q4=(int16_t)q;
+}
+
 static void current_voltage_scale_refresh(void) {
     const uint32_t vin_cv=((uint32_t)(batVoltage>0?batVoltage:1)*(uint32_t)BAT_CALIB_REAL_VOLTAGE)/(uint32_t)BAT_CALIB_ADC;
     const uint32_t cv=vin_cv?vin_cv:1u;
@@ -99,10 +126,12 @@ static void current_voltage_scale_refresh(void) {
     s_mod_counts_per_volt_q16=(uint32_t)(a/cv);
     s_volt_q24_per_mod_count=(uint32_t)(((uint64_t)cv*16777216u+1200000u)/2400000u);
     if(s_volt_q24_per_mod_count==0u)s_volt_q24_per_mod_count=1u;
-    /* Gain duty down-ramp VESC berbanding terbalik dengan Vbus. Pembagian ini
-     * sengaja dilakukan di housekeeping 5 ms, bukan di ISR 16 kHz. */
+    /* Gain duty down-ramp dan watt/current VESC dihitung di slow path, bukan
+     * di ISR 16 kHz. Ini menjaga worst-case ISR bebas __aeabi_uldivmod. */
     duty_pi_apply_vbus(&m_motor_1,cv);
     duty_pi_apply_vbus(&m_motor_2,cv);
+    watt_current_limits_refresh(&m_motor_1,cv);
+    watt_current_limits_refresh(&m_motor_2,cv);
     s_voltage_scale_bat_adc=batVoltage;
 }
 
@@ -303,21 +332,11 @@ static int16_t current_circle_iq_limit_q4(const mcpwm_foc_motor_t *m, int16_t iq
         if (amod_q > mod_q_min) {
             const bool drawing=((iq_cmd_q4>=0)==(mod_q>=0));
             int32_t in_lim=drawing?m->m_input_current_max_q4:m->m_input_current_regen_q4;
-            /* VESC 6.00 watt limit: I_in <= P_limit / V_in. Daya disimpan
-             * 0,1 W dan Vin dihitung centivolt, sehingga I(q4)=P_x10*8000/V_cV. */
-            const int32_t vin_cv=((int32_t)batVoltage*(int32_t)BAT_CALIB_REAL_VOLTAGE)/(int32_t)BAT_CALIB_ADC;
-            const uint32_t watt_x10=drawing?m->m_watt_max_x10:m->m_watt_regen_x10;
-            if (vin_cv > 0 && watt_x10 > 0u) {
-                /* Avoid a 64-bit software divide in the 16-kHz ISR when the
-                 * configured watt limit is looser than the already active input
-                 * current limit. Only calculate P/V when it can actually bind. */
-                const uint64_t watt_num=(uint64_t)watt_x10*8000u;
-                const uint64_t input_need=(uint64_t)(uint32_t)in_lim*(uint32_t)vin_cv;
-                if (watt_num < input_need) {
-                    const uint32_t wi=(uint32_t)(watt_num/(uint32_t)vin_cv);
-                    if (wi < (uint32_t)in_lim) in_lim=(int32_t)wi;
-                }
-            }
+            /* VESC 6.00 watt limit: I_in <= P_limit / V_in. P/V dikonversi
+             * ke Q4 di slow path setiap Vbus/config berubah. ISR hanya memilih
+             * nilai cache sehingga worst-case tidak pernah memanggil 64-bit div. */
+            const int32_t watt_lim=drawing?m->m_watt_current_max_q4:m->m_watt_current_regen_q4;
+            if(watt_lim>0 && watt_lim<in_lim)in_lim=watt_lim;
             if (in_lim > 0) {
                 /* in_lim is int16-backed Q4 current, therefore in_lim*16000
                  * is bounded below INT32_MAX. Keep the hot path on the M3's
@@ -834,12 +853,21 @@ static bool hall_table_runtime_sane(const uint8_t t[8]) {
     return true;
 }
 
+static uint32_t fault_stop_ticks_from_ms(int32_t configured_ms) {
+    uint32_t ms=configured_ms>0?(uint32_t)configured_ms:(uint32_t)MCCONF_FAULT_STOP_TIME_MS;
+    if(ms<50u)ms=50u;
+    uint64_t ticks=((uint64_t)ms*(uint64_t)PWM_FREQ+999u)/1000u;
+    if(ticks==0u)ticks=1u;
+    if(ticks>UINT32_MAX)ticks=UINT32_MAX;
+    return (uint32_t)ticks;
+}
+
 static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
-    uint32_t ms = m->m_conf.m_fault_stop_time_ms > 0 ? (uint32_t)m->m_conf.m_fault_stop_time_ms : MCCONF_FAULT_STOP_TIME_MS;
-    if (ms < 50u) ms = 50u;
-    m->m_fault = code;
-    m->m_fault_recovery_ticks = (uint32_t)(((uint64_t)ms * (uint64_t)PWM_FREQ + 999u) / 1000u);
-    if (m->m_fault_recovery_ticks == 0u) m->m_fault_recovery_ticks = 1u;
+    if(!m)return;
+    m->m_fault=code;
+    /* Timeout telah dikonversi saat config berubah. Fault path ISR sekarang
+     * O(1), tanpa software divide 64-bit pada kondisi yang justru kritis. */
+    m->m_fault_recovery_ticks=m->m_fault_stop_ticks?m->m_fault_stop_ticks:1u;
 }
 
 static void motor_fault_recovery_tick(mcpwm_foc_motor_t *m) {
@@ -876,6 +904,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_vin_max_adc=(uint16_t)(MCCONF_L_MAX_VIN*100.0f*(float)BAT_CALIB_ADC/(float)BAT_CALIB_REAL_VOLTAGE+0.5f);
     m->m_watt_max_x10=(uint32_t)(MCCONF_L_WATT_MAX*10.0f+0.5f);
     m->m_watt_regen_x10=(uint32_t)(-MCCONF_L_WATT_MIN*10.0f+0.5f);
+    m->m_fault_stop_ticks=fault_stop_ticks_from_ms(m->m_conf.m_fault_stop_time_ms);
     m->m_temp_fet_start_x10=(int16_t)(MCCONF_L_TEMP_FET_START*10.0f+0.5f);
     m->m_temp_fet_end_x10=(int16_t)(MCCONF_L_TEMP_FET_END*10.0f+0.5f);
     m->m_temp_fet_accel_start_x10=(int16_t)((MCCONF_L_TEMP_FET_START+MCCONF_L_TEMP_ACCEL_DEC*(25.0f-MCCONF_L_TEMP_FET_START))*10.0f+0.5f);
@@ -886,6 +915,8 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_erpm_neg_start=(int32_t)(MCCONF_L_MIN_ERPM*MCCONF_L_ERPM_START);
     m->m_input_current_max_q4=(int16_t)(MCCONF_L_IN_CURRENT_MAX*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_input_current_regen_q4=(int16_t)(-MCCONF_L_IN_CURRENT_MIN*FOC_CURRENT_Q4_PER_A+0.5f);
+    m->m_watt_current_max_q4=m->m_input_current_max_q4;
+    m->m_watt_current_regen_q4=m->m_input_current_regen_q4;
     m->m_in_current_map_start_q15=(uint16_t)(MCCONF_L_IN_CURRENT_MAP_START*32768.0f+0.5f);
     m->m_in_current_map_filter_q16=(uint16_t)(MCCONF_L_IN_CURRENT_MAP_FILTER*65535.0f+0.5f);
     current_pid_recompute_coeff(m);
@@ -1085,6 +1116,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (poles_changed || encoder_requires_resync) mcpwm_foc_release_motor(second);
     if (encoder_requires_resync) m->m_encoder_synced=0u;
     m->m_conf = next;
+    m->m_fault_stop_ticks=fault_stop_ticks_from_ms(next.m_fault_stop_time_ms);
     openloop_phase_coeff_recompute(m,second);
     hall_interp_recompute(m);
     position_ang_div_recompute(m);
@@ -1148,6 +1180,10 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     m->m_wrong_voltage_integrator=0u;
     m->m_input_current_max_q4=(int16_t)CLAMP((int32_t)(next.l_in_current_max*FOC_CURRENT_Q4_PER_A+0.5f),1,I_DC_MAX*FOC_CURRENT_Q4_PER_A);
     m->m_input_current_regen_q4=(int16_t)CLAMP((int32_t)(-next.l_in_current_min*FOC_CURRENT_Q4_PER_A+0.5f),1,I_DC_MAX*FOC_CURRENT_Q4_PER_A);
+    {
+        const uint32_t cv=((uint32_t)(batVoltage>0?batVoltage:1)*(uint32_t)BAT_CALIB_REAL_VOLTAGE)/(uint32_t)BAT_CALIB_ADC;
+        watt_current_limits_refresh(m,cv?cv:1u);
+    }
     m->m_in_current_map_start_q15=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_start*32768.0f+0.5f),0,32768);
     m->m_in_current_map_filter_q16=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_filter*65535.0f+0.5f),1,65535);
     m->m_in_current_map_lpf_q20=0;
@@ -4155,8 +4191,8 @@ void DMA1_Channel1_IRQHandler(void) {
     buzzerTimer++;
     if (buzzerFreq != 0 && (buzzerTimer / 5000) % (buzzerPattern + 1) == 0) {
         if (buzzerPrev == 0) { buzzerPrev=1; if(++buzzerIdx>(buzzerCount+2))buzzerIdx=1; }
-        if (buzzerTimer % buzzerFreq == 0 && (buzzerIdx <= buzzerCount || buzzerCount == 0)) HAL_GPIO_TogglePin(BUZZER_PORT,BUZZER_PIN);
-    } else if (buzzerPrev) { HAL_GPIO_WritePin(BUZZER_PORT,BUZZER_PIN,GPIO_PIN_RESET); buzzerPrev=0; }
+        if (buzzerTimer % buzzerFreq == 0 && (buzzerIdx <= buzzerCount || buzzerCount == 0)) buzzer_pin_toggle_fast();
+    } else if (buzzerPrev) { buzzer_pin_low_fast(); buzzerPrev=0; }
 
     if (s_overrun) { m_motor_1.m_overrun_count++;m_motor_2.m_overrun_count++;foc_isr_monitor_end(focIsrStartCycles);return; }
     s_overrun=1;

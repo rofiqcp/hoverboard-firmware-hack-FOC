@@ -20,6 +20,35 @@ static const int16_t s_sin_q15[257] = {
     0,
 };
 
+
+/* sqrt(n) Q7 untuk n pada grid 0,256,...,65536. Tabel uint16 berada di
+ * Flash. ISR menormalisasi uint32 ke mantissa 14/15-bit, interpolasi linear,
+ * lalu koreksi integer bounded. Tidak ada loop sqrt bit-by-bit atau libm. */
+static const uint16_t s_sqrt_q7[257] = {
+    0u, 2048u, 2896u, 3547u, 4096u, 4579u, 5016u, 5418u, 5792u, 6144u, 6476u, 6792u,
+    7094u, 7384u, 7662u, 7931u, 8192u, 8444u, 8688u, 8927u, 9158u, 9385u, 9605u, 9821u,
+    10033u, 10240u, 10442u, 10641u, 10836u, 11028u, 11217u, 11402u, 11585u, 11764u, 11941u, 12116u,
+    12288u, 12457u, 12624u, 12789u, 12952u, 13113u, 13272u, 13429u, 13584u, 13738u, 13890u, 14040u,
+    14188u, 14336u, 14481u, 14625u, 14768u, 14909u, 15049u, 15188u, 15325u, 15462u, 15597u, 15730u,
+    15863u, 15995u, 16125u, 16255u, 16384u, 16511u, 16638u, 16763u, 16888u, 17011u, 17134u, 17256u,
+    17377u, 17498u, 17617u, 17736u, 17854u, 17971u, 18087u, 18203u, 18317u, 18432u, 18545u, 18658u,
+    18770u, 18881u, 18992u, 19102u, 19211u, 19320u, 19429u, 19536u, 19643u, 19750u, 19856u, 19961u,
+    20066u, 20170u, 20274u, 20377u, 20480u, 20582u, 20683u, 20784u, 20885u, 20985u, 21085u, 21184u,
+    21283u, 21381u, 21479u, 21577u, 21673u, 21770u, 21866u, 21962u, 22057u, 22152u, 22246u, 22341u,
+    22434u, 22528u, 22620u, 22713u, 22805u, 22897u, 22988u, 23079u, 23170u, 23260u, 23350u, 23440u,
+    23529u, 23618u, 23707u, 23795u, 23883u, 23971u, 24058u, 24145u, 24232u, 24318u, 24404u, 24490u,
+    24576u, 24661u, 24746u, 24830u, 24914u, 24999u, 25082u, 25166u, 25249u, 25332u, 25415u, 25497u,
+    25579u, 25661u, 25742u, 25824u, 25905u, 25986u, 26066u, 26147u, 26227u, 26307u, 26386u, 26465u,
+    26545u, 26624u, 26702u, 26781u, 26859u, 26937u, 27014u, 27092u, 27169u, 27246u, 27323u, 27400u,
+    27476u, 27553u, 27629u, 27704u, 27780u, 27855u, 27930u, 28005u, 28080u, 28155u, 28229u, 28303u,
+    28377u, 28451u, 28525u, 28598u, 28672u, 28745u, 28817u, 28890u, 28963u, 29035u, 29107u, 29179u,
+    29251u, 29322u, 29394u, 29465u, 29536u, 29607u, 29678u, 29748u, 29819u, 29889u, 29959u, 30029u,
+    30099u, 30168u, 30238u, 30307u, 30376u, 30445u, 30514u, 30583u, 30651u, 30720u, 30788u, 30856u,
+    30924u, 30991u, 31059u, 31126u, 31194u, 31261u, 31328u, 31395u, 31461u, 31528u, 31595u, 31661u,
+    31727u, 31793u, 31859u, 31925u, 31990u, 32056u, 32121u, 32186u, 32251u, 32316u, 32381u, 32446u,
+    32510u, 32575u, 32639u, 32703u, 32768u,
+};
+
 int16_t foc_sat_s16(int32_t x) {
     if (x > 32767) return 32767;
     if (x < -32768) return -32768;
@@ -76,13 +105,25 @@ void foc_inv_park(const foc_dq_t *vdvq, uint16_t phase, foc_ab_t *ab) {
 
 
 uint32_t foc_isqrt_u32(uint32_t x) {
-    uint32_t op=x, res=0, one=1u<<30;
-    while (one>op) one>>=2;
-    while (one!=0) {
-        if (op>=res+one) { op-=res+one; res=(res>>1)+one; } else { res>>=1; }
-        one>>=2;
+    if(x==0u)return 0u;
+    const uint32_t bit=31u-(uint32_t)__builtin_clz(x);
+    const int32_t target=(bit&1u)?15:14;
+    const int32_t shift=(int32_t)bit-target; /* selalu genap */
+    const uint32_t n=shift>=0?(x>>(uint32_t)shift):(x<<(uint32_t)(-shift));
+    const uint32_t idx=n>>8;
+    const uint32_t frac=n&0xffu;
+    const uint32_t y0=s_sqrt_q7[idx];
+    const uint32_t yq7=y0+(((uint32_t)s_sqrt_q7[idx+1u]-y0)*frac>>8);
+    uint32_t y=shift>=0?((yq7<<(uint32_t)(shift/2))>>7):
+                         (yq7>>(uint32_t)(7+((-shift)/2)));
+    /* Q7 lower-estimate maksimum 4 count pada domain uint32. Empat koreksi
+     * bounded menghasilkan floor(sqrt(x)) persis tanpa latency data-dependent
+     * dari algoritma restoring 16 iterasi. */
+    for(uint8_t k=0u;k<4u && y<65535u;++k){
+        const uint32_t yp=y+1u;
+        if(yp*yp<=x)y=yp; else break;
     }
-    return res;
+    return y;
 }
 
 void foc_vector_limit(foc_dq_t *v, int16_t max_mag) {

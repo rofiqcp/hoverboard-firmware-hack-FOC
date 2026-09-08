@@ -9,11 +9,9 @@
 extern "C" {
 #endif
 
-typedef enum {
-    MCPWM_FOC_MOTOR_1 = 0,
-    MCPWM_FOC_MOTOR_2 = 1,
-    MCPWM_FOC_MOTOR_COUNT = 2
-} mcpwm_foc_motor_id_t;
+/* Konvensi dual-motor mengikuti VESC: is_second_motor=false berarti
+ * motor 1/LEFT, is_second_motor=true berarti motor 2/RIGHT. Pada hardware ini
+ * LEFT dapat Hall atau ABI; RIGHT dikunci Hall-only. */
 
 typedef struct {
     mc_configuration m_conf;
@@ -21,6 +19,7 @@ typedef struct {
     mc_control_mode m_control_mode;
     mc_fault_code m_fault;
     volatile uint32_t m_fault_recovery_ticks;
+    uint32_t m_fault_stop_ticks; /* m_fault_stop_time_ms -> tick PWM, dihitung di slow path */
 
     /* VESC-style setpoints. Fixed-point values are authoritative in the ISR. */
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
@@ -100,6 +99,8 @@ typedef struct {
     volatile uint16_t m_vin_max_adc;           /* l_max_vin dalam hitungan ADC baterai */
     volatile uint32_t m_watt_max_x10;          /* batas daya motoring, 0,1 W */
     volatile uint32_t m_watt_regen_x10;        /* magnitudo batas daya regeneratif, 0,1 W */
+    volatile int16_t m_watt_current_max_q4;    /* Pmax/Vbus -> batas Iin, cache slow path */
+    volatile int16_t m_watt_current_regen_q4;  /* |Pregen|/Vbus -> batas Iin, cache slow path */
     volatile int16_t m_temp_fet_start_x10;     /* awal derating temperatur board/MOS, 0,1 C */
     volatile int16_t m_temp_fet_end_x10;       /* akhir derating / fault, 0,1 C */
     volatile uint32_t m_wrong_voltage_integrator;

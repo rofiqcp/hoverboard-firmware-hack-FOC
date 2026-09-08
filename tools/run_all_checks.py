@@ -23,7 +23,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/build_factory_image.py','tools/install_bootloader_stlink.sh','tools/pio_vesc_upload.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
+        'tools/build_factory_image.py','tools/install_bootloader_stlink.sh','tools/pio_vesc_upload.py','tools/tests/target/test_isr_callgraph.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -64,6 +64,11 @@ def check_static():
     assert 'CONTROL_MODE_SPEED' in mc and 'goto control_done' in mc, 'mode2 low-speed VESC zero-vector path missing'
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'
+    assert 's_sqrt_q7[257]' in mathc and '__builtin_clz' in mathc and 'for(uint8_t k=0u;k<4u' in mathc, 'ISR integer sqrt must use bounded Flash LUT implementation'
+    assert 'uint32_t op=x, res=0, one=1u<<30' not in mathc, 'legacy iterative restoring sqrt remains in ISR math'
+    assert 'watt_current_limits_refresh' in mc and 'm_watt_current_max_q4' in mc and 'm_watt_current_regen_q4' in mc, 'VESC watt P/V limit must be cached outside ISR'
+    fault_block=mc[mc.index('static void motor_fault_set'):mc.index('static void motor_fault_recovery_tick')]
+    assert 'uint64_t' not in fault_block and '__aeabi' not in fault_block and 'm_fault_stop_ticks' in fault_block, 'fault ISR path must use precomputed timeout ticks'
     assert 'm->m_iq_set_q4=m->m_iq_target_q4' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' not in mcc, 'SET_CURRENT must be direct VESC reference without legacy slew'
     assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
     assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc and 'm->m_hall_ticks>fresh' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc, 'VESC live-direction current brake path missing'
@@ -108,6 +113,8 @@ def check_static():
     assert 'SENSOR_PORT_MODE_ABI' in enc and 'enc_abi_init' in enc and 'encoder_read_deg' in enc, 'VESC ABI encoder dispatcher missing'
     assert 'TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1' in abi and 'TIM4' in (ROOT/'Src/encoder/encoder_cfg.c').read_text(), 'TIM4 quadrature ABI driver missing'
     assert 'encoder_feedback_update' in mc and 'm_phase_encoder' in mc and 'encoder_feedback_selected' in mc, 'ABI phase not integrated into FOC'
+    for dead in ('encoder_read_deg_multiturn','encoder_reset_multiturn','encoder_reset_errors','encoder_get_error_rate','encoder_check_faults','encoder_pin_isr','encoder_tim_isr','encoder_get_counts','enc_abi_pin_isr'):
+        assert dead not in enc and dead not in ench and dead not in abi, f'dead encoder API remains: {dead}'
     assert 'mcpwm_foc_encoder_startup_align' in mc and 'mcpwm_foc_encoder_detect' in mc, 'ABI lifecycle/detect missing'
     assert 'PB6/PB7' in mc or 'PB6/PB7' in abi, 'shared Hall/ABI pin constraint not documented'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
@@ -117,6 +124,9 @@ def check_static():
     assert re.search(r'#define\s+VESC_FW_MAJOR\s+6u',vp) and re.search(r'#define\s+VESC_FW_MINOR\s+0u',vp), 'firmware must identify as VESC 6.00'
     assert 'COMM_DETECT_HALL_FOC' in vp and 'mcpwm_foc_hall_detect_command_start' in vp and 'mcpwm_foc_hall_detect_process' in vp, 'VESC-standard async Hall detect command missing'
     assert 'case COMM_DETECT_ENCODER:' in vp and 'mc_interface_steering_detect_calibrate' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect + steering commissioning command missing'
+    assert 'DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS' not in vp and 'steering_span_pending' not in vp, 'Detect-All must never invent or overwrite LEFT steering hard-stop span'
+    assert 'mcpwm_foc_encoder_detect(MCCONF_STEERING_DETECT_CURRENT_START_A' in vp, 'Detect-All LEFT encoder electrical commissioning missing'
+    assert 'RIGHT Hall-only' in vp and 'if(second)' in vp[vp.index('static int terminal_cfg_one'):vp.index('static void process_terminal_command')], 'RIGHT Hall-only contract missing from terminal/config path'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
     assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'

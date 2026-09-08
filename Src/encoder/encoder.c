@@ -46,8 +46,6 @@ float encoder_read_deg(void) {
     return m_encoder_type_now == ENCODER_TYPE_ABI ? enc_abi_read_deg(&encoder_cfg_ABI) : 0.0f;
 }
 
-float encoder_read_deg_multiturn(void) { return encoder_read_deg(); }
-
 void encoder_set_deg(float deg) {
     if (m_encoder_type_now == ENCODER_TYPE_ABI) enc_abi_set_deg(&encoder_cfg_ABI, deg);
 }
@@ -58,24 +56,7 @@ bool encoder_index_found(void) {
     return m_encoder_type_now == ENCODER_TYPE_ABI ? encoder_cfg_ABI.state.index_found : true;
 }
 
-void encoder_reset_multiturn(void) { }
-void encoder_reset_errors(void) { encoder_cfg_ABI.state.bad_pulses = 0; }
-float encoder_get_error_rate(void) { return -1.0f; }
-
-void encoder_check_faults(volatile mc_configuration *m_conf, bool is_second_motor) {
-    (void)m_conf;
-    (void)is_second_motor;
-    /* ABI A/B tidak mempunyai checksum/SPI fault. Plausibility arah dan
-     * gerakan divalidasi oleh FOC/detect encoder, bukan fault transport. */
-}
-
-void encoder_pin_isr(void) { enc_abi_pin_isr(&encoder_cfg_ABI); }
-void encoder_tim_isr(void) { }
-
 uint32_t encoder_read_raw_count(void) {
     return m_encoder_type_now == ENCODER_TYPE_ABI ? enc_abi_read_cnt(&encoder_cfg_ABI) : 0u;
 }
 
-uint32_t encoder_get_counts(void) {
-    return m_encoder_type_now == ENCODER_TYPE_ABI ? encoder_cfg_ABI.counts : 0u;
-}

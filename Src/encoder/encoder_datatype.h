@@ -27,21 +27,13 @@ typedef enum {
 
 typedef struct {
     volatile bool index_found;
-    volatile uint32_t cnt_at_ind_last;
-    volatile int bad_pulses;
-    volatile uint32_t index_pulse_cnt;
 } ABI_state;
 
 typedef struct {
     uint32_t counts;
     GPIO_TypeDef *A_gpio; uint16_t A_pin;
     GPIO_TypeDef *B_gpio; uint16_t B_pin;
-    GPIO_TypeDef *I_gpio; uint16_t I_pin;
     TIM_TypeDef *timer;
-    uint8_t tim_af;
-    uint8_t exti_portsrc;
-    uint8_t exti_pinsrc;
-    uint32_t exti_line;
     ABI_state state;
 } ABI_config_t;
 

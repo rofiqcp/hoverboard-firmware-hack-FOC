@@ -13,11 +13,6 @@ ABI_config_t encoder_cfg_ABI = {
     4096u,
     GPIOB, GPIO_PIN_6,
     GPIOB, GPIO_PIN_7,
-    NULL, 0u,
     ENCODER_ABI_TIMER,
-    0u,
-    0u,
-    0u,
-    0u,
-    {false, 0u, 0, 0u}
+    {false}
 };

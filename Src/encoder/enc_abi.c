@@ -93,21 +93,3 @@ void enc_abi_set_deg(ABI_config_t *cfg, float deg) {
     cfg->timer->CNT = cnt;
     cfg->state.index_found = true;
 }
-
-void enc_abi_pin_isr(ABI_config_t *cfg) {
-    if (!cfg || !cfg->I_gpio || cfg->I_pin == 0u) return;
-    __NOP(); __NOP(); __NOP(); __NOP();
-    if (HAL_GPIO_ReadPin(cfg->I_gpio, cfg->I_pin) == GPIO_PIN_SET) {
-        const uint32_t cnt = cfg->timer->CNT;
-        const uint32_t lim = cfg->counts / 20u;
-        cfg->state.cnt_at_ind_last = cnt;
-        cfg->state.index_pulse_cnt++;
-        if (!cfg->state.index_found || cnt > cfg->counts - lim || cnt < lim) {
-            cfg->timer->CNT = 0u;
-            cfg->state.index_found = true;
-            cfg->state.bad_pulses = 0;
-        } else if (++cfg->state.bad_pulses > 5) {
-            cfg->state.index_found = false;
-        }
-    }
-}
