@@ -9,8 +9,8 @@ main=(R/'Src/main.c').read_text()
 hov=(R/'tools/hoverserial.py').read_text()
 dual=(R/'tools/vesc_dual.py').read_text()
 
-# V13 tuning/position parameters remain, but the obsolete user-toggleable live
-# switch was intentionally removed in V15. Telemetry is automatic instead.
+# V13 tuning/position parameters tetap ada. Jalur telemetry legacy/LIVE telah
+# dihapus; realtime sekarang hanya melalui polling protokol VESC standar.
 for name in ('KPQ','KIQ','KPD','KID','KPS','KIS','KDS','KPP','KIP','KDP','PMIN','PMAX','PSETL','PSETR'):
     assert f'"{name}"' in com, f'missing parameter {name}'
 assert '"LIVE"' not in com, 'obsolete LIVE parameter must be removed'
@@ -30,8 +30,8 @@ assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
 assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 5.0 A runtime safety limit'
 assert 'MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering Kp multiplier must stay bounded'
 assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' in mc, 'ABI process-D sign must follow encoder inversion in steering count mode'
-assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main, 'automatic 50 Hz legacy telemetry missing'
-assert 'no user-controlled live telemetry switch' in main, 'live-removal rationale missing'
+assert 'SerialFeedback' not in main and 'legacyTelemetryPrevMs' not in main, 'dead legacy telemetry must stay removed'
+assert 'USART3 hanya membawa protokol VESC' in main, 'VESC-exclusive USART3 rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp
 assert 'Right power stage is physically mirrored' not in vp and 'right_sign' not in vp, 'virtual-right protocol must not rewrite VESC coordinates'
 assert 'op == "live"' not in hov.lower() and 'toggle custom live telemetry' not in hov.lower()

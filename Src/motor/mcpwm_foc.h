@@ -399,6 +399,10 @@ bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
 bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
 bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
 void mcpwm_foc_release_motor(bool is_second_motor);
+/* VESC COMM_MOTOR_ESTOP: hentikan kedua bridge dan abaikan perintah motor
+ * selama duration_ms. Nilai 0 berarti release sekali tanpa hold tambahan. */
+void mcpwm_foc_estop_both(uint16_t duration_ms);
+bool mcpwm_foc_estop_active(void);
 void mcpwm_foc_vesc_timeout_configure(bool is_second_motor, uint32_t timeout_ms, float brake_current);
 void mcpwm_foc_vesc_override_touch(bool is_second_motor);
 bool mcpwm_foc_vesc_override_active(bool is_second_motor);

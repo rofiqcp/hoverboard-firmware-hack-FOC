@@ -2837,6 +2837,14 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     case COMM_ALIVE:
         touch_motor(second);
         break;
+    case COMM_MOTOR_ESTOP: {
+        /* Wire VESC 6.00: payload uint16 adalah lama ignore-input dalam ms.
+         * E-stop selalu berlaku untuk kedua motor, termasuk paket forwarded. */
+        uint16_t hold_ms=0u;
+        if(n>=2u) hold_ms=buffer_get_uint16(d,&k);
+        mcpwm_foc_estop_both(hold_ms);
+        break;
+    }
     case COMM_GET_MCCONF:
     case COMM_GET_MCCONF_DEFAULT:
         reply_mcconf(second, id);

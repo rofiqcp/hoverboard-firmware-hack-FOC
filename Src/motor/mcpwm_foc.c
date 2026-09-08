@@ -29,6 +29,8 @@ uint8_t buzzerCount = 0;
 volatile uint32_t buzzerTimer = 0;
 static uint8_t buzzerPrev = 0;
 static uint8_t buzzerIdx = 0;
+/* Hold E-stop dalam tick ADC 16 kHz agar gate tetap deterministik tanpa HAL tick. */
+static volatile uint32_t s_estop_ticks = 0u;
 
 static inline void buzzer_pin_toggle_fast(void) {
     /* ISR F103: akses register langsung, deterministic beberapa cycle. */
@@ -1343,6 +1345,9 @@ static void speed_mode_enter(mcpwm_foc_motor_t *m) {
 }
 
 static void set_control_mode(mcpwm_foc_motor_t *m, mc_control_mode mode) {
+    /* Saat E-stop aktif semua permintaan energize ditolak. CONTROL_MODE_NONE
+     * tetap diizinkan agar release/fault path selalu dapat mematikan bridge. */
+    if (s_estop_ticks != 0u && mode != CONTROL_MODE_NONE) return;
     if (m->m_control_mode != mode) {
         reset_current_pi(m);
         m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0; reset_position_pid(m);
@@ -2030,6 +2035,22 @@ void mcpwm_foc_release_motor(bool second) {
         LEFT_TIM->LEFT_TIM_U=pwm_res/2u; LEFT_TIM->LEFT_TIM_V=pwm_res/2u; LEFT_TIM->LEFT_TIM_W=pwm_res/2u;
     }
 }
+
+bool mcpwm_foc_estop_active(void) {
+    return s_estop_ticks != 0u;
+}
+
+void mcpwm_foc_estop_both(uint16_t duration_ms) {
+    /* 65535 ms * 16 kHz masih muat uint32. Pembulatan ke atas memastikan
+     * durasi tidak pernah lebih pendek dari nilai wire VESC. */
+    const uint32_t ticks=((uint32_t)duration_ms*(uint32_t)PWM_FREQ+999u)/1000u;
+    s_estop_ticks=ticks;
+    /* Urutan release kedua motor mengikuti mc_interface_release_motor_override_both
+     * upstream: output dipadamkan sekarang, bukan menunggu ISR berikutnya. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+}
+
 
 static int16_t trq_ca_to_q4(const mcpwm_foc_motor_t *m, int16_t ca) {
     (void)m;
@@ -3862,7 +3883,7 @@ void mcpwm_foc_vesc_override_clear(bool second) {
 /* ========================================================================== */
 /* Original EFeru ADC DMA ISR timing/calibration path                          */
 /* ========================================================================== */
-void DMA1_Channel1_IRQHandler(void) {
+void f103_DMA1_Channel1_IRQHandler_impl(void) {
     const uint32_t focIsrStartCycles = DWT->CYCCNT;
     DMA1->IFCR = DMA_IFCR_CTCIF1;
 
@@ -3891,8 +3912,10 @@ void DMA1_Channel1_IRQHandler(void) {
     }
     /* VESC ownership is per motor. A right-motor forwarded command must not
      * accidentally energize a stale left control mode (and vice versa). */
-    const uint8_t leftSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(false);
-    const uint8_t rightSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(true);
+    const bool estopActive=s_estop_ticks!=0u;
+    if(s_estop_ticks!=0u)s_estop_ticks--;
+    const uint8_t leftSourceEnable=(!estopActive)&&((enable!=0u)||mcpwm_foc_vesc_override_active(false));
+    const uint8_t rightSourceEnable=(!estopActive)&&((enable!=0u)||mcpwm_foc_vesc_override_active(true));
     const bool leftOpenloopRequest=(m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||
                                     m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
     const bool rightOpenloopRequest=(m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP ||
@@ -4220,6 +4243,14 @@ void DMA1_Channel1_IRQHandler(void) {
 }
 
 
+
+#if !defined(__arm__) && !defined(__thumb__)
+/* Host regression tidak memakai vector table STM32. Sediakan nama IRQ standar
+ * sebagai wrapper tipis agar test menjalankan implementasi ISR yang sama. */
+void DMA1_Channel1_IRQHandler(void) {
+    f103_DMA1_Channel1_IRQHandler_impl();
+}
+#endif
 
 uint8_t mcpwm_foc_hall_detect_angle200(int64_t sum_s, int64_t sum_c, uint16_t n) {
     if (n <= 30u) return 255u;

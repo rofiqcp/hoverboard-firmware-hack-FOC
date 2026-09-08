@@ -126,7 +126,7 @@ def check_static():
     assert 'case COMM_DETECT_ENCODER:' in vp and 'mc_interface_steering_detect_calibrate' in vp and 'buffer_append_float32(reply,off,1e6f' in vp, 'VESC-standard encoder detect + steering commissioning command missing'
     assert 'DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS' not in vp and 'steering_span_pending' not in vp, 'Detect-All must never invent or overwrite LEFT steering hard-stop span'
     assert 'mcpwm_foc_encoder_detect(MCCONF_STEERING_DETECT_CURRENT_START_A' in vp, 'Detect-All LEFT encoder electrical commissioning missing'
-    assert 'RIGHT Hall-only' in vp and 'if(second)' in vp[vp.index('static int terminal_cfg_one'):vp.index('static void process_terminal_command')], 'RIGHT Hall-only contract missing from terminal/config path'
+    assert 'RIGHT Hall-only' in vp and 'if(!second&&!strcmp(sv,"encoder"))' in vp[vp.index('static int terminal_cfg_one'):vp.index('static void process_terminal_command')], 'RIGHT Hall-only contract missing from terminal/config path'
     assert 'mc_interface_store_configuration_motor(second)' in vp, 'VESC MC config/Hall persistence missing'
     serial=(ROOT/'Src/vesc/mcconf_serial.h').read_text()
     assert 'MCCONF_SIGNATURE 776184161u' in serial, 'VESC 6.00 MC config signature mismatch'
@@ -205,10 +205,8 @@ def check_static():
     assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K', bootlds), 'bootloader linker must own immutable first 10 KiB'
     mainc=(ROOT/'Src/main.c').read_text()
     assert '!vescLinkActive && !timeoutFlgSerial && enable == 0' in mainc, 'legacy blocking enable handshake must be suppressed while VESC link is armed'
-    assert 'feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);' in mainc, 'custom telemetry right duty sign not normalized'
-    assert 'mcpwm_foc_get_tot_current_motor(false) * 100.0f' in mainc and 'mcpwm_foc_get_tot_current_motor(true) * 100.0f' in mainc, 'legacy currentMotor must be signed DQ magnitude, not Iq'
-    assert 'feedback.currentMotorL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_iq_q4);' not in mainc, 'obsolete legacy currentMotor=Iq mapping remains'
-    assert 'feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);' in mainc, 'custom telemetry right Vq sign not normalized'
+    assert 'SerialFeedback' not in mainc and 'legacyTelemetryPrevMs' not in mainc and 'if (0 &&' not in mainc, 'dead legacy 72-byte telemetry must be removed completely'
+    assert 'HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback' not in mainc, 'legacy raw USART3 telemetry must not coexist with VESC transport'
     h=hashlib.sha256((ROOT/'Src/vesc/datatypes.h').read_bytes()).hexdigest()
     assert h == EXPECTED_DATATYPES_SHA256, f'datatypes.h SHA mismatch: {h}'
     # Verify quoted project includes resolve locally, excluding STM32Cube/CMSIS framework includes.

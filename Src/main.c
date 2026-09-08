@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
 #include "stm32f1xx_hal.h"
 #include "defines.h"
 #include "setup.h"
@@ -18,7 +17,6 @@ void SystemClock_Config(void);
 
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
-extern UART_HandleTypeDef huart3;
 extern volatile adc_buf_t adc_buffer;
 extern InputStruct input1[];
 extern InputStruct input2[];
@@ -52,78 +50,11 @@ int16_t dc_curr = 0;
 int16_t cmdL = 0;
 int16_t cmdR = 0;
 
-typedef struct __attribute__((packed)) {
-  uint16_t start;
-  uint16_t version;              /* VESC-like telemetry payload version */
-  int16_t cmdL, cmdR;
-  int16_t rpmL, rpmR;
-  int16_t dutyL_x1000, dutyR_x1000;
-  int16_t currentMotorL_cA, currentMotorR_cA;
-  int16_t currentInL_cA, currentInR_cA;
-  int16_t idL_cA, idR_cA;
-  int16_t iqL_cA, iqR_cA;
-  int16_t vdL_cV, vdR_cV;
-  int16_t vqL_cV, vqR_cV;
-  int16_t vIn_x100;
-  int16_t boardTemp_x10;
-  uint16_t hallL, hallR;
-  uint16_t faultL, faultR;
-  uint16_t adc_dcl, adc_rla, adc_rlb;
-  uint16_t adc_dcr, adc_rrb, adc_rrc;
-  uint16_t status;
-  uint32_t foc_isr_cycles;
-  uint16_t checksum;
-} SerialFeedback;
-
-_Static_assert(sizeof(SerialFeedback) == 72u, "SerialFeedback V2 must stay 72 bytes");
-
-static SerialFeedback feedback;
 static int16_t cmdLRateFixdt = 0;
 static int16_t cmdRRateFixdt = 0;
 static int32_t cmdLFixdt = 0;
 static int32_t cmdRFixdt = 0;
 static uint32_t buzzerTimerPrev = 0;
-// static uint32_t inactivityTimeoutCounter = 0;
-static uint32_t legacyTelemetryPrevMs = 0u;
-
-static uint16_t feedbackChecksum(const SerialFeedback *f) {
-  const uint8_t *p = (const uint8_t *)f;
-  const size_t n = offsetof(SerialFeedback, checksum);
-  uint16_t c = 0;
-  for (size_t i = 0; i + 1 < n; i += 2) {
-    c ^= (uint16_t)p[i] | ((uint16_t)p[i + 1] << 8);
-  }
-  return c;
-}
-
-static int16_t focCurrentQ4ToCentiAmp(int32_t currentQ4) {
-  /* The fixed-point VESC-style FOC shifts phase-current inputs by 4 before Clarke/Park:
-   *     rtb = rtU->i_phaXX << 4
-   * and rtY.iq / rtY.id are exported without shifting back. Therefore dq is
-   * Q4 current-count, i.e. 16 * A2BIT_CONV units per ampere. */
-  const int32_t denom = (int32_t)A2BIT_CONV * 16;
-  return (int16_t)(((int32_t)currentQ4 * 100) / denom);
-}
-
-static int16_t focVoltageToCentiVolt(int16_t v) {
-  /* Report D/Q voltage against the measured DC bus, not a fixed 48-V nominal.
-   * batVoltageCalib is centivolts. */
-  return (int16_t)(((int32_t)v * (int32_t)batVoltageCalib) / MCCONF_FOC_VOLTAGE_MAX);
-}
-
-static uint16_t readHallLeft(void) {
-  const uint16_t u = (LEFT_HALL_U_PORT->IDR & LEFT_HALL_U_PIN) ? 0u : 1u;
-  const uint16_t v = (LEFT_HALL_V_PORT->IDR & LEFT_HALL_V_PIN) ? 0u : 1u;
-  const uint16_t w = (LEFT_HALL_W_PORT->IDR & LEFT_HALL_W_PIN) ? 0u : 1u;
-  return (uint16_t)((u << 2) | (v << 1) | w);
-}
-
-static uint16_t readHallRight(void) {
-  const uint16_t u = (RIGHT_HALL_U_PORT->IDR & RIGHT_HALL_U_PIN) ? 0u : 1u;
-  const uint16_t v = (RIGHT_HALL_V_PORT->IDR & RIGHT_HALL_V_PIN) ? 0u : 1u;
-  const uint16_t w = (RIGHT_HALL_W_PORT->IDR & RIGHT_HALL_W_PIN) ? 0u : 1u;
-  return (uint16_t)((u << 2) | (v << 1) | w);
-}
 
 static void cycleCounterInit(void) {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -283,57 +214,8 @@ int main(void) {
 
     /* USART3 is VESC-exclusive: no raw debug output on the motor link. */
 
-    /* Legacy 72-byte telemetry is automatic at 50 Hz when no VESC binary link
-     * owns USART3. There is intentionally no user-controlled live telemetry switch anymore.
-     * When VESC Tool is connected, unsolicited legacy bytes are suppressed and
-     * VESC realtime data is served by its standard GET_VALUES polling. */
-    const uint32_t telemetryNowMs = HAL_GetTick();
-    if (0 && !vescLinkActive && !timeoutFlgSerial &&
-        (uint32_t)(telemetryNowMs - legacyTelemetryPrevMs) >= 20u &&
-        huart3.hdmatx != NULL && __HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0u) {
-      legacyTelemetryPrevMs = telemetryNowMs;
-      feedback.start = SERIAL_START_FRAME;
-      feedback.version = 2u;
-      feedback.cmdL = cmdL;
-      feedback.cmdR = cmdR;
-      feedback.rpmL = m_motor_1.m_rpm;
-      feedback.rpmR = (int16_t)(-m_motor_2.m_rpm);
-      feedback.dutyL_x1000 = m_motor_1.m_duty_now_permille;
-      feedback.dutyR_x1000 = (int16_t)(-m_motor_2.m_duty_now_permille);
-      /* VESC current_motor is signed |Idq|, not Iq. Direction inversion does
-       * not flip this field; its sign follows measured DC/input power flow. */
-      feedback.currentMotorL_cA = (int16_t)(mcpwm_foc_get_tot_current_motor(false) * 100.0f);
-      feedback.currentMotorR_cA = (int16_t)(mcpwm_foc_get_tot_current_motor(true) * 100.0f);
-      feedback.currentInL_cA = left_dc_curr;
-      feedback.currentInR_cA = right_dc_curr;
-      feedback.idL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_id_q4);
-      feedback.idR_cA = focCurrentQ4ToCentiAmp(m_motor_2.m_id_q4);
-      feedback.iqL_cA = focCurrentQ4ToCentiAmp(m_motor_1.m_iq_q4);
-      feedback.iqR_cA = focCurrentQ4ToCentiAmp(-((int32_t)m_motor_2.m_iq_q4));
-      feedback.vdL_cV = focVoltageToCentiVolt(m_motor_1.m_vd);
-      feedback.vdR_cV = focVoltageToCentiVolt(m_motor_2.m_vd);
-      feedback.vqL_cV = focVoltageToCentiVolt(m_motor_1.m_vq);
-      feedback.vqR_cV = focVoltageToCentiVolt((int16_t)-m_motor_2.m_vq);
-      feedback.vIn_x100 = batVoltageCalib;
-      feedback.boardTemp_x10 = board_temp_deg_c;
-      feedback.hallL = readHallLeft();
-      feedback.hallR = readHallRight();
-      feedback.faultL = (uint16_t)m_motor_1.m_fault;
-      feedback.faultR = (uint16_t)m_motor_2.m_fault;
-      feedback.adc_dcl = adc_buffer.dcl;
-      feedback.adc_rla = adc_buffer.rlA;
-      feedback.adc_rlb = adc_buffer.rlB;
-      feedback.adc_dcr = adc_buffer.dcr;
-      feedback.adc_rrb = adc_buffer.rrB;
-      feedback.adc_rrc = adc_buffer.rrC;
-      feedback.status = (enable ? SERIAL_STATUS_ENABLED : 0u) |
-                        (timeoutFlgSerial ? SERIAL_STATUS_TIMEOUT : 0u) |
-                        ((m_motor_1.m_fault != FAULT_CODE_NONE) ? SERIAL_STATUS_LEFT_FAULT : 0u) |
-                        ((m_motor_2.m_fault != FAULT_CODE_NONE) ? SERIAL_STATUS_RIGHT_FAULT : 0u);
-      feedback.foc_isr_cycles = foc_isr_cycles;
-      feedback.checksum = feedbackChecksum(&feedback);
-      HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&feedback, sizeof(feedback));
-    }
+    /* USART3 hanya membawa protokol VESC. Telemetri legacy 72-byte telah
+     * dihapus agar tidak ada jalur mati/duplikat yang dapat mencemari link motor. */
 
     poweroffPressCheck();
 

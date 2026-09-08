@@ -56,7 +56,7 @@ static uint8_t debugLine[SERIAL_DEBUG_LINE_SIZE];
 static uint8_t debugIndex = 0;
 
 #ifdef __GNUC__
-int _write(int file, char *data, int len) {
+__attribute__((used, externally_visible)) int _write(int file, char *data, int len) {
   (void)file;
   (void)data;
   if (len <= 0) return 0;

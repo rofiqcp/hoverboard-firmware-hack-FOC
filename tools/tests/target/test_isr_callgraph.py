@@ -7,13 +7,17 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[3]
 ELF = ROOT / '.pio/build/APP_F411/firmware.elf'
 OBJDUMP = shutil.which('arm-none-eabi-objdump')
+NM = shutil.which('arm-none-eabi-nm')
 if not OBJDUMP:
     candidate = Path.home() / '.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-objdump'
     if candidate.exists():
         OBJDUMP = str(candidate)
+    nm_candidate = Path.home() / '.platformio/packages/toolchain-gccarmnoneeabi/bin/arm-none-eabi-nm'
+    if not NM and nm_candidate.exists():
+        NM = str(nm_candidate)
 
-if not OBJDUMP:
-    raise SystemExit('FAIL arm-none-eabi-objdump not found')
+if not OBJDUMP or not NM:
+    raise SystemExit('FAIL arm-none-eabi-objdump/nm not found')
 if not ELF.exists():
     raise SystemExit('FAIL firmware.elf missing; run pio run -e APP_F411 first')
 
@@ -31,7 +35,23 @@ for line in text.splitlines():
         if m:
             graph[current].add(m.group(1).split('+')[0])
 
-root = 'DMA1_Channel1_IRQHandler'
+# Build LTO memakai trampoline assembly kuat agar vector CMSIS tidak jatuh ke
+# weak Default_Handler. Audit simbol ini wajib sebelum menganalisis call graph.
+nm_text = subprocess.check_output([NM, '-C', str(ELF)], text=True)
+required_handlers = {
+    'SysTick_Handler', 'DMA1_Channel1_IRQHandler', 'DMA1_Channel2_IRQHandler',
+    'DMA1_Channel3_IRQHandler', 'USART3_IRQHandler',
+}
+strong = set()
+for line in nm_text.splitlines():
+    m = re.match(r'^[0-9a-fA-F]+\s+([Tt])\s+(\S+)$', line.strip())
+    if m:
+        strong.add(m.group(2))
+missing = sorted(required_handlers - strong)
+if missing:
+    raise SystemExit('FAIL IRQ vector handler is not strong under LTO: ' + ', '.join(missing))
+
+root = 'f103_DMA1_Channel1_IRQHandler_impl'
 if root not in graph:
     raise SystemExit(f'FAIL {root} not found in ELF')
 
@@ -61,4 +81,5 @@ print(
     'ISR_CALLGRAPH_PASS',
     f'reachable={len(reachable)}',
     'forbidden=0',
+    'vectors=strong',
 )

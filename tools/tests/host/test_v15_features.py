@@ -35,10 +35,11 @@ assert 'rightSourceEnable=(enable!=0u)||mcpwm_foc_vesc_override_active(true)' in
 assert 'leftOpenloop = (m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||' in mc
 assert 'CONTROL_MODE_OPENLOOP_PHASE);' in mc and 'leftDcLimit=leftOpenloop' in mc and 'rightDcLimit=rightOpenloop' in mc
 
-# No user live toggle. Automatic legacy telemetry is 50 Hz; VESC link suppresses it.
+# Tidak ada live toggle maupun telemetry legacy. USART3 hanya protokol VESC.
 assert '"LIVE"' not in com
-assert 'telemetryNowMs - legacyTelemetryPrevMs) >= 20u' in main
+assert 'SerialFeedback' not in main and 'legacyTelemetryPrevMs' not in main
 assert 'if (!vescLinkActive && !timeoutFlgSerial' in main
+assert 'USART3 hanya membawa protokol VESC' in main
 
 # Exact VESC 6.00 identity: FW response stops after FW_NAME.
 fwfun=vp[vp.index('static void reply_fw_version'):vp.index('static void get_values_normalized')]
