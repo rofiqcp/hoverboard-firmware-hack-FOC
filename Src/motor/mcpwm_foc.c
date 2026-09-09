@@ -32,6 +32,12 @@ static uint8_t buzzerIdx = 0;
 /* Hold E-stop dalam tick ADC 16 kHz agar gate tetap deterministik tanpa HAL tick. */
 static volatile uint32_t s_estop_ticks = 0u;
 
+static inline int32_t q16_from_i32_sat(int32_t v) {
+    if(v>INT32_MAX/65536)return INT32_MAX;
+    if(v<INT32_MIN/65536)return INT32_MIN;
+    return v*65536;
+}
+
 static inline void buzzer_pin_toggle_fast(void) {
     /* ISR F103: akses register langsung, deterministic beberapa cycle. */
     BUZZER_PORT->ODR ^= BUZZER_PIN;
@@ -1257,7 +1263,7 @@ void mcpwm_foc_init(void) {
      * housekeeping dapat mewarisi tegangan filter sesi sebelumnya dan membuat
      * fault palsu walau motor/fault state sudah di-reset. */
     batVoltage = (400 * BAT_CELLS * BAT_CALIB_ADC) / BAT_CALIB_REAL_VOLTAGE;
-    batVoltageFixdt = (int32_t)batVoltage << 16;
+    batVoltageFixdt = q16_from_i32_sat((int32_t)batVoltage);
     m_motor_1.m_driven_offset0=offsetrlA; m_motor_1.m_driven_offset1=offsetrlB; m_motor_1.m_driven_offsetdc=offsetdcl;
     m_motor_2.m_driven_offset0=offsetrrB; m_motor_2.m_driven_offset1=offsetrrC; m_motor_2.m_driven_offsetdc=offsetdcr;
     m_motor_1.m_off_offset0=offsetrlA; m_motor_1.m_off_offset1=offsetrlB; m_motor_1.m_off_offsetdc=offsetdcl;
@@ -1647,7 +1653,7 @@ static void reset_current_pi(mcpwm_foc_motor_t *m) {
 
 static int32_t steering_target_slew_step(mcpwm_foc_motor_t *m, uint32_t dt_ms) {
     if(!m)return 0;
-    const int64_t target_q16=(int64_t)m->m_position_target_counts<<16;
+    const int64_t target_q16=(int64_t)m->m_position_target_counts*65536LL;
     int64_t ramp_q16=(int64_t)m->m_position_target_ramp_q16;
     uint64_t step=(uint64_t)m->m_position_target_ramp_step_q16*(dt_ms?dt_ms:1u);
     if(step>UINT32_MAX)step=UINT32_MAX;
@@ -1982,7 +1988,7 @@ void mcpwm_foc_set_current(float current, bool second) {
     set_control_mode(m, CONTROL_MODE_CURRENT);
     m->m_iq_target_q4=amp_to_q4(m,current);
     m->m_iq_set_q4=m->m_iq_target_q4;
-    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
     m->m_id_set_q4=0;
 }
 static void mcpwm_foc_set_brake_current_q4(int16_t current_q4, bool second) {
@@ -2009,17 +2015,17 @@ void mcpwm_foc_set_handbrake(float current, bool second) {
     if(m->m_handbrake_current_q4<0)m->m_handbrake_current_q4=(int16_t)-m->m_handbrake_current_q4;
     m->m_iq_target_q4=m->m_handbrake_current_q4;
     m->m_iq_set_q4=m->m_iq_target_q4;
-    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
     m->m_id_set_q4=0;
 }
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); set_control_mode(m, CONTROL_MODE_OPENLOOP);
-    m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0; m->m_id_set_q4=0; m->m_iq_target_q4=amp_to_q4(m,current); m->m_iq_set_q4=m->m_iq_target_q4; m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16; m->m_openloop_speed_q16=(int32_t)(rpm*65536.0f); m->m_phase_override=1;
+    m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0; m->m_id_set_q4=0; m->m_iq_target_q4=amp_to_q4(m,current); m->m_iq_set_q4=m->m_iq_target_q4; m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536; m->m_openloop_speed_q16=(int32_t)(rpm*65536.0f); m->m_phase_override=1;
 }
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); set_control_mode(m, CONTROL_MODE_OPENLOOP_PHASE);
     m->m_openloop_id_target_q4=amp_to_q4(m,current);
-    m->m_openloop_id_ramp_q16=(int32_t)m->m_openloop_id_target_q4<<16;
+    m->m_openloop_id_ramp_q16=(int32_t)m->m_openloop_id_target_q4*65536;
     m->m_id_set_q4=m->m_openloop_id_target_q4;
     m->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;
     while (phase < 0.0f) phase += 360.0f;
@@ -3048,7 +3054,7 @@ static void encoder_feedback_finalize_speed_non_isr(mcpwm_foc_motor_t *m, bool s
         if(mq3>((int64_t)INT16_MAX*8LL))mq3=(int64_t)INT16_MAX*8LL;
         if(mq3<((int64_t)INT16_MIN*8LL))mq3=(int64_t)INT16_MIN*8LL;
         const int32_t mech_q3=(int32_t)mq3;
-        m->m_encoder_mech_rpm_q16=mech_q3<<13;
+        m->m_encoder_mech_rpm_q16=(int32_t)((int64_t)mech_q3*8192LL);
         int64_t eq16=((int64_t)m->m_encoder_mech_rpm_q16*(int64_t)m->m_encoder_ratio_q16)>>16;
         if(eq16>INT32_MAX)eq16=INT32_MAX; else if(eq16<INT32_MIN)eq16=INT32_MIN;
         m->m_encoder_erpm_q16=(int32_t)eq16;
@@ -3092,7 +3098,7 @@ static void encoder_tachometer_update_non_isr(mcpwm_foc_motor_t *m) {
      * pernah hilang walaupun housekeeping hanya 200 Hz. Semua 64-bit division
      * berada di slow path, bukan ADC ISR. */
     const int64_t delta_foc=m->m_conf.foc_encoder_inverted?-delta_raw:delta_raw;
-    const int64_t den=(int64_t)counts<<16;
+    const int64_t den=(int64_t)counts*65536LL;
     int64_t num=s_left_abi_tacho_remainder + delta_foc*(int64_t)ratio_q16*6LL;
     const int64_t steps=num/den;
     s_left_abi_tacho_remainder=num-steps*den;
@@ -3111,8 +3117,8 @@ static void openloop_current_ramp_update(mcpwm_foc_motor_t *m) {
     /* Shared mode-4/Hall-detect Id slew. This helper deliberately never changes
      * m_phase_openloop: COMM_DETECT_HALL_FOC depends on the requested synthetic
      * electrical phase remaining exactly where the detector put it. */
-    const int32_t target_id_q16=(int32_t)m->m_openloop_id_target_q4<<16;
-    int32_t id_step_q16=((int32_t)MCCONF_OPENLOOP_ID_SLEW_A_S*FOC_CURRENT_Q4_PER_A<<16)/PWM_FREQ;
+    const int32_t target_id_q16=(int32_t)m->m_openloop_id_target_q4*65536;
+    int32_t id_step_q16=((int32_t)MCCONF_OPENLOOP_ID_SLEW_A_S*FOC_CURRENT_Q4_PER_A*65536)/PWM_FREQ;
     if(m->m_openloop_id_ramp_q16<target_id_q16){
         m->m_openloop_id_ramp_q16+=id_step_q16;
         if(m->m_openloop_id_ramp_q16>target_id_q16)m->m_openloop_id_ramp_q16=target_id_q16;
@@ -3167,8 +3173,8 @@ static void openloop_update(mcpwm_foc_motor_t *m) {
         return;
     }
 
-    const int32_t target_speed_q16=(int32_t)absrpm<<16;
-    int32_t speed_step=((int32_t)MCCONF_OPENLOOP_ACCEL_RPM_S<<16)/PWM_FREQ;
+    const int32_t target_speed_q16=q16_from_i32_sat((int32_t)absrpm);
+    int32_t speed_step=((int32_t)MCCONF_OPENLOOP_ACCEL_RPM_S*65536)/PWM_FREQ;
     if(m->m_openloop_speed_q16<target_speed_q16){
         m->m_openloop_speed_q16+=speed_step;
         if(m->m_openloop_speed_q16>target_speed_q16)m->m_openloop_speed_q16=target_speed_q16;
@@ -3341,7 +3347,7 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
             int64_t isum=(int64_t)m->m_position_integrator+istep;
             int32_t i_lim_q15=32768-(p_q15<0?-p_q15:p_q15);
             if(i_lim_q15<0)i_lim_q15=0;
-            int64_t ilim=(int64_t)i_lim_q15<<16;
+            int64_t ilim=(int64_t)i_lim_q15*65536LL;
             if(isum>ilim)isum=ilim; else if(isum<-ilim)isum=-ilim;
             m->m_position_integrator=(int32_t)isum;
         }
@@ -3408,7 +3414,7 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
         pid_target=steering_target_slew_step(m,dt_ms);
     }else{
         m->m_position_pid_target_counts=pid_target;
-        m->m_position_target_ramp_q16=pid_target<<16;
+        m->m_position_target_ramp_q16=q16_from_i32_sat(pid_target);
     }
     int64_t ec64=(int64_t)pid_target-(int64_t)m->m_position_counts;
     if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
@@ -3460,7 +3466,7 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
         int64_t isum=(int64_t)m->m_position_integrator+istep;
         int32_t i_lim_q15=32768-(p_q15<0?-p_q15:p_q15);
         if(i_lim_q15<0)i_lim_q15=0;
-        int64_t ilim=(int64_t)i_lim_q15<<16;
+        int64_t ilim=(int64_t)i_lim_q15*65536LL;
         if(isum>ilim)isum=ilim; else if(isum<-ilim)isum=-ilim;
         m->m_position_integrator=(int32_t)isum;
     }
@@ -3656,7 +3662,7 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
     if(dt_ms==0u)dt_ms=1u;
     const int64_t i_step_base=((int64_t)error_q2*(int64_t)m->m_speed_ki_coeff_q16)>>16;
     const int64_t i_step=i_step_base*(int64_t)dt_ms;
-    const int64_t i_lim = (int64_t)limit_q4 << 16;
+    const int64_t i_lim = (int64_t)limit_q4 * 65536LL;
     const int32_t i_old=m->m_speed_integrator;
 
     int32_t d_q4 = 0;
@@ -3752,14 +3758,14 @@ static int16_t phase_current_counts_to_q4(const mcpwm_foc_motor_t *m, int16_t co
                              m->m_abs_current_limit_counts:
                              (int32_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV);
     int32_t c=CLAMP((int32_t)counts,-max_counts,max_counts);
-    int32_t q4=c<<4;
+    int32_t q4=c*16;
     /* Preserve the generated-controller numeric saturation as a final guard. */
     if(q4>27200)q4=27200; else if(q4<-27200)q4=-27200;
     return (int16_t)q4;
 }
 
 static int16_t telemetry_lpf_step(int32_t *state_q16, uint16_t alpha_q16, int16_t sample) {
-    const int32_t target=(int32_t)sample<<16;
+    const int32_t target=q16_from_i32_sat((int32_t)sample);
     const int32_t diff=target-*state_q16;
     *state_q16 += (int32_t)(((int64_t)diff*(int32_t)alpha_q16)>>16);
     return (int16_t)(*state_q16>>16);
@@ -4249,7 +4255,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 /* Outer SPEED PID berjalan 1 kHz di main context seperti thread
                  * FOC PID VESC. ISR hanya menutup current loop dengan cached Iq. */
                 m->m_iq_set_q4=m->m_iq_target_q4;
-                m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
                 v.q=current_pi_vesc_state(eq,m->m_current_kpq_err_q8,m->m_current_kiq_err_q8,
@@ -4262,11 +4268,11 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                      * when duty is below the target, and uses its down-ramp PI
                      * only when measured duty exceeds the target. */
                     m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 } else if(m->m_control_mode==CONTROL_MODE_POS){
                     /* Outer POSITION PID 1 kHz menghasilkan cached Iq target. */
                     m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 } else if (m->m_control_mode==CONTROL_MODE_CURRENT_BRAKE) {
                     /* VESC: iq = -SIGN(speed) * abs(brake_current). At zero
                      * speed the reference is zero and the centered zero vector
@@ -4276,17 +4282,17 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                     m->m_iq_target_q4=dir>0?(int16_t)-m->m_brake_current_q4:
                                           (dir<0?m->m_brake_current_q4:0);
                     m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 } else if (m->m_control_mode==CONTROL_MODE_HANDBRAKE) {
                     m->m_iq_target_q4=m->m_handbrake_current_q4;
                     m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 } else if (m->m_control_mode==CONTROL_MODE_CURRENT ||
                            m->m_control_mode==CONTROL_MODE_OPENLOOP) {
                     /* OPENLOOP_CURRENT uses exactly the signed Iq reference set
                      * by mcpwm_foc_set_openloop_current(), as upstream VESC. */
                     m->m_iq_set_q4=m->m_iq_target_q4;
-                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4<<16;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 } else {
                     /* OPENLOOP_PHASE and all other non-torque modes use Iq=0. */
                     m->m_iq_target_q4=0;

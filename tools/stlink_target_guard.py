@@ -11,9 +11,14 @@ EXPECTED_DEV_ID = 0x414  # STM32F103 high-density (xC/xD/xE)
 
 def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100) -> str:
     cmd = [str(openocd), "-s", str(scripts), "-f", "interface/stlink.cfg",
-           "-c", "transport select swd", "-f", "target/stm32f1x.cfg",
+           "-c", "transport select swd",
+           "-c", "reset_config srst_only srst_nogate connect_assert_srst",
+           "-f", "target/stm32f1x.cfg",
            "-c", f"adapter speed {int(speed)}",
-           "-c", "init; flash info 0; reset run; shutdown"]
+           # Keep the target halted for the whole identification session.
+           # Releasing it here creates an avoidable race where application code
+           # can run before the upload process reconnects.
+           "-c", "init; halt; flash info 0; shutdown"]
     cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, check=False)
     out = cp.stdout or ""

@@ -698,9 +698,13 @@ bool mc_interface_store_configuration_motor(bool second) {
     const uint8_t signature_slot=second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     bool ok = true;
     HAL_FLASH_Unlock();
-    /* Invalidate FIRST. A brownout at any later write makes this motor config
-     * fail closed on the next boot instead of accepting a mixed old/new image. */
-    ok &= ee_write_slot(signature_slot, 0u);
+    /* Invalidate FIRST. If invalidation itself fails, abort before touching any
+     * payload. Once invalid, never restore VALID unless every payload write did
+     * succeed; this is the EEPROM-emulation commit barrier. */
+    if (!ee_write_slot(signature_slot, 0u)) {
+        HAL_FLASH_Lock();
+        return false;
+    }
     ok &= ee_write_slot(cur_slot, (uint16_t)ca);
     for (uint8_t i = 0u; i < 8u; ++i) ok &= ee_write_slot((uint8_t)(hall_base + i), m->m_conf.foc_hall_table[i]);
     for (uint8_t i = 0u; i < 10u; ++i) ok &= ee_write_slot((uint8_t)(gain_base + i), gains[i]);
@@ -932,10 +936,10 @@ bool mc_interface_store_configuration_motor(bool second) {
         ok &= ee_write_float32_pair(pll_ki_slot,m->m_conf.foc_pll_ki);
         ok &= ee_write_slot(mode_slot,flags);
     }
-    /* Per-motor signature is written last, so an interrupted update of one
-     * motor can never make the other motor's partial configuration look valid. */
-    ok &= ee_write_slot(signature_slot, EE_CFG_SIGNATURE_VALUE);
-    ok &= ee_write_slot(EE_CFG_KEY, (uint16_t)FLASH_WRITE_KEY);
+    /* Commit only a fully-written payload. A failed write deliberately leaves
+     * signature_slot=0 so the next boot rejects the mixed image. */
+    if (ok) ok = ee_write_slot(signature_slot, EE_CFG_SIGNATURE_VALUE);
+    if (ok) ok = ee_write_slot(EE_CFG_KEY, (uint16_t)FLASH_WRITE_KEY);
     HAL_FLASH_Lock();
     return ok;
 }

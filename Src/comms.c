@@ -369,8 +369,18 @@ int32_t intToExt(uint8_t index,int32_t value){
 int32_t extToInt(uint8_t index,int32_t value){
   // Multiply to translate to internal format
   if(params[index].div) value *= params[index].div;
-  // Shift to translate to internal format
-  if (params[index].fix) value <<= params[index].fix;
+  // Shift to translate to internal format. Avoid signed-left-shift UB and
+  // saturate instead of wrapping when a malformed parameter scale is too large.
+  if (params[index].fix) {
+    const uint8_t sh=params[index].fix;
+    if(sh>=31u)value=value<0?INT32_MIN:(value>0?INT32_MAX:0);
+    else {
+      int64_t scaled=(int64_t)value*(int64_t)(1UL<<sh);
+      if(scaled>INT32_MAX)scaled=INT32_MAX;
+      if(scaled<INT32_MIN)scaled=INT32_MIN;
+      value=(int32_t)scaled;
+    }
+  }
   // Divide for small number
   if(params[index].mul) value /= params[index].mul;
   return value;

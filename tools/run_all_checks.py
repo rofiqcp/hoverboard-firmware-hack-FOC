@@ -89,8 +89,14 @@ def check_static():
     assert 'uint64_t' not in fault_block and '__aeabi' not in fault_block and 'm_fault_stop_ticks' in fault_block, 'fault set path must use precomputed timeout ticks'
     house=mc[mc.index('void mcpwm_foc_housekeeping_non_isr'):mc.index('void mcpwm_foc_adc_int_handler')]
     adc_handler=mc[mc.index('void mcpwm_foc_adc_int_handler'):mc.index('void mcpwm_foc_set_board_temperature_x10')]
-    assert 'm_fault_recovery_ticks' in house and 's_vesc_timeout_ticks' in house and 's_estop_ticks' in house, 'millisecond recovery/timeout timers must live in non-ISR housekeeping'
-    assert 'm_fault_recovery_ticks' not in adc_handler and 's_vesc_timeout_ticks' not in adc_handler and 'mcpwm_foc_set_mode_command' not in adc_handler, 'hot ADC handler must not service recovery/timeout/source arbitration'
+    dma_isr=mc[mc.index('void f103_DMA1_Channel1_IRQHandler_impl'):mc.index('#if !defined(__arm__)', mc.index('void f103_DMA1_Channel1_IRQHandler_impl'))]
+    # Fault recovery and E-stop duration remain slow bookkeeping, but the actuator
+    # command deadline itself must be decremented by the 16-kHz hardware clock so
+    # a deadlocked main/parser cannot hold stale torque. The ISR only marks expiry
+    # and drops MOE; main performs the heavier release/brake transition afterwards.
+    assert 'm_fault_recovery_ticks' in house and 's_estop_ticks' in house and 's_vesc_timeout_expired' in house, 'slow recovery/E-stop and timeout transition missing from housekeeping'
+    assert 's_vesc_timeout_ticks' in dma_isr and 's_vesc_timeout_expired[wi]=1u' in dma_isr and 'BDTR&=~TIM_BDTR_MOE' in dma_isr, 'hard VESC actuator deadline must fail closed in the 16-kHz DMA ISR'
+    assert 'm_fault_recovery_ticks' not in adc_handler and 's_vesc_timeout_ticks' not in adc_handler and 'mcpwm_foc_set_mode_command' not in adc_handler, 'current-regulator helper must not service recovery/timeout/source arbitration'
     assert 'm->m_iq_set_q4=m->m_iq_target_q4' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' not in mcc, 'SET_CURRENT must be direct VESC reference without legacy slew'
     assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
     assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc and 'm->m_hall_ticks>fresh' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc, 'VESC live-direction current brake path missing'

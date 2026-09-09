@@ -38,9 +38,10 @@ assert 'Fixed phase/current is set directly by the VESC setter' in phase_branch
 assert mc.count('for (uint8_t pass = 0u; pass < 3u; ++pass)') >= 2 and 'deg = 360; deg >= 0' in mc
 assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++)' in halltest and 'isr<16u' in halltest
 
-# VESC ownership/bridge gating is per motor, not one shared any-motor flag.
-assert re.search(r'leftSourceEnable=\(!estopActive\)&&\(\(enable!=0u\)\|\|mcpwm_foc_vesc_override_active\(false\)\)', mc), 'LEFT source gate must include VESC ownership and E-stop'
-assert re.search(r'rightSourceEnable=\(!estopActive\)&&\(\(enable!=0u\)\|\|mcpwm_foc_vesc_override_active\(true\)\)', mc), 'RIGHT source gate must include VESC ownership and E-stop'
+# VESC ownership/bridge gating is per motor and exclusive. Once VESC owns an
+# endpoint, an expired command must not be bypassed by the legacy enable flag.
+assert 'const uint8_t leftSourceEnable=(!estopActive) &&' in mc and        '(s_vesc_owned[0] ? mcpwm_foc_vesc_command_live(false) : (enable!=0u));' in mc,        'LEFT source gate must enforce exclusive VESC ownership and E-stop'
+assert 'const uint8_t rightSourceEnable=(!estopActive) &&' in mc and        '(s_vesc_owned[1] ? mcpwm_foc_vesc_command_live(true) : (enable!=0u));' in mc,        'RIGHT source gate must enforce exclusive VESC ownership and E-stop'
 assert 'leftOpenloop = (m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||' in mc
 assert 'CONTROL_MODE_OPENLOOP_PHASE);' in mc and 'leftDcLimit=leftOpenloop' in mc and 'rightDcLimit=rightOpenloop' in mc
 

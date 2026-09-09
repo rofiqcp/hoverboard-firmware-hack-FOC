@@ -59,9 +59,18 @@ def main() -> None:
             str(openocd), "-s", str(scripts),
             "-f", "interface/stlink.cfg",
             "-c", "transport select swd",
+            "-c", "reset_config srst_only srst_nogate connect_assert_srst",
             "-f", "target/stm32f1x.cfg",
             "-c", f"adapter speed {speed}",
-            "-c", f"program {{{image}}} 0x{args.address:08X} verify reset; shutdown",
+            # Connect while NRST is asserted, halt before the application can
+            # execute, then use explicit erase/write/verify operations. Only
+            # release reset after verification has succeeded.
+            "-c", (
+                f"init; halt; "
+                f"flash write_image erase {{{image}}} 0x{args.address:08X} bin; "
+                f"verify_image {{{image}}} 0x{args.address:08X} bin; "
+                "mww 0xE000ED0C 0x05FA0004; shutdown"
+            ),
         ]
         print(
             f"[STLINK] attempt={attempt}/{len(speeds)} image={image.name} "

@@ -53,10 +53,13 @@ extern UART_HandleTypeDef huart3;
 /*            Cortex-M3 Processor Interruption and Exception Handlers         */
 /******************************************************************************/
 
+static inline void f103_emergency_pwm_off(void);
+
 /**
 * @brief This function handles Non maskable interrupt.
 */
 void f103_NMI_Handler_impl(void) {
+  f103_emergency_pwm_off();
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
 
   /* USER CODE END NonMaskableInt_IRQn 0 */

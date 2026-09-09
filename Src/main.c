@@ -123,7 +123,7 @@ int main(void) {
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
 
-  int32_t boardTempAdcFixdt = adc_buffer.temp << 16;
+  int32_t boardTempAdcFixdt = (int32_t)adc_buffer.temp * 65536;
   int16_t boardTempAdcFilt = adc_buffer.temp;
 #if !POWER_BUTTON_BYPASS
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) HAL_Delay(10);

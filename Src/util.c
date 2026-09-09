@@ -36,6 +36,7 @@ static uint8_t rxBuffer[SERIAL_BUFFER_SIZE];
 static volatile uint32_t usart3RxErrorCount = 0u;
 static volatile uint32_t usart3RxRestartCount = 0u;
 static volatile uint32_t usart3ForcedRecoveryCount = 0u;
+static volatile uint8_t usart3RxErrorPending = 0u;
 static uint32_t usart3LastByteMs = 0u;
 static uint32_t usart3LastValidFrameMs = 0u;
 static uint32_t usart3LastValidCount = 0u;
@@ -83,15 +84,11 @@ void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart) {
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
   if (!huart || huart->Instance != USART3) return;
   ++usart3RxErrorCount;
-  usart3RxOldPos = 0u;
-  huart->ErrorCode = HAL_UART_ERROR_NONE;
-  /* HAL has already ended/aborted the DMA RX transfer before this callback.
-   * Restart the same circular buffer immediately so one FE/NE/ORE can lose at
-   * most the current VESC frame, never the complete session. */
-  if (HAL_UART_Receive_DMA(huart, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
-    ++usart3RxRestartCount;
-    __HAL_UART_ENABLE_IT(huart, UART_IT_IDLE);
-  }
+  /* IRQ context never owns DMA position/restart state. HAL may have aborted the
+   * current DMA transfer before this callback; main() notices this flag on its
+   * next pass, discards the partial VESC frame and restarts the circular DMA.
+   * This gives us one owner for usart3RxOldPos and prevents IRQ/main races. */
+  usart3RxErrorPending = 1u;
 }
 
 uint32_t usart3_rx_error_count(void) { return usart3RxErrorCount; }
@@ -228,18 +225,37 @@ static void serialAcceptByte(uint8_t byte) {
   (void)vesc_protocol_rx_byte(byte);
 }
 
+static bool usart3_restart_rx_main(bool reset_protocol) {
+  if (reset_protocol) vesc_protocol_transport_reset();
+  (void)HAL_UART_DMAStop(&huart3);
+  usart3RxOldPos = 0u;
+  huart3.ErrorCode = HAL_UART_ERROR_NONE;
+  huart3.RxState = HAL_UART_STATE_READY;
+  if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) != HAL_OK) return false;
+  ++usart3RxRestartCount;
+  __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+  return true;
+}
+
 void usart3_rx_check(void) {
+  if (usart3RxErrorPending != 0u) {
+    __disable_irq();
+    usart3RxErrorPending = 0u;
+    __enable_irq();
+    /* A UART framing/noise/overrun error makes the current binary frame
+     * untrustworthy. Fail closed before resetting transport state. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    (void)usart3_restart_rx_main(true);
+    return;
+  }
   /* Safety net in addition to HAL_UART_ErrorCallback: if a DMA error left RX
    * disabled for any reason, restart it from main context. */
   if ((huart3.Instance->CR3 & USART_CR3_DMAR) == 0u ||
       huart3.hdmarx == NULL || (huart3.hdmarx->Instance->CCR & DMA_CCR_EN) == 0u) {
-    usart3RxOldPos = 0u;
-    huart3.ErrorCode = HAL_UART_ERROR_NONE;
-    huart3.RxState = HAL_UART_STATE_READY;
-    if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
-      ++usart3RxRestartCount;
-      __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
-    }
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    (void)usart3_restart_rx_main(true);
     return;
   }
   const uint32_t pos = sizeof(rxBuffer) - __HAL_DMA_GET_COUNTER(huart3.hdmarx);
@@ -276,6 +292,7 @@ void usart3_recovery_tick(uint32_t now_ms) {
   (void)HAL_UART_DMAStop(&huart3);
   (void)HAL_UART_DeInit(&huart3);
   UART3_Init();
+  usart3RxErrorPending = 0u;
   usart3RxOldPos = 0u;
   huart3.ErrorCode = HAL_UART_ERROR_NONE;
   huart3.RxState = HAL_UART_STATE_READY;
@@ -357,13 +374,14 @@ void poweroffPressCheck(void) {
 }
 
 void filtLowPass32(int32_t u, uint16_t coef, int32_t *y) {
-  int64_t tmp = ((int64_t)((u << 4) - (*y >> 12)) * coef) >> 4;
+  int64_t tmp = ((((int64_t)u * 16LL) - (int64_t)(*y >> 12)) * coef) >> 4;
   tmp = CLAMP(tmp, -2147483648LL, 2147483647LL);
   *y = (int32_t)tmp + *y;
 }
 
 void rateLimiter16(int16_t u, int16_t rate, int16_t *y) {
-  int16_t delta = (int16_t)((u << 4) - *y);
+  int32_t delta32 = (int32_t)u * 16 - (int32_t)*y;
+  int16_t delta = (int16_t)CLAMP(delta32, INT16_MIN, INT16_MAX);
   if (delta > rate) delta = rate;
   if (delta < -rate) delta = (int16_t)-rate;
   *y = (int16_t)(*y + delta);
