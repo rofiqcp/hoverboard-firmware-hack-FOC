@@ -65,10 +65,21 @@ void f103_NMI_Handler_impl(void) {
   /* USER CODE END NonMaskableInt_IRQn 1 */
 }
 
+
+static inline void f103_emergency_pwm_off(void)
+{
+  /* Exception path: keep this register-only and bounded. */
+  TIM1->BDTR &= ~TIM_BDTR_MOE;
+  TIM8->BDTR &= ~TIM_BDTR_MOE;
+  TIM1->CCR1 = 0; TIM1->CCR2 = 0; TIM1->CCR3 = 0;
+  TIM8->CCR1 = 0; TIM8->CCR2 = 0; TIM8->CCR3 = 0;
+}
+
 /**
 * @brief This function handles Hard fault interrupt.
 */
 void f103_HardFault_Handler_impl(void) {
+  f103_emergency_pwm_off();
   /* USER CODE BEGIN HardFault_IRQn 0 */
 
   /* USER CODE END HardFault_IRQn 0 */
@@ -83,6 +94,7 @@ void f103_HardFault_Handler_impl(void) {
 * @brief This function handles Memory management fault.
 */
 void f103_MemManage_Handler_impl(void) {
+  f103_emergency_pwm_off();
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
 
   /* USER CODE END MemoryManagement_IRQn 0 */
@@ -97,6 +109,7 @@ void f103_MemManage_Handler_impl(void) {
 * @brief This function handles Prefetch fault, memory access fault.
 */
 void f103_BusFault_Handler_impl(void) {
+  f103_emergency_pwm_off();
   /* USER CODE BEGIN BusFault_IRQn 0 */
 
   /* USER CODE END BusFault_IRQn 0 */
@@ -111,6 +124,7 @@ void f103_BusFault_Handler_impl(void) {
 * @brief This function handles Undefined instruction or illegal state.
 */
 void f103_UsageFault_Handler_impl(void) {
+  f103_emergency_pwm_off();
   /* USER CODE BEGIN UsageFault_IRQn 0 */
 
   /* USER CODE END UsageFault_IRQn 0 */

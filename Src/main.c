@@ -130,19 +130,21 @@ int main(void) {
 #endif
 
   while (1) {
-    /* Service VESC request/reply traffic as soon as DMA/IDLE has queued it.
-     * Keeping this outside the ~5 ms housekeeping gate avoids adding one full
-     * control-loop period of latency to every UART transaction. FOC itself
-     * remains interrupt-driven and is not moved into this path. */
     uint32_t prof0=DWT->CYCCNT;
+    /* Deadline control didahulukan dari parser komunikasi. Upstream VESC
+     * menjalankan speed/position pada PID thread terpisah; pada bare-metal F103
+     * padanan paling deterministik adalah mengeksekusi scheduler 1 kHz sebelum
+     * packet/config work. Paket yang baru tiba menjadi setpoint tick berikutnya
+     * (latensi <=1 ms), tetapi burst VESC tidak boleh menambah jitter kontrol. */
+    uint32_t vesc_now_ms = HAL_GetTick();
+    mcpwm_foc_outer_control_non_isr(vesc_now_ms);
+
     /* Drain USART3 circular DMA every main-loop pass as a deterministic
-     * fallback to the IDLE-line IRQ. On this F103 the 16-kHz FOC DMA ISR can
-     * make short VESC bursts miss the expected IDLE callback even though the
-     * bytes are already present in rxBuffer. Polling the DMA write position is
-     * cheap when no bytes arrived and guarantees request/reply progress. */
+     * fallback to the IDLE-line IRQ, then process protocol in the remaining
+     * main-context budget. FOC current regulation remains interrupt-driven. */
     usart3_rx_check();
     vesc_protocol_process_pending();
-    const uint32_t vesc_now_ms = HAL_GetTick();
+    vesc_now_ms = HAL_GetTick();
     vesc_protocol_periodic(vesc_now_ms);
     usart3_recovery_tick(vesc_now_ms);
     uint32_t profd=DWT->CYCCNT-prof0;

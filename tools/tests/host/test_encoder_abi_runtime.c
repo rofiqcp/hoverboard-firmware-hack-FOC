@@ -27,7 +27,14 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y) {
 
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
 static uint32_t hk_ms=1u;
-static void outer_5ms(void){hk_ms+=5u;mcpwm_foc_housekeeping_non_isr(hk_ms);}
+static void outer_5ms(void){
+    /* Prime after any mcpwm_foc_init(), then execute one real elapsed-dt outer
+     * tick. Housekeeping remains separate for telemetry/tachometer consumption. */
+    mcpwm_foc_outer_control_non_isr(hk_ms);
+    hk_ms+=5u;
+    mcpwm_foc_outer_control_non_isr(hk_ms);
+    mcpwm_foc_housekeeping_non_isr(hk_ms);
+}
 static bool nearf(float a,float b,float tol){return fabsf(a-b)<=tol;}
 static mc_configuration abi_conf(void){
     mc_configuration c=m_motor_1.m_conf;
@@ -85,8 +92,8 @@ int main(void){
         encoder_cfg_ABI.timer->CNT=(encoder_cfg_ABI.timer->CNT+1u)%4096u;
         mcpwm_foc_adc_int_handler();
     }
-    /* ABI ISR hanya mengakumulasi delta/tick; division RPM diselesaikan snapshot
-     * housekeeping agar current ISR tetap deterministik. */
+    /* ABI ISR hanya mengakumulasi delta/tick; pembagian RPM diselesaikan oleh
+     * snapshot outer PID di luar current ISR agar hot path tetap deterministik. */
     outer_5ms();
     if(mcpwm_foc_get_erpm_motor(false)>-3500.0f)return fail("inverted ABI ERPM sign");
 

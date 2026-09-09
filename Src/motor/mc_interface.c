@@ -460,7 +460,10 @@ bool mc_interface_store_steering_calibration(void){
     if(!mcpwm_foc_steering_is_calibrated())return false;
     const int32_t span=mcpwm_foc_steering_span_counts();
     const uint32_t u=(uint32_t)span, inv=~u; bool ok=true;
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
     HAL_FLASH_Unlock();
+    ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC,0u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_LO,u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_INV_LO,inv);
     ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC, s_steering_logical_inverted ? EE_L_STEER_CAL_MAGIC_INVERTED : EE_L_STEER_CAL_MAGIC_VALUE);
@@ -488,6 +491,8 @@ bool mc_interface_reset_steering_calibration(void){
     mcpwm_foc_vesc_override_clear(false);
     mcpwm_foc_steering_clear_calibration();
     s_steering_logical_inverted=false;
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
     bool ok=true; HAL_FLASH_Unlock();
     ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC,0u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_LO,0u);
@@ -676,15 +681,26 @@ bool mc_interface_store_configuration_motor(bool second) {
     if (ca > I_MOT_MAX * 100) ca = I_MOT_MAX * 100;
     uint32_t ramp_erpm_s = (uint32_t)m->m_speed_ramp_rpm_s * pp;
     uint16_t ramp10 = (uint16_t)((ramp_erpm_s + 5u) / 10u);
-    uint16_t rel_erpm = (uint16_t)((uint32_t)m->m_speed_release_rpm * pp);
+    uint32_t rel_u32=(m->m_speed_release_erpm_q16+32768u)>>16;
+    if(rel_u32>65535u)rel_u32=65535u;
+    uint16_t rel_erpm=(uint16_t)rel_u32;
     const uint16_t gains[10] = {
         m->m_kpq_q11, m->m_kiq_q16, m->m_kpd_q11, m->m_kid_q16,
         m->m_kps_q11, m->m_kis_q16, m->m_kds_q11,
         m->m_kpp_q11, m->m_kip_q16, m->m_kdp_q11
     };
 
+    /* STM32F1 flash program/erase stalls instruction fetch globally. Match the
+     * upstream VESC store policy: both motors must be electrically released
+     * before any EEPROM-emulation write, even when storing one endpoint. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    const uint8_t signature_slot=second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     bool ok = true;
     HAL_FLASH_Unlock();
+    /* Invalidate FIRST. A brownout at any later write makes this motor config
+     * fail closed on the next boot instead of accepting a mixed old/new image. */
+    ok &= ee_write_slot(signature_slot, 0u);
     ok &= ee_write_slot(cur_slot, (uint16_t)ca);
     for (uint8_t i = 0u; i < 8u; ++i) ok &= ee_write_slot((uint8_t)(hall_base + i), m->m_conf.foc_hall_table[i]);
     for (uint8_t i = 0u; i < 10u; ++i) ok &= ee_write_slot((uint8_t)(gain_base + i), gains[i]);
@@ -918,7 +934,7 @@ bool mc_interface_store_configuration_motor(bool second) {
     }
     /* Per-motor signature is written last, so an interrupted update of one
      * motor can never make the other motor's partial configuration look valid. */
-    ok &= ee_write_slot(second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE, EE_CFG_SIGNATURE_VALUE);
+    ok &= ee_write_slot(signature_slot, EE_CFG_SIGNATURE_VALUE);
     ok &= ee_write_slot(EE_CFG_KEY, (uint16_t)FLASH_WRITE_KEY);
     HAL_FLASH_Lock();
     return ok;
@@ -1235,18 +1251,21 @@ bool mc_interface_load_configuration_motor(bool second) {
             }
         }
     }
-    if (ee_read_slot(ramp_slot, &v) && v > 0u) {
-        uint32_t erpm_s = (uint32_t)v * 10u;
-        uint32_t mech = erpm_s / persisted_pp;
-        if (mech < 1u) mech = 1u;
-        if (mech > 5000u) mech = 5000u;
-        m->m_speed_ramp_rpm_s = (uint16_t)mech;
+    if (ee_read_slot(ramp_slot, &v)) {
+        if (v == 0u) {
+            /* Standard VESC semantics: zero disables speed setpoint ramping. */
+            m->m_speed_ramp_rpm_s = 0u;
+        } else {
+            uint32_t erpm_s = (uint32_t)v * 10u;
+            uint32_t mech = erpm_s / persisted_pp;
+            if (mech < 1u) mech = 1u;
+            if (mech > 5000u) mech = 5000u;
+            m->m_speed_ramp_rpm_s = (uint16_t)mech;
+        }
     }
-    if (ee_read_slot(rel_slot, &v) && v > 0u) {
-        uint32_t mech = v / persisted_pp;
-        if (mech < 1u) mech = 1u;
-        if (mech > 100u) mech = 100u;
-        m->m_speed_release_rpm = (uint16_t)mech;
+    if (ee_read_slot(rel_slot, &v)) {
+        /* Slot semantics are already ERPM, so old EEPROM remains compatible. */
+        m->m_speed_release_erpm_q16=(uint32_t)v<<16;
     }
     mcpwm_foc_sync_tuning_to_conf(second);
     {
@@ -1313,7 +1332,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.foc_dt_us=MCCONF_FOC_DT_US_DEFAULT;
     }
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
-    m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);
+    m->m_conf.s_pid_min_erpm = (float)m->m_speed_release_erpm_q16/65536.0f;
     /* Jangan duplikasi rumus turunan MC config di loader. Semua limit, PID,
      * Hall, posisi, dan encoder diterapkan lewat jalur yang sama dengan
      * SET_MCCONF agar hasil boot == hasil write VESC Tool. */

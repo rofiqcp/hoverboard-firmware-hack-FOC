@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+from stlink_target_guard import verify_f103_target
+
 
 def parse_int(value: str) -> int:
     return int(value, 0)
@@ -42,6 +44,11 @@ def main() -> None:
     scripts = pio_home / "packages/tool-openocd/openocd/scripts"
     if not openocd.is_file():
         raise SystemExit(f"STLINK_UPLOAD_FAIL: OpenOCD missing: {openocd}")
+
+    try:
+        verify_f103_target(openocd, scripts, 100)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))
 
     last_rc = 1
     speeds = unique_speeds(args.adapter_khz)

@@ -15,9 +15,13 @@ extern "C" {
 
 typedef struct {
     mc_configuration m_conf;
-    mc_state m_state;
-    mc_control_mode m_control_mode;
-    mc_fault_code m_fault;
+    volatile mc_state m_state;
+    volatile mc_control_mode m_control_mode;
+    volatile mc_fault_code m_fault;
+    /* Main-context MC config publication can span many float/cache calculations.
+     * While this flag is set the ADC ISR must never read the partially published
+     * configuration or re-arm MOE. */
+    volatile uint8_t m_config_update_active;
     volatile uint32_t m_fault_recovery_ticks;
     uint32_t m_fault_stop_ticks; /* m_fault_stop_time_ms -> tick PWM, dihitung di slow path */
     /* Safety runtime per motor. Semua threshold mahal dihitung saat config
@@ -134,7 +138,7 @@ typedef struct {
     volatile int16_t m_vq;
     volatile int16_t m_current_in_counts;
     /* Set only when Clarke/Park has produced a new D/Q sample on this motor's
-     * 5.33-kHz regulator slot. The outer ABS protection consumes this flag so
+     * 2.667-kHz per-motor regulator slot. The outer ABS protection consumes this flag so
      * its three-sample qualification always means three distinct ADC samples. */
     volatile uint8_t m_dq_sample_fresh;
     /* Monitoring-only filtered currents. Upstream VESC keeps a separate current
@@ -146,7 +150,7 @@ typedef struct {
     int32_t m_telem_current_lpf_q16[3];
     uint16_t m_telem_current_filter_q16;
     /* VESC-style read/reset telemetry averages. These are accumulated at the
-     * 5.33-kHz control cadence and atomically consumed by COMM_GET_VALUES. */
+     * 2.667-kHz per-motor control cadence and atomically consumed by COMM_GET_VALUES. */
     volatile int32_t m_telem_sum_id_q4;
     volatile int32_t m_telem_sum_iq_q4;
     volatile int32_t m_telem_sum_ibus_counts;
@@ -327,7 +331,7 @@ typedef struct {
     uint16_t m_position_settle_ticks;
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
-    uint16_t m_speed_release_rpm;
+    uint32_t m_speed_release_erpm_q16; /* exact VESC s_pid_min_erpm runtime threshold */
     uint16_t m_speed_breakaway_ticks;
     uint8_t m_speed_breakaway_done;
     uint8_t m_iq_sat_hold;
@@ -437,6 +441,7 @@ bool mcpwm_foc_vesc_override_active(bool is_second_motor);
 bool mcpwm_foc_vesc_command_live(bool is_second_motor);
 void mcpwm_foc_vesc_override_clear(bool is_second_motor);
 void mcpwm_foc_energy_update(uint32_t now_ms);
+void mcpwm_foc_outer_control_non_isr(uint32_t now_ms);
 void mcpwm_foc_housekeeping_non_isr(uint32_t now_ms);
 void mcpwm_foc_set_board_temperature_x10(int16_t temperature_x10);
 
@@ -503,6 +508,10 @@ typedef struct {
     /* Profiler acceptance minimal: worst-case dan miss per scheduler slot 0..5.
      * Tidak menambah DWT read baru; memakai elapsed ISR yang sudah tersedia. */
     uint32_t slot_max_cycles[6], slot_miss_count[6];
+    /* Main-context 1-kHz SPEED/POS scheduler. Kept in the same diagnostic
+     * transaction so timing can be verified without attaching SWD to F103. */
+    uint32_t outer_max_cycles, outer_miss_count, outer_jitter_max_cycles;
+    uint32_t outer_period_min_cycles, outer_period_max_cycles;
 } mcpwm_foc_isr_profile_t;
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out);
 void mcpwm_foc_reset_isr_profile(void);

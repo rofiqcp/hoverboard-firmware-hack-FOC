@@ -9,7 +9,9 @@
 #define VARIANT_USART
 #endif
 
-#define PWM_FREQ                 16000
+#define CPU_CLOCK_HZ             64000000u
+#define PWM_FREQ_HZ              16000u
+#define PWM_FREQ                 PWM_FREQ_HZ
 #define DEAD_TIME                48
 #define DELAY_IN_MAIN_LOOP       5
 #define A2BIT_CONV               50  /* EFeru ADC current scaling: 50 count/A */
@@ -101,7 +103,7 @@
 #define DIAG_ENA                 1
 #define I_MOT_MAX                15
 #define I_DC_MAX                 17
-#define N_MOT_MAX                1000
+#define N_MOT_MAX                1000  /* legacy mechanical display range; bukan authority COMM_SET_RPM */
 #define FIELD_WEAK_ENA           0
 #define FIELD_WEAK_MAX           5
 #define PHASE_ADV_MAX            25

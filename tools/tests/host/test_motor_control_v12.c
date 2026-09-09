@@ -32,10 +32,16 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y) {
 
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
 static uint32_t legacy_ms=1u;
+static uint32_t outer_ms=1u;
 static uint32_t sim_pwm_frames=0u;
+static uint32_t sim_outer_frames=0u;
 static void legacy_sync(void){mcpwm_foc_housekeeping_non_isr(legacy_ms);legacy_ms+=5u;}
 static void sim_isr_step(void){
     mcpwm_foc_adc_int_handler();
+    if(++sim_outer_frames>=16u){
+        sim_outer_frames=0u;
+        mcpwm_foc_outer_control_non_isr(outer_ms++);
+    }
     if(++sim_pwm_frames>=80u){sim_pwm_frames=0u;legacy_sync();}
 }
 static void set_hall(GPIO_TypeDef *port,uint16_t pu,uint16_t pv,uint16_t pw,uint8_t h){
@@ -180,8 +186,8 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP left SPEED mode too early");
     for(int i=0;i<5000;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain SPEED at zero vector");
-    if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
-        return fail("mode2 zero-vector must reset all PI integrators");
+    if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_target_q4!=0)
+        return fail("mode2 zero-vector must reset speed PID and command zero Iq");
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0)
         return fail("mode2 zero-vector must zero speed states");
 
@@ -218,8 +224,8 @@ int main(void){
     m_motor_1.m_speed_set_ramp_q16=(int32_t)4<<16;
     m_motor_1.m_speed_target_rpm_q16=0; m_motor_1.m_speed_target_rpm=0;
     m_motor_1.m_iq_set_q4=800; m_motor_1.m_iq_target_q4=800; m_motor_1.m_iq_set_ramp_q16=(int32_t)800<<16;
-    /* SPEED outer PID/zero-zone follows the proven PWM/6 regulator cadence.
-     * 80 PWM frames include multiple regulator ticks and must reach zero-vector. */
+    /* SPEED outer PID/zero-zone berjalan di scheduler 1 kHz. 80 PWM frame
+     * mewakili 5 ms sehingga menyediakan beberapa outer tick fresh-feedback. */
     for(unsigned i=0;i<80u;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("speed STOP must not release with nonzero Iq");
     if(m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zone must force zero Iq like VESC");
@@ -385,7 +391,7 @@ int main(void){
     for(uint32_t i=0u;i<MCCONF_HALL_TIMEOUT_TICKS+100u;i++)sim_isr_step();
     if(m_motor_2.m_hall_interp_active!=0u)return fail("Hall interpolation low-speed disable");
 
-    printf("MOTOR_CONTROL_V12_PASS speed_ramp=%uRPM/s release=%uRPM trq50=0.50A erpm=%.0f mode4=2A\n",
-           m_motor_1.m_speed_ramp_rpm_s,m_motor_1.m_speed_release_rpm,vals.rpm);
+    printf("MOTOR_CONTROL_V12_PASS speed_ramp=%uRPM/s release=%uERPM trq50=0.50A erpm=%.0f mode4=2A\n",
+           m_motor_1.m_speed_ramp_rpm_s,(unsigned)(m_motor_1.m_speed_release_erpm_q16>>16),vals.rpm);
     return 0;
 }

@@ -18,10 +18,13 @@ assert 'm_speed_target_rpm_q16' in mch and 'erpm_to_mech_rpm_q16' in mc
 assert 'measured_mech_rpm_q16' in mc
 motor_step_start=mc.index('static void motor_control_step')
 motor_step=mc[motor_step_start:mc.index('static int16_t duty_permille_from_vdq',motor_step_start)]
-# Baseline 61c semantics: SPEED/POS outer control uses fresh feedback on each
-# regulator tick; telemetry remains decoupled from the high-priority ISR.
-assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step
-assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step
+# VESC-style outer PID scheduler: fresh feedback at 1 kHz, current ISR only
+# consumes cached Iq. Virtual stale-feedback catch-up is forbidden.
+outer=mc[mc.index('void mcpwm_foc_outer_control_non_isr'):mc.index('void mcpwm_foc_housekeeping_non_isr')]
+assert re.search(r'#define\s+MCCONF_OUTER_PID_HZ\s+1000u',mcc)
+assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in outer
+assert 'm->m_iq_target_q4=position_pid_iq_target_step' in outer
+assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_step' not in motor_step
 assert 'motor_outer_loop_virtual_steps' not in mc
 assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc

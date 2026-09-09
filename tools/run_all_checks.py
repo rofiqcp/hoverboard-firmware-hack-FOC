@@ -65,16 +65,20 @@ def check_static():
     motor_step_start=mc.index('static void motor_control_step')
     motor_step_end=mc.index('static int16_t duty_permille_from_vdq',motor_step_start)
     motor_step=mc[motor_step_start:motor_step_end]
-    # Baseline 61c control semantics: outer SPEED/POS loops use fresh feedback on
-    # each PWM/6 regulator tick. Monitoring remains slow-path and must not be
-    # reintroduced merely to reproduce the older ISR's unnecessary overhead.
-    assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step, 'mode2 speed PID must execute on regulator tick like 61c baseline'
-    assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step, 'position PID must execute on regulator tick like 61c baseline'
-    assert 'motor_outer_loop_virtual_steps' not in mc, 'stale-feedback 200-Hz virtual outer-loop architecture must not remain'
+    # Upstream VESC semantics: SPEED/POS run in a dedicated PID scheduler, while
+    # the ADC ISR only closes Id/Iq current control against a cached Iq target.
+    outer_start=mc.index('void mcpwm_foc_outer_control_non_isr')
+    outer_end=mc.index('void mcpwm_foc_housekeeping_non_isr',outer_start)
+    outer=mc[outer_start:outer_end]
+    assert re.search(r'#define\s+MCCONF_OUTER_PID_HZ\s+1000u',mcc), 'outer VESC PID scheduler must be 1 kHz'
+    assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in outer, 'speed PID must run in 1-kHz outer scheduler'
+    assert 'm->m_iq_target_q4=position_pid_iq_target_step' in outer, 'position PID must run in 1-kHz outer scheduler'
+    assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_step' not in motor_step, 'SPEED/POS PID must not execute in hot ADC ISR'
+    assert 'speed_setpoint_slew_step(m,dt_ms)' in outer and 'dt_ms=now_ms-s_outer_pid_last_ms' in outer, 'outer scheduler must use fresh actual dt without stale virtual catch-up'
+    assert 'float' not in outer and 'sqrtf' not in outer and 'lroundf' not in outer, '1-kHz outer scheduler must remain fixed-point/integer'
+    assert 'motor_outer_loop_virtual_steps' not in mc, 'stale-feedback virtual outer-loop architecture must not remain'
     assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
     assert 'current_pi_vesc_state' in motor_step and 'm_current_kpq_v_q16' in mc, 'ISR must retain upstream-style physical Id/Iq current PI'
-    assert 'speed_setpoint_slew_step(m)' in motor_step and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp must follow regulator cadence'
-    assert 'stop_zone' in motor_step and 'm->m_iq_set_q4=0' in motor_step and 'reset_current_pi(m)' in motor_step, 'mode2 STOP zero-vector reset missing from regulator path'
     assert 'if(m->m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED)' in motor_step, 'redundant final vector sqrt must be skipped when decoupling is disabled'
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'

@@ -1325,7 +1325,8 @@ class VescDual:
             "sensor","pll","current","regulator","position_pid","speed_pid",
             "current_circle","id_pi","iq_pi","decouple_limit","svpwm","duty_mag","overrun",
             "slot0_max","slot1_max","slot2_max","slot3_max","slot4_max","slot5_max",
-            "slot0_miss","slot1_miss","slot2_miss","slot3_miss","slot4_miss","slot5_miss")
+            "slot0_miss","slot1_miss","slot2_miss","slot3_miss","slot4_miss","slot5_miss",
+            "outer_max","outer_miss","outer_jitter","outer_period_min","outer_period_max")
         p=self.custom_transact(HB_GET_ISR_PROFILE,bytes((1 if reset else 0,)),right=False,timeout=max(self.timeout,1.2))
         status=parse_custom_header(p,HB_GET_ISR_PROFILE)
         if status or len(p)!=6+4*len(names):

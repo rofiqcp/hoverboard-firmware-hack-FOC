@@ -27,9 +27,12 @@ assert 'm_hall_reject_counted_state' in mch and 'm->m_hall_reject_counted_state 
 assert 'period_for_filter' in mc and 'floor_period' in mc and 'm->m_hall_period_reject_count++' in mc, 'Hall timing outlier slew-limit path missing'
 motor_step_start=mc.index('static void motor_control_step')
 motor_step=mc[motor_step_start:mc.index('static int16_t duty_permille_from_vdq',motor_step_start)]
-assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step
-assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step
-assert 'stop_zone' in motor_step and 'm->m_iq_set_q4=m->m_iq_target_q4;' in motor_step
+outer=mc[mc.index('void mcpwm_foc_outer_control_non_isr'):mc.index('void mcpwm_foc_housekeeping_non_isr')]
+assert re.search(r'#define\s+MCCONF_OUTER_PID_HZ\s+1000u',mcc)
+assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in outer
+assert 'm->m_iq_target_q4=position_pid_iq_target_step' in outer
+assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_step' not in motor_step
+assert 'm->m_iq_set_q4=m->m_iq_target_q4;' in motor_step
 assert 'motor_outer_loop_virtual_steps' not in mc
 assert 'm->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;' in mc, 'speed STOP must force VESC zero-vector reference'
 assert 'VESC speed PID -> Iq' in mc
@@ -85,7 +88,17 @@ assert 's_pending_count < VESC_RX_QUEUE_DEPTH' in vp
 assert 'VESC_RT_PERIOD_MS' not in vp and 's_rt_stream' not in vp
 assert 'case COMM_SET_DETECT:' in vp and 'COMM_ROTOR_POSITION' in vp
 assert 'vesc_protocol_periodic(uint32_t now_ms)' in vp
-assert 'const uint32_t vesc_now_ms = HAL_GetTick();' in main and 'vesc_protocol_periodic(vesc_now_ms)' in main and 'usart3_recovery_tick(vesc_now_ms)' in main
+assert 'vesc_now_ms = HAL_GetTick();' in main and 'vesc_protocol_periodic(vesc_now_ms)' in main and 'usart3_recovery_tick(vesc_now_ms)' in main
+# Bare-metal equivalent of VESC's independent PID thread: control deadline must
+# execute before potentially long packet/config processing.
+assert main.index('mcpwm_foc_outer_control_non_isr(vesc_now_ms)') < main.index('vesc_protocol_process_pending()'), 'outer PID must have priority over VESC parser'
+# Timing/control regressions found against VESC + EFeru references.
+assert 'm->m_position_dt_ticks=0u' in mc and 'm->m_position_proc_dt_ticks=0u' in mc, 'position derivative dt must start at zero'
+assert 'const uint32_t den=(uint32_t)m->m_hall_period*(pp?pp:1u);' in mc and '10667' not in mc, 'Hall mechanical RPM must use runtime pole pairs'
+assert 'if (m->m_speed_ramp_rpm_s == 0u)' in mc and 'm->m_speed_set_ramp_q16 = target_q16;' in mc, 'zero VESC speed ramp must mean direct setpoint'
+assert 'm_speed_release_erpm_q16' in mch and 'min_erpm_q16 = (int64_t)m->m_speed_release_erpm_q16' in mc, 's_pid_min_erpm must stay in electrical ERPM domain'
+assert outer.index('driven_offset_finalize_non_isr();') < outer.index('if(s_outer_pid_last_ms==0u)'), 'powered offset finalization must not wait for 200-Hz housekeeping'
+assert 'outer_max_cycles, outer_miss_count, outer_jitter_max_cycles' in mch and 'APPP(p.outer_max_cycles)' in vp and '"outer_jitter"' in dual, 'outer timing profiler must be readable through existing diagnostic packet'
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
 assert 'strict request/reply' in vp and 'one request -> one reply' in vp
 assert 'realtime mailbox latest VESC-tool mapped setpoint' in host and 'request/reply only' in host

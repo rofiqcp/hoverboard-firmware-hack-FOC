@@ -37,10 +37,16 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y) {
 
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
 static uint32_t legacy_ms=1u;
+static uint32_t outer_ms=1u;
 static uint32_t sim_pwm_frames=0u;
+static uint32_t sim_outer_frames=0u;
 static void legacy_sync(void){mcpwm_foc_housekeeping_non_isr(legacy_ms);legacy_ms+=5u;}
 static void sim_isr_step(void){
     mcpwm_foc_adc_int_handler();
+    if(++sim_outer_frames>=16u){
+        sim_outer_frames=0u;
+        mcpwm_foc_outer_control_non_isr(outer_ms++);
+    }
     if(++sim_pwm_frames>=80u){sim_pwm_frames=0u;legacy_sync();}
 }
 static void set_hall(GPIO_TypeDef *port,uint16_t pu,uint16_t pv,uint16_t pw,uint8_t h){
@@ -162,15 +168,25 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
     for(int i=0;i<5000;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain VESC speed zero-vector");
-    if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
-        return fail("mode2 zero-vector must reset PI integrators");
+    if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_target_q4!=0)
+        return fail("mode2 zero-vector must reset speed PID and command zero Iq");
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0 ||
-       m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)
-        return fail("mode2 zero-vector state");
+       m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)
+        return fail("mode2 zero-Iq speed state");
 
     /* VESC boundary: 200 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
      * is active must request a ramp, not immediate active braking/reversal. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
+    /* Hard ERPM authority regression: VESC mcconf allows +/-15000 ERPM.
+     * LEFT has 4 pole-pairs, so 15000 ERPM = 3750 mechanical RPM; this must
+     * not be clipped by the legacy N_MOT_MAX=1000 mechanical constant. RIGHT
+     * has 15 pole-pairs, so the same electrical limit is 1000 mechanical RPM. */
+    mcpwm_foc_set_pid_speed(15000.0f,false);
+    if(m_motor_1.m_speed_target_rpm!=3750)return fail("LEFT 15000 ERPM clipped by legacy mechanical RPM limit");
+    mcpwm_foc_set_pid_speed(15000.0f,true);
+    if(m_motor_2.m_speed_target_rpm!=1000)return fail("RIGHT 15000 ERPM conversion incorrect");
+    mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+
     mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
@@ -182,7 +198,7 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
     for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)return fail("VESC zero ERPM zero-vector");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)return fail("VESC zero ERPM zero-Iq state");
     mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     m_motor_1.m_rpm=50;
@@ -201,6 +217,23 @@ int main(void){
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1;
     m_motor_1.m_hall_period=3200u; m_motor_1.m_hall_ticks=0u;
     if(fabsf(mcpwm_foc_get_erpm_motor(false)-50.0f)>0.05f)return fail("50 ERPM direct Hall telemetry");
+
+    /* VESC speed-ramp zero means no ramp. It must not silently become 1 RPM/s,
+     * and position derivative timers must start with no phantom elapsed tick. */
+    mcpwm_foc_init(); use_legacy_hall_fixture();
+    if(m_motor_1.m_position_dt_ticks!=0u || m_motor_1.m_position_proc_dt_ticks!=0u)
+        return fail("position D timer reset must start at zero");
+    mc_configuration noramp=m_motor_1.m_conf;
+    noramp.s_pid_ramp_erpms_s=0.0f;
+    noramp.s_pid_min_erpm=75.0f;
+    mcpwm_foc_set_configuration(&noramp,false);
+    if(m_motor_1.m_speed_release_erpm_q16!=(75u<<16))
+        return fail("s_pid_min_erpm must stay exact electrical ERPM");
+    mcpwm_foc_set_pid_speed(200.0f,false);
+    mcpwm_foc_outer_control_non_isr(outer_ms++);
+    mcpwm_foc_outer_control_non_isr(outer_ms++);
+    if(m_motor_1.m_speed_ramp_rpm_s!=0u || m_motor_1.m_speed_set_ramp_q16!=m_motor_1.m_speed_target_rpm_q16)
+        return fail("VESC zero speed ramp must apply target directly");
 
     /* Stock VESC SET_CURRENT scaling: 3.00 A must become the exact Iq target. */
     mcpwm_foc_init(); use_legacy_hall_fixture();
@@ -350,6 +383,28 @@ int main(void){
     if(A2BIT_CONV!=50 || FOC_CURRENT_Q4_PER_A!=800)return fail("EFeru current unit 50count/A Q4=800/A");
     mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
 
+    /* Hard realtime VESC deadline: even if legacy enable remains high and main
+     * housekeeping is never called, the ADC ISR must remove MOE when the VESC
+     * command deadline expires. This is the fail-safe for a deadlocked parser or
+     * main loop while the 16-kHz current ISR is still alive. */
+    mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
+    adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
+    mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
+    mcpwm_foc_set_current(0.10f,false); mcpwm_foc_vesc_override_touch(false);
+    for(int i=0;i<100;i++)DMA1_Channel1_IRQHandler();
+    mcpwm_foc_outer_control_non_isr(outer_ms++);
+    for(int i=0;i<8;i++)DMA1_Channel1_IRQHandler();
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("watchdog setup bridge must be active");
+    mcpwm_foc_vesc_timeout_configure(false,2u,0.0f);
+    for(int i=0;i<40;i++)DMA1_Channel1_IRQHandler(); /* no main/housekeeping */
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("ISR VESC timeout must clear MOE with main stalled");
+    if(mcpwm_foc_vesc_command_live(false))return fail("expired VESC deadline must not remain source-live");
+    for(int i=0;i<20;i++)DMA1_Channel1_IRQHandler();
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("legacy enable must not bypass owned VESC timeout");
+    mcpwm_foc_vesc_override_clear(false); enable=0u; motorRunReq=0u;
+
     /* Telemetry sensor harus tetap live ketika bridge released. Baseline high-Z
      * dipelajari terpisah dari offset kontrol, dan perubahan ADC saat idle harus
      * muncul di Id/Iq/Ibattery tanpa pernah mengaktifkan PWM/proteksi arus. */
@@ -394,7 +449,7 @@ int main(void){
     mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
     mcpwm_foc_set_position_counts(1,false); mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
-    for(int i=0;i<6;i++)sim_isr_step();
+    for(int i=0;i<20;i++)sim_isr_step();
     {
         const int32_t mdeg_per_count=360000/(6*(int32_t)MCCONF_POLE_PAIRS_LEFT);
         const int32_t p_q15=(int32_t)(((int64_t)mdeg_per_count*60*32768LL)/1000000LL);
@@ -453,7 +508,7 @@ int main(void){
         const float now=mcpwm_foc_get_phase_motor(false);
         float target=now+60.0f; if(target>=360.0f)target-=360.0f;
         mcpwm_foc_set_pid_pos(target,false); mcpwm_foc_vesc_override_touch(false);
-        /* POSITION outer PID is serviced outside the ADC ISR at 200 Hz. */
+        /* POSITION outer PID is serviced outside the ADC ISR at 1 kHz. */
         for(int i=0;i<80;i++)sim_isr_step();
         if(!m_motor_1.m_pos_pid_phase_mode || m_motor_1.m_control_mode!=CONTROL_MODE_POS)return fail("VESC position Hall phase mode");
         if(m_motor_1.m_iq_target_q4<=0)return fail("VESC position positive phase error must request positive Iq");

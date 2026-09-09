@@ -155,10 +155,10 @@
 #define MCCONF_ENCODER_STUCK_MIN_ERPM             100u
 #define MCCONF_ENCODER_STUCK_CURRENT_MA           1000u
 #define MCCONF_ENCODER_STUCK_TIMEOUT_TICKS       8000u /* 0,5 s @16 kHz */
-/* OFF->RUN ADC/gate-driver settling. Unlike the old per-start offset calibration,
- * this never learns a new offset. It only holds a zero vector for 8 PWM frames
- * (0.5 ms @16 kHz) so the first LOW-FET shunt sample belongs to the driven
- * operating point calibrated during the original 2000-sample startup window. */
+/* OFF->RUN powered-current baseline. Keep a zero vector for 80 PWM frames
+ * (5.0 ms @16 kHz), average the low-side shunt operating point, then finalize
+ * outside ISR. This is intentionally longer than a simple gate-settle delay:
+ * real hardware showed a different driven common-mode than bridge-OFF. */
 #define MCCONF_BRIDGE_SETTLE_SAMPLES               80u
 /* OFF/high-impedance telemetry uses its own frozen zero-current ADC baseline.
  * Remove a few ADC counts of amplifier noise without hiding real passive/regen
@@ -177,6 +177,8 @@
 /* Upstream VESC default: 3 extra samples => 7 instantaneous GPIO reads with majority vote. */
 #define MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT       3u
 #define MCCONF_FOC_CONTROL_DIV                  6u
+#define MCCONF_OUTER_PID_HZ                  1000u /* VESC FOC speed/position PID thread equivalent */
+#define MCCONF_TELEMETRY_HZ                   200u /* housekeeping/telemetry slow path */
 /* Hall timeout must be longer than one Hall sector at low VESC ERPM.
  * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.
  * 8000 ticks (0.5 s) keeps valid low-speed Hall feedback down to ~20 ERPM. */

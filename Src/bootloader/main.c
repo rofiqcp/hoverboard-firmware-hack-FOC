@@ -212,7 +212,9 @@ static bool stage_valid(uint32_t *size_out, uint16_t *crc_out) {
 static bool app_vector_valid(void) {
     const uint32_t sp = *(const uint32_t *)F103_APP_BASE_ADDR;
     const uint32_t rv = *(const uint32_t *)(F103_APP_BASE_ADDR + 4u);
-    if (sp < 0x20000000u || sp > 0x2000C000u || (sp & 3u)) return false;
+    /* App linker reserves 0x2000BFF0..0x2000BFFF for boot/reset handoff.
+     * Never accept an initial MSP inside that reserved black-box region. */
+    if (sp < 0x20000000u || sp > F103_BOOT_REQUEST_ADDR || (sp & 3u)) return false;
     if ((rv & 1u) == 0u) return false;
     const uint32_t pc = rv & ~1u;
     return pc >= F103_APP_BASE_ADDR && pc < (F103_APP_BASE_ADDR + F103_APP_REGION_SIZE);

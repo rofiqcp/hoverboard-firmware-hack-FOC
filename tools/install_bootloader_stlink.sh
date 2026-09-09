@@ -12,6 +12,7 @@ BOOT_BIN="$ROOT/.pio/build/BOOTLOADER_STLINK/firmware.bin"
 
 [[ -x "$OPENOCD" ]] || { echo "STLINK_INSTALL_FAIL: OpenOCD not found" >&2; exit 2; }
 command -v pio >/dev/null || { echo "STLINK_INSTALL_FAIL: pio not found" >&2; exit 2; }
+python3 "$ROOT/tools/stlink_target_guard.py" --openocd "$OPENOCD" --scripts "$OCD_SCRIPTS" --speed 100
 echo "[1/7] Build relocated application"
 pio run -e APP_STLINK
 

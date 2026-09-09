@@ -116,7 +116,13 @@ static void app_flags_unpack(adc_config *c, uint16_t f) {
 bool app_vesc_store_configuration(bool second) {
     const app_configuration *a=&s_conf[second?1u:0u];
     const adc_config *c=&a->app_adc_conf; const uint8_t b=(uint8_t)(APP_EE_BASE+(second?APP_EE_STRIDE:0u));
+    /* EEPROM emulation executes from the same STM32F1 flash as the FOC ISR.
+     * Release both bridges before writes, then invalidate this endpoint's commit
+     * marker so interrupted updates never boot as a partially valid App Config. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
     bool ok=true; HAL_FLASH_Unlock();
+    ok &= app_ee_write_if_changed(b,0u);
     ok &= app_ee_write_if_changed((uint8_t)(b+1u),(uint16_t)a->app_to_use);
     ok &= app_ee_write_u32((uint8_t)(b+2u),a->timeout_msec);
     ok &= app_ee_write_u32((uint8_t)(b+4u),float_bits(a->timeout_brake_current));
@@ -137,7 +143,7 @@ bool app_vesc_store_configuration(bool second) {
     ok &= app_ee_write_u32((uint8_t)(b+31u),float_bits(c->ramp_time_neg));
     ok &= app_ee_write_u32((uint8_t)(b+33u),float_bits(c->tc_max_diff));
     ok &= app_ee_write_u32((uint8_t)(b+35u),c->update_rate_hz);
-    /* Signature and shared key last: interrupted writes never look valid. */
+    /* Commit marker and shared key last: interrupted writes remain invalid. */
     ok &= app_ee_write_if_changed(b,APP_EE_SIGNATURE);
     ok &= app_ee_write_if_changed(APP_EE_KEY_SLOT,(uint16_t)APP_EE_KEY_VALUE);
     HAL_FLASH_Lock(); return ok;

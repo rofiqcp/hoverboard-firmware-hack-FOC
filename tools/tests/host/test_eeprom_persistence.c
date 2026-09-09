@@ -23,6 +23,10 @@ uint16_t VirtAddVarTab[NB_OF_VAR];
 
 static uint16_t ee_value[NB_OF_VAR];
 static uint8_t ee_valid[NB_OF_VAR];
+/* Permanent write failure after N successful EEPROM writes, used to model a
+ * brownout/flash fault in the middle of a transaction. -1 disables injection. */
+static int ee_fail_after=-1;
+static int ee_write_count=0;
 
 static int slot_from_addr(uint16_t addr){
     for(unsigned i=0;i<NB_OF_VAR;i++) if(VirtAddVarTab[i]==addr) return (int)i;
@@ -37,6 +41,7 @@ uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data){
 uint16_t EE_WriteVariable(uint16_t VirtAddress, uint16_t Data){
     int i=slot_from_addr(VirtAddress);
     if(i<0) return 1u;
+    if(ee_fail_after>=0 && ee_write_count++>=ee_fail_after)return 1u;
     ee_value[i]=Data; ee_valid[i]=1u;
     return HAL_OK;
 }
@@ -117,12 +122,12 @@ int main(void){
     m_motor_1.m_kpd_q11=333u;  m_motor_1.m_kid_q16=444u;
     m_motor_1.m_kps_q11=555u;  m_motor_1.m_kis_q16=666u; m_motor_1.m_kds_q11=77u;
     m_motor_1.m_kpp_q11=888u;  m_motor_1.m_kip_q16=999u; m_motor_1.m_kdp_q11=111u;
-    m_motor_1.m_speed_ramp_rpm_s=123u; m_motor_1.m_speed_release_rpm=7u;
+    m_motor_1.m_speed_ramp_rpm_s=123u; m_motor_1.m_speed_release_erpm_q16=28u<<16;
     m_motor_2.m_kpq_q11=1212u; m_motor_2.m_kiq_q16=2323u;
     m_motor_2.m_kpd_q11=343u;  m_motor_2.m_kid_q16=454u;
     m_motor_2.m_kps_q11=565u;  m_motor_2.m_kis_q16=676u; m_motor_2.m_kds_q11=87u;
     m_motor_2.m_kpp_q11=898u;  m_motor_2.m_kip_q16=909u; m_motor_2.m_kdp_q11=121u;
-    m_motor_2.m_speed_ramp_rpm_s=234u; m_motor_2.m_speed_release_rpm=8u;
+    m_motor_2.m_speed_ramp_rpm_s=234u; m_motor_2.m_speed_release_erpm_q16=120u<<16;
     /* Raw/custom tuning is an explicit fixed-point API. Mirror it into the
      * standard MC config before persistence, exactly like HB_CUSTOM_SET_TUNING
      * and terminal SET callbacks do in production. */
@@ -244,8 +249,8 @@ int main(void){
         return fail("Hall interpolation runtime coefficient restore");
     if(m_motor_1.m_kpq_q11!=1111u || m_motor_1.m_kiq_q16!=2222u || m_motor_1.m_kdp_q11!=111u) return fail("left gains persistence");
     if(m_motor_2.m_kpq_q11!=1212u || m_motor_2.m_kiq_q16!=2323u || m_motor_2.m_kdp_q11!=121u) return fail("right gains persistence");
-    if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_rpm!=7u) return fail("left speed persistence");
-    if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_rpm!=8u) return fail("right speed persistence");
+    if(m_motor_1.m_speed_ramp_rpm_s!=123u || m_motor_1.m_speed_release_erpm_q16!=(28u<<16)) return fail("left speed persistence");
+    if(m_motor_2.m_speed_ramp_rpm_s!=234u || m_motor_2.m_speed_release_erpm_q16!=(120u<<16)) return fail("right speed persistence");
 
     /* Standard VESC SET_MCCONF keeps the requested float values authoritative.
      * Runtime coefficients are quantized for the ISR, but GET_MCCONF and EEPROM
@@ -427,6 +432,30 @@ int main(void){
     if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u || !ee_valid[161] || !ee_valid[162] ||
        !ee_valid[179] || !ee_valid[180] || !ee_valid[181] || !ee_valid[185])
         return fail("V27 migration rewrite/signature");
+
+    /* Power-loss transaction regression. Start from two valid endpoints, then
+     * make every EEPROM write fail after a few successful words. The LEFT
+     * signature must already have been invalidated, while RIGHT remains valid.
+     * Restore the emulated EEPROM afterwards so the legacy corruption test below
+     * remains independent. */
+    {
+        uint16_t saved_value[NB_OF_VAR]; uint8_t saved_valid[NB_OF_VAR];
+        memcpy(saved_value,ee_value,sizeof(saved_value));
+        memcpy(saved_valid,ee_valid,sizeof(saved_valid));
+        mc_configuration interrupted=m_motor_1.m_conf; interrupted.l_current_max=3.21f;
+        mcpwm_foc_set_configuration(&interrupted,false);
+        ee_write_count=0; ee_fail_after=6;
+        if(mc_interface_store_configuration_motor(false))return fail("brownout store must report failure");
+        ee_fail_after=-1;
+        if(!ee_valid[43] || ee_value[43]!=0u)return fail("brownout must leave LEFT signature invalid");
+        if(!ee_valid[44] || ee_value[44]!=0x6022u)return fail("brownout LEFT store must not invalidate RIGHT");
+        mcpwm_foc_init();
+        if(mc_interface_load_configuration_motor(false))return fail("partial LEFT config must fail closed");
+        if(!mc_interface_load_configuration_motor(true))return fail("RIGHT config must survive LEFT brownout");
+        memcpy(ee_value,saved_value,sizeof(saved_value));
+        memcpy(ee_valid,saved_valid,sizeof(saved_valid));
+        ee_write_count=0;
+    }
 
     /* Independent signatures: corrupt only right signature; left remains valid. */
     ee_value[44]=0u;
