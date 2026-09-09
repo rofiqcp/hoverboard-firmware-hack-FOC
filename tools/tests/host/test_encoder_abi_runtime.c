@@ -26,6 +26,8 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y) {
 }
 
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
+static uint32_t hk_ms=1u;
+static void outer_5ms(void){hk_ms+=5u;mcpwm_foc_housekeeping_non_isr(hk_ms);}
 static bool nearf(float a,float b,float tol){return fabsf(a-b)<=tol;}
 static mc_configuration abi_conf(void){
     mc_configuration c=m_motor_1.m_conf;
@@ -46,6 +48,7 @@ static void host_set_deg_synced(float deg){
 
 int main(void){
     mcpwm_foc_init();
+    mcpwm_foc_housekeeping_non_isr(hk_ms);
     mc_configuration c=abi_conf();
     mcpwm_foc_set_configuration(&c,false);
     if(encoder_is_configured()!=ENCODER_TYPE_ABI)return fail("ABI not configured");
@@ -82,6 +85,9 @@ int main(void){
         encoder_cfg_ABI.timer->CNT=(encoder_cfg_ABI.timer->CNT+1u)%4096u;
         mcpwm_foc_adc_int_handler();
     }
+    /* ABI ISR hanya mengakumulasi delta/tick; division RPM diselesaikan snapshot
+     * housekeeping agar current ISR tetap deterministik. */
+    outer_5ms();
     if(mcpwm_foc_get_erpm_motor(false)>-3500.0f)return fail("inverted ABI ERPM sign");
 
     c.m_encoder_counts=2048;
@@ -104,9 +110,9 @@ int main(void){
     /* VESC p_pid_ang_div=2: one physical encoder revolution advances PID
      * position only 180 deg while preserving continuity through 360->0. */
     c.p_pid_ang_div=2.0f; mcpwm_foc_set_configuration(&c,false);
-    host_set_deg_synced(350.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
+    host_set_deg_synced(350.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler(); outer_5ms();
     if(!nearf(mcpwm_foc_get_pid_pos_now_motor(false),355.0f,0.35f))return fail("p_pid_ang_div reverse wrap");
-    host_set_deg_synced(10.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
+    host_set_deg_synced(10.0f); for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler(); outer_5ms();
     if(!nearf(mcpwm_foc_get_pid_pos_now_motor(false),5.0f,0.35f))return fail("p_pid_ang_div forward wrap");
     c.p_pid_ang_div=1.0f; mcpwm_foc_set_configuration(&c,false);
     host_set_deg_synced(0.0f);
@@ -114,6 +120,7 @@ int main(void){
     m_motor_1.m_position_counts=0;
     mcpwm_foc_set_position_counts(1,false);
     mcpwm_foc_vesc_override_touch(false);
+    outer_5ms();
     for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     if(abs(m_motor_1.m_iq_target_q4)>8)
         return fail("one ABI count incorrectly scaled as Hall sector");
@@ -125,11 +132,13 @@ int main(void){
     c.p_pid_kd=0.0f; c.p_pid_kd_proc=0.0f; c.p_pid_gain_dec_angle=0.0f;
     mcpwm_foc_set_configuration(&c,false); host_set_deg_synced(0.0f);
     mcpwm_foc_set_pid_pos(20.0f,false); mcpwm_foc_vesc_override_touch(false);
+    outer_5ms();
     for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     const int iq_full=abs(m_motor_1.m_iq_target_q4);
     mcpwm_foc_release_motor(false);
     c.p_pid_gain_dec_angle=40.0f; mcpwm_foc_set_configuration(&c,false); host_set_deg_synced(0.0f);
     mcpwm_foc_set_pid_pos(20.0f,false); mcpwm_foc_vesc_override_touch(false);
+    outer_5ms();
     for(unsigned i=0u;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
     const int iq_half=abs(m_motor_1.m_iq_target_q4);
     if(iq_full<100 || iq_half<40 || iq_half>iq_full*3/5 || iq_half<iq_full*2/5)
@@ -146,7 +155,11 @@ int main(void){
     for(int i=0;i<700;i++){
         encoder_cfg_ABI.timer->CNT=(encoder_cfg_ABI.timer->CNT+1u)%4096u;
         mcpwm_foc_adc_int_handler();
+        if(((i+1)%80)==0)outer_5ms();
     }
+    /* Consume the completed second estimator window. This reader tick does not
+     * add encoder/PWM ticks; those are producer-owned by the ISR accumulator. */
+    outer_5ms();
     const float erpm=mcpwm_foc_get_erpm_motor(false);
     if(!nearf(erpm,3515.625f,12.0f))return fail("ABI ERPM scaling");
     if(m_motor_1.m_tachometer<14 || m_motor_1.m_tachometer>16)

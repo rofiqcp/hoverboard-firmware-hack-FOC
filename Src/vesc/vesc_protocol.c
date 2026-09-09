@@ -53,6 +53,7 @@
 #define HB_CUSTOM_ENCODER_DEBUG             14u /* read-only LEFT ABI alignment/detect black box */
 #define HB_CUSTOM_STEERING_SET_CENTER        15u /* redefine current LEFT ABI position as logical POS180 */
 #define HB_CUSTOM_GET_ROTOR_SNAPSHOT          16u /* simultaneous VESC-standard rotor/position diagnostics */
+#define HB_CUSTOM_GET_ISR_PROFILE             17u /* read/reset cycle profiler; diagnostic only */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -81,10 +82,24 @@ extern volatile uint32_t foc_prof_sensor_max_cycles;
 extern volatile uint32_t foc_prof_current_max_cycles;
 extern volatile uint32_t foc_prof_regulator_max_cycles;
 extern volatile uint32_t foc_prof_svpwm_max_cycles;
+extern volatile uint32_t foc_isr_deadline_miss_count;
+extern volatile uint32_t foc_prof_pre_max_cycles;
+extern volatile uint32_t foc_prof_control_max_cycles;
+extern volatile uint32_t foc_prof_post_max_cycles;
+extern volatile uint32_t foc_isr_cycles_max;
 #else
 volatile uint32_t main_prof_vesc_max_cycles = 0u;
 volatile uint32_t main_prof_house_max_cycles = 0u;
 volatile uint32_t main_prof_tail_max_cycles = 0u;
+volatile uint32_t foc_prof_sensor_max_cycles = 0u;
+volatile uint32_t foc_prof_current_max_cycles = 0u;
+volatile uint32_t foc_prof_regulator_max_cycles = 0u;
+volatile uint32_t foc_prof_svpwm_max_cycles = 0u;
+volatile uint32_t foc_isr_deadline_miss_count = 0u;
+volatile uint32_t foc_prof_pre_max_cycles = 0u;
+volatile uint32_t foc_prof_control_max_cycles = 0u;
+volatile uint32_t foc_prof_post_max_cycles = 0u;
+volatile uint32_t foc_isr_cycles_max = 0u;
 #endif
 
 static volatile uint8_t s_rx_active = 0u;
@@ -885,7 +900,11 @@ static void setup_motion_values(bool second, const mc_values *values,
 
 /** Hitung odometer VESC dari offset SET_ODOMETER dan distance_abs Hall. */
 static uint32_t setup_odometer_m(bool second, float distance_abs_m) {
-    int64_t trip = (int64_t)(distance_abs_m >= 0.0f ? distance_abs_m : 0.0f);
+    /* Odometer packet berukuran uint32 meter; clamp sebelum cast agar tidak
+     * membutuhkan float->int64 helper pada Cortex-M3. */
+    float trip_f=distance_abs_m>=0.0f?distance_abs_m:0.0f;
+    uint32_t trip_u=trip_f>4294967040.0f?UINT32_MAX:(uint32_t)trip_f;
+    int64_t trip=(int64_t)trip_u;
     int64_t value = s_odometer_offset_m[second ? 1u : 0u] + trip;
     if (value < 0) value = 0;
     if (value > (int64_t)UINT32_MAX) value = (int64_t)UINT32_MAX;
@@ -1653,7 +1672,9 @@ static void mcpwm_foc_hall_detect_command_start(bool second, const uint8_t *data
     /* Upstream COMM_DETECT_HALL_FOC wrapper uses a temporary FOC setup, runs
      * mcpwm_foc_hall_detect(), then restores the complete previous MC config. */
     temp.motor_type=MOTOR_TYPE_FOC;
-    temp.foc_f_zv=10000.0f;
+    /* Timer F103 fixed 16 kHz; Hall detect tidak boleh membuat MC config
+     * sementara mengaku berjalan pada switching frequency lain. */
+    temp.foc_f_zv=(float)PWM_FREQ;
     temp.foc_current_kp=0.01f;
     temp.foc_current_ki=10.0f;
     mc_interface_set_configuration(&temp);
@@ -1813,7 +1834,7 @@ static bool measure_r_l_imax_f103_finish(uint8_t mi) {
     const float l=fabsf(b)*vscale*(float)FOC_CURRENT_Q4_PER_A*dt;
     if(!(l>=0.000005f && l<=0.020f)) return false;
 
-    float im=sqrtf((float)s_detect_all.max_power_loss/(r*1.5f));
+    float im=foc_sqrtf_slow((float)s_detect_all.max_power_loss/(r*1.5f));
     if(im<1.0f)im=1.0f;
     if(im>(float)I_MOT_MAX)im=(float)I_MOT_MAX;
     s_detect_all.r[mi]=(float)r;
@@ -1997,8 +2018,8 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         const float iq=mcpwm_foc_get_iq_motor(second);
         const float vd=mcpwm_foc_get_vd_motor(second);
         const float vq=mcpwm_foc_get_vq_motor(second);
-        s_detect_all.sum_i+=sqrtf(id*id+iq*iq);
-        s_detect_all.sum_v+=sqrtf(vd*vd+vq*vq);
+        s_detect_all.sum_i+=foc_sqrtf_slow(id*id+iq*iq);
+        s_detect_all.sum_v+=foc_sqrtf_slow(vd*vd+vq*vq);
         s_detect_all.sum_erpm+=fabsf(mcpwm_foc_get_erpm_motor(second));
         s_detect_all.sample_n++;
         if(elapsed>=800u && s_detect_all.sample_n>=40u){
@@ -2200,6 +2221,28 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,0,&j); /* inductance/detect signal: invalid unless bit6 is set */
         uart_send_payload(b,(uint16_t)j);
         return;
+    }
+    if (op == HB_CUSTOM_GET_ISR_PROFILE) {
+        if(n>=1u && d[0]!=0u)mcpwm_foc_reset_isr_profile();
+        mcpwm_foc_isr_profile_t p; mcpwm_foc_get_isr_profile(&p);
+        uint8_t b[192]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+#define APPP(v) buffer_append_uint32(b,(v),&j)
+        APPP(p.total_max_cycles); APPP(p.deadline_miss_count);
+        APPP(p.pre_max_cycles); APPP(p.control_max_cycles); APPP(p.post_max_cycles);
+        APPP(p.pre_fault_max_cycles); APPP(p.pre_offset_max_cycles); APPP(p.pre_protect_max_cycles);
+        APPP(p.motor_step_max_cycles[0]); APPP(p.motor_step_max_cycles[1]);
+        APPP(p.motor_control_max_cycles[0]); APPP(p.motor_control_max_cycles[1]);
+        APPP(p.motor_hold_max_cycles[0]); APPP(p.motor_hold_max_cycles[1]);
+        APPP(p.sensor_max_cycles); APPP(p.pll_max_cycles); APPP(p.current_max_cycles); APPP(p.regulator_max_cycles);
+        APPP(p.position_pid_max_cycles); APPP(p.speed_pid_max_cycles); APPP(p.current_circle_max_cycles);
+        APPP(p.id_pi_max_cycles); APPP(p.iq_pi_max_cycles); APPP(p.decouple_limit_max_cycles);
+        APPP(p.svpwm_max_cycles); APPP(p.duty_mag_max_cycles); APPP(p.overrun_total);
+        for(uint8_t si=0u;si<6u;++si)APPP(p.slot_max_cycles[si]);
+        for(uint8_t si=0u;si<6u;++si)APPP(p.slot_miss_count[si]);
+#undef APPP
+        uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
         if(second)return;
@@ -2664,7 +2707,20 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
     if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
-    if(!strcmp(a[0],"perf")){snprintf(o,sizeof(o),"isr=%lu/%lu overrun=%lu rx=%lu crc=%lu rxdrop=%lu txdrop=%lu gap=%lums\n",(unsigned long)mcpwm_foc_get_isr_cycles(),(unsigned long)mcpwm_foc_get_isr_cycles_max(),(unsigned long)m->m_overrun_count,(unsigned long)s_rx_ok,(unsigned long)s_rx_crc_err,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,(unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"perf")){
+        if(ac>1&&!strcmp(a[1],"reset")){
+            foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u;
+            foc_prof_pre_max_cycles=foc_prof_control_max_cycles=foc_prof_post_max_cycles=0u;
+            foc_prof_sensor_max_cycles=foc_prof_current_max_cycles=foc_prof_regulator_max_cycles=foc_prof_svpwm_max_cycles=0u;
+        }
+        snprintf(o,sizeof(o),"isr=%lu/%lu miss=%lu pre=%lu ctrl=%lu post=%lu sensor=%lu current=%lu reg=%lu svpwm=%lu overrun=%lu rxdrop=%lu txdrop=%lu gap=%lums\n",
+            (unsigned long)mcpwm_foc_get_isr_cycles(),(unsigned long)mcpwm_foc_get_isr_cycles_max(),
+            (unsigned long)foc_isr_deadline_miss_count,(unsigned long)foc_prof_pre_max_cycles,
+            (unsigned long)foc_prof_control_max_cycles,(unsigned long)foc_prof_post_max_cycles,
+            (unsigned long)foc_prof_sensor_max_cycles,(unsigned long)foc_prof_current_max_cycles,
+            (unsigned long)foc_prof_regulator_max_cycles,(unsigned long)foc_prof_svpwm_max_cycles,
+            (unsigned long)m->m_overrun_count,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,
+            (unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
 
     bool alias_enc=!strcmp(a[0],"foc_encoder_detect");
     if(!strcmp(a[0],"detect")||alias_enc){
@@ -2888,8 +2944,9 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
             float speed_unused = 0.0f, dist_unused = 0.0f, dist_abs = 0.0f;
             get_values_normalized(second, &ov);
             setup_motion_values(second, &ov, &speed_unused, &dist_unused, &dist_abs);
-            const int64_t trip = (int64_t)(dist_abs >= 0.0f ? dist_abs : 0.0f);
-            s_odometer_offset_m[second ? 1u : 0u] = (int64_t)requested - trip;
+            const float trip_f=dist_abs>=0.0f?dist_abs:0.0f;
+            const uint32_t trip_u=trip_f>4294967040.0f?UINT32_MAX:(uint32_t)trip_f;
+            s_odometer_offset_m[second ? 1u : 0u] = (int64_t)requested - (int64_t)trip_u;
         }
         break;
     case COMM_SET_APPCONF:

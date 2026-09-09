@@ -126,6 +126,52 @@ uint32_t foc_isqrt_u32(uint32_t x) {
     return y;
 }
 
+/* Akar float ringan untuk commissioning/detect non-ISR. Seed berasal dari
+ * eksponen IEEE-754 lalu empat Newton step. Tidak dipakai oleh ADC ISR; fungsi
+ * ini menggantikan sqrtf/libm yang mahal pada tiga slow-path VESC detect. */
+float foc_sqrtf_slow(float x) {
+    if (!(x > 0.0f)) return 0.0f;
+    union { float f; uint32_t u; } seed;
+    seed.f = x;
+    seed.u = (seed.u >> 1) + 0x1FC00000u;
+    float g = seed.f;
+    for (uint8_t k=0u;k<4u;++k) g = 0.5f * (g + x / g);
+    return g;
+}
+
+/* atan2 ringan untuk commissioning/diagnostik non-ISR. Pada octant 0..45 deg
+ * gunakan atan(r) ~= r*(pi/4 + 0.273*(1-r)); error teoritis sekitar 0,3 deg.
+ * Output memakai phase Q0.16 agar langsung kompatibel dengan phase FOC. */
+void foc_deadtime_sign_q15(int16_t alpha_q4, int16_t beta_q4, int32_t *sign_alpha_q15, int32_t *sign_beta_q15) {
+    /* Tanda phase-current yang sama dengan update_valpha_vbeta() VESC.
+     * Tidak perlu magnitude ampere: dead-time model hanya memakai SIGN(Ia/b/c).
+     * Proyeksi B/C memakai -0.5*alpha +/- sqrt(3)/2*beta dalam Q15. */
+    const int32_t a=(int32_t)alpha_q4;
+    const int32_t bproj=-a*16384+(int32_t)beta_q4*FOC_SQRT3_BY_2_Q15;
+    const int32_t cproj=-a*16384-(int32_t)beta_q4*FOC_SQRT3_BY_2_Q15;
+    const int32_t sa=(a>0)-(a<0);
+    const int32_t sb=(bproj>0)-(bproj<0);
+    const int32_t sc=(cproj>0)-(cproj<0);
+    if(sign_alpha_q15)*sign_alpha_q15=((2*sa-sb-sc)*32768)/3;
+    if(sign_beta_q15)*sign_beta_q15=(sb-sc)*FOC_INV_SQRT3_Q15;
+}
+
+uint16_t foc_atan2_phase_u16(int32_t y, int32_t x) {
+    if(x==0 && y==0)return 0u;
+    const uint32_t ax=(uint32_t)(x<0?-(int64_t)x:(int64_t)x);
+    const uint32_t ay=(uint32_t)(y<0?-(int64_t)y:(int64_t)y);
+    const uint32_t hi=ax>ay?ax:ay;
+    const uint32_t lo=ax>ay?ay:ax;
+    uint32_t r_q15=hi?((uint32_t)(((uint64_t)lo<<15)/hi)):0u;
+    if(r_q15>32768u)r_q15=32768u;
+    const uint32_t correction=(2847u*(32768u-r_q15))>>15;
+    const uint32_t base=(r_q15*(8192u+correction))>>15;
+    uint32_t phase=ax>=ay?base:(16384u-base);
+    if(x<0)phase=32768u-phase;
+    if(y<0)phase=(65536u-phase)&0xffffu;
+    return (uint16_t)phase;
+}
+
 void foc_vector_limit(foc_dq_t *v, int16_t max_mag) {
     uint32_t mag2=(uint32_t)((int32_t)v->d*v->d)+(uint32_t)((int32_t)v->q*v->q);
     uint32_t max2=(uint32_t)((int32_t)max_mag*max_mag);

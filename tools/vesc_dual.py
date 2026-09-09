@@ -11,11 +11,14 @@ polls selective mc_values telemetry from both motors.
 from __future__ import annotations
 import argparse
 import os
+import signal
 import socket
 import struct
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import serial
@@ -88,6 +91,95 @@ def _discover_f411_cdc() -> str:
     return "/dev/ttyACM0"
 
 
+def _proc_cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _parent_pid(pid: int) -> int:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().split()[3])
+    except Exception:
+        return 0
+
+
+def _cdc_holders(path: str) -> list[tuple[int, str]]:
+    real = os.path.realpath(path)
+    try:
+        r = subprocess.run(["fuser", real], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=1.0, check=False)
+    except Exception:
+        return []
+    out=[]
+    for tok in r.stdout.split():
+        if tok.isdigit():
+            pid=int(tok)
+            if pid != os.getpid():
+                out.append((pid, _proc_cmdline(pid)))
+    return out
+
+
+def _reclaim_official_f411_holder(path: str) -> list[int]:
+    """Release only our stmf4_hmi_bridge, never an arbitrary tty owner.
+
+    The ros2 launch ancestor is SIGSTOP-ed first so respawn cannot race an
+    exclusive direct-CDC maintenance session. The caller must SIGCONT returned
+    PIDs after closing the CDC.
+    """
+    holders=_cdc_holders(path)
+    if not holders:
+        return []
+    official=[x for x in holders if "stmf4_hmi_bridge" in x[1]]
+    unknown=[x for x in holders if x not in official]
+    if unknown:
+        raise RuntimeError("F411 CDC busy by unknown process(es): " +
+                           ", ".join(f"{pid}:{cmd[:80]}" for pid,cmd in unknown))
+    suspended=[]
+    for child,_ in official:
+        pid=_parent_pid(child)
+        while pid>1:
+            cmd=_proc_cmdline(pid)
+            if "ros2 launch " in cmd or ("/opt/ros/" in cmd and " launch " in cmd):
+                if pid not in suspended:
+                    os.kill(pid, signal.SIGSTOP); suspended.append(pid)
+                    print(f"[VESC-AUTO] paused ROS launch pid={pid} for direct F411 fallback", flush=True)
+                break
+            pid=_parent_pid(pid)
+    pids=[pid for pid,_ in official]
+    for pid in pids:
+        try: os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+    deadline=time.monotonic()+4.0
+    while time.monotonic()<deadline:
+        if not any(pid in [p for p,_ in _cdc_holders(path)] for pid in pids):
+            return suspended
+        time.sleep(.10)
+    for pid in pids:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+    deadline=time.monotonic()+1.0
+    while time.monotonic()<deadline:
+        if not _cdc_holders(path):
+            return suspended
+        time.sleep(.05)
+    for pid in suspended:
+        try: os.kill(pid, signal.SIGCONT)
+        except ProcessLookupError: pass
+    raise RuntimeError("F411 CDC could not be released for direct fallback")
+
+
+def _resume_pids(pids: list[int]) -> None:
+    for pid in reversed(pids):
+        try:
+            os.kill(pid, signal.SIGCONT)
+            print(f"[VESC-AUTO] resumed ROS launch pid={pid}", flush=True)
+        except ProcessLookupError:
+            pass
+
+
+
 class TcpSerialTransport:
     """Small pyserial-compatible adapter for the ROS maintenance TCP bridge."""
     def __init__(self, endpoint: str, timeout: float = 0.01):
@@ -153,24 +245,35 @@ class TcpSerialTransport:
 
 class F411DirectTransport:
     """VESC byte stream tunneled directly over the BlackPill F411 USB CDC gateway."""
-    def __init__(self, path: str | None = None, timeout: float = 0.01):
+    def __init__(self, path: str | None = None, timeout: float = 0.01, reclaim: bool = False):
         if serial is None:
             raise RuntimeError("pyserial required for direct F411 USB mode")
         self.path = path or _discover_f411_cdc()
         self.timeout = max(0.0, float(timeout))
+        self._suspended_launch_pids = _reclaim_official_f411_holder(self.path) if reclaim else []
         # Poll USB CDC at 1 ms. With the F411/F103 UART fixed at 115200 baud the round-trip is normally
         # sub-millisecond to a few milliseconds; a 10-ms tty read timeout turns
         # an otherwise healthy request into artificial 10-ms latency whenever
         # the reply is not already queued at the first read.
-        self.ser = serial.Serial(
-            self.path, 1000000, timeout=0.001, write_timeout=2.0, exclusive=True)
-        self.linebuf = bytearray()
-        self.rawbuf = bytearray()
-        self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
-        self.ser.write(b"\n"); self.ser.flush(); time.sleep(0.03); self.ser.reset_input_buffer()
-        self._command("VESC:MODE:MAINTENANCE", "VESC:MODE:MAINTENANCE", 3.0)
-        self._command("VESC:STATUS", "mode=MAINTENANCE", 2.0)
-        time.sleep(0.30)
+        try:
+            self.ser = serial.Serial(
+                self.path, 1000000, timeout=0.001, write_timeout=2.0, exclusive=True)
+            self.linebuf = bytearray()
+            self.rawbuf = bytearray()
+            self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
+            self.ser.write(b"\n"); self.ser.flush(); time.sleep(0.03); self.ser.reset_input_buffer()
+            self._command("VESC:MODE:MAINTENANCE", "VESC:MODE:MAINTENANCE", 3.0)
+            self._command("VESC:STATUS", "mode=MAINTENANCE", 2.0)
+            time.sleep(0.30)
+        except Exception:
+            try:
+                if hasattr(self, "ser") and self.ser is not None:
+                    self.ser.close()
+            except Exception:
+                pass
+            _resume_pids(self._suspended_launch_pids)
+            self._suspended_launch_pids=[]
+            raise
 
     def _consume_line(self, line: str) -> None:
         if line.startswith("VESC:ERR:"):
@@ -257,10 +360,14 @@ class F411DirectTransport:
 
     def close(self) -> None:
         try:
-            self._command("VESC:MODE:RUNTIME", "VESC:MODE:RUNTIME", 1.5)
-        except Exception:
-            pass
-        self.ser.close()
+            try:
+                self._command("VESC:MODE:RUNTIME", "VESC:MODE:RUNTIME", 1.5)
+            except Exception:
+                pass
+            self.ser.close()
+        finally:
+            _resume_pids(self._suspended_launch_pids)
+            self._suspended_launch_pids=[]
 
 
 def open_transport(port: str, baud: int = 115200, timeout: float = 0.01):
@@ -274,10 +381,25 @@ def open_transport(port: str, baud: int = 115200, timeout: float = 0.01):
     target = (port or "auto").strip()
     if target == "auto":
         endpoint = os.environ.get("VESC_PYTHON_MAINTENANCE", "tcp://127.0.0.1:65101")
-        try:
-            return TcpSerialTransport(endpoint, timeout=timeout)
-        except OSError:
-            return F411DirectTransport(_discover_f411_cdc(), timeout=timeout)
+        # Bila ROS/F411 sedang aktif, localhost:65101 adalah authority tertinggi
+        # dan harus dipakai tanpa merebut /dev/ttyACM0. Probe maksimal 5 detik;
+        # hanya bila route itu benar-benar tidak ada, fallback ke CDC F411.
+        wait_s=min(5.0,max(0.0,float(os.environ.get("VESC_TCP_WAIT_SEC","5.0"))))
+        deadline=time.monotonic()+wait_s; last=None; attempts=0
+        while True:
+            attempts += 1
+            try:
+                tr=TcpSerialTransport(endpoint, timeout=timeout)
+                print(f"[VESC-AUTO] TCP maintenance {tr.endpoint} selected after {attempts} probe(s)", flush=True)
+                return tr
+            except OSError as exc:
+                last=exc
+                if time.monotonic()>=deadline:
+                    break
+                time.sleep(min(.20,max(0.0,deadline-time.monotonic())))
+        cdc=_discover_f411_cdc()
+        print(f"[VESC-AUTO] TCP unavailable within {wait_s:.1f}s ({last}); direct F411 CDC fallback {cdc}", flush=True)
+        return F411DirectTransport(cdc, timeout=timeout, reclaim=True)
     if target in {"maintenance", "ros", "python-maintenance"} or target.startswith("tcp://"):
         return TcpSerialTransport(target, timeout=timeout)
     if target in {"direct", "usb", "f411", "direct-usb"}:
@@ -303,6 +425,7 @@ HB_SET_STEERING_DEG = 9
 HB_GET_STEERING_CAL = 10
 HB_STEERING_HOME = 13
 HB_ENCODER_DEBUG = 14
+HB_GET_ISR_PROFILE = 17
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -550,6 +673,16 @@ class Diag:
     process_gap_max_ms: int | None = None
     usart3_rx_errors: int | None = None
     usart3_rx_restarts: int | None = None
+    isr_count: int | None = None
+    position_no_motion_ticks: int | None = None
+    position_breakaway_ticks: int | None = None
+    position_last_motion_count: int | None = None
+    position_error_counts: int | None = None
+    prof_sensor_max_cycles: int | None = None
+    prof_current_max_cycles: int | None = None
+    prof_regulator_max_cycles: int | None = None
+    prof_svpwm_max_cycles: int | None = None
+    profiler_overrun_total: int | None = None
 
     def short(self) -> str:
         return (
@@ -643,8 +776,17 @@ def parse_diag(payload: bytes) -> Diag:
         rxhi, gapmax = struct.unpack_from(">2I", payload, 197)
         ext.update(rx_queue_highwater=rxhi, process_gap_max_ms=gapmax)
     if len(payload) >= 217:
-        _main_vesc, uart_err, uart_restart = struct.unpack_from(">3I", payload, 205)
-        ext.update(usart3_rx_errors=uart_err, usart3_rx_restarts=uart_restart)
+        isr_count, uart_err, uart_restart = struct.unpack_from(">3I", payload, 205)
+        ext.update(isr_count=isr_count, usart3_rx_errors=uart_err, usart3_rx_restarts=uart_restart)
+    if len(payload) >= 253:
+        no_motion, breakaway = struct.unpack_from(">2I", payload, 217)
+        last_motion, pos_error = struct.unpack_from(">2i", payload, 225)
+        ps, pc, pr, pv, po = struct.unpack_from(">5I", payload, 233)
+        ext.update(position_no_motion_ticks=no_motion, position_breakaway_ticks=breakaway,
+                   position_last_motion_count=last_motion, position_error_counts=pos_error,
+                   prof_sensor_max_cycles=ps, prof_current_max_cycles=pc,
+                   prof_regulator_max_cycles=pr, prof_svpwm_max_cycles=pv,
+                   profiler_overrun_total=po)
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok), link_armed=bool(link_armed),
@@ -1174,6 +1316,22 @@ class VescDual:
                 "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
                 "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
                 "span":span,"position":pos,"target":target,"pid_target":pid_target}
+
+    def isr_profile(self, reset: bool = False) -> dict[str, int]:
+        names=(
+            "total_max","deadline_miss","pre_max","control_max","post_max",
+            "pre_fault","pre_offset","pre_protect","left_step","right_step",
+            "left_control","right_control","left_hold","right_hold",
+            "sensor","pll","current","regulator","position_pid","speed_pid",
+            "current_circle","id_pi","iq_pi","decouple_limit","svpwm","duty_mag","overrun",
+            "slot0_max","slot1_max","slot2_max","slot3_max","slot4_max","slot5_max",
+            "slot0_miss","slot1_miss","slot2_miss","slot3_miss","slot4_miss","slot5_miss")
+        p=self.custom_transact(HB_GET_ISR_PROFILE,bytes((1 if reset else 0,)),right=False,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_ISR_PROFILE)
+        if status or len(p)!=6+4*len(names):
+            raise RuntimeError(f"isr_profile status={status} len={len(p)}")
+        vals=struct.unpack_from(">"+"I"*len(names),p,6)
+        return dict(zip(names,vals))
 
     def set_steering_deg(self, deg: float):
         """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""

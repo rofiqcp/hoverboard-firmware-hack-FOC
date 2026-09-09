@@ -36,6 +36,13 @@ void filtLowPass32(int16_t u, uint16_t coef, int32_t *y) {
 }
 
 static int fail(const char *s){fprintf(stderr,"FAIL %s\n",s);return 1;}
+static uint32_t legacy_ms=1u;
+static uint32_t sim_pwm_frames=0u;
+static void legacy_sync(void){mcpwm_foc_housekeeping_non_isr(legacy_ms);legacy_ms+=5u;}
+static void sim_isr_step(void){
+    mcpwm_foc_adc_int_handler();
+    if(++sim_pwm_frames>=80u){sim_pwm_frames=0u;legacy_sync();}
+}
 static void set_hall(GPIO_TypeDef *port,uint16_t pu,uint16_t pv,uint16_t pw,uint8_t h){
     port->IDR|=(uint32_t)(pu|pv|pw);
     if(h&4u)port->IDR&=~(uint32_t)pu;
@@ -58,11 +65,13 @@ static void use_legacy_hall_fixture(void){
 
 int main(void){
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    legacy_sync();
 
     /* MODE 1 follows VESC FOC duty architecture: duty limits modulation while
      * the inner current PI remains active. It must never bypass l_current_max. */
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
-    mcpwm_foc_adc_int_handler(); mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step(); sim_isr_step();
     if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 left current-limit target");
     if(m_motor_2.m_iq_target_q4!=-MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 right current-limit target");
     if(abs(m_motor_1.m_vq)>1440 || abs(m_motor_2.m_vq)>1440)return fail("mode1 10pct modulation ceiling");
@@ -70,7 +79,7 @@ int main(void){
     mc_configuration duty_conf=m_motor_1.m_conf; duty_conf.l_current_max=2.0f; duty_conf.l_current_min=-2.0f;
     mcpwm_foc_set_configuration(&duty_conf,false);
     mcpwm_foc_set_duty(0.20f,false);
-    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)mcpwm_foc_adc_int_handler();
+    for(unsigned i=0;i<MCCONF_FOC_CONTROL_DIV;i++)sim_isr_step();
     if(abs(m_motor_1.m_iq_target_q4)>1600)return fail("mode1 must honor 2A mcconf current limit");
     if(abs(m_motor_1.m_vq)>2880)return fail("mode1 20pct modulation ceiling");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);
@@ -81,6 +90,7 @@ int main(void){
      * retaining the 15 A current authority that was accidentally left at 1 A
      * during bench-safe tests. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    legacy_sync();
     mc_configuration duty15=m_motor_1.m_conf;
     duty15.l_current_max=15.0f; duty15.l_current_min=-15.0f;
     duty15.l_in_current_max=15.0f; duty15.l_in_current_min=-15.0f;
@@ -89,7 +99,7 @@ int main(void){
     mcpwm_foc_set_duty(1.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
-    for(int i=0;i<180;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<180;i++)sim_isr_step();
     if(m_motor_1.m_duty_set_permille!=1000)return fail("15A duty command must reach normalized 1.0 target");
     if(m_motor_1.m_current_limit_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production duty current authority must be 15A");
     if(m_motor_1.m_input_current_max_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production input current limit must be 15A");
@@ -99,12 +109,14 @@ int main(void){
     /* Verify free-run is electrical high impedance, not merely Vq=0: after the
      * control mode is released the corresponding timer MOE must turn off. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
+    legacy_sync();
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2004;i++)DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR & TIM_BDTR_MOE)==0u || (RIGHT_TIM->BDTR & TIM_BDTR_MOE)==0u)
         return fail("mode1 RUN must enable both bridges");
     pwml=0; pwmr=0; motorRunReq=0u;
+    legacy_sync();
     DMA1_Channel1_IRQHandler();
     DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR & TIM_BDTR_MOE)!=0u || (RIGHT_TIM->BDTR & TIM_BDTR_MOE)!=0u)
@@ -113,23 +125,27 @@ int main(void){
     /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
      * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    legacy_sync();
     ctrlModReq=SPD_MODE; pwml=50; pwmr=-50;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=50)return fail("mode2 target must be 50 mechanical RPM");
     if(m_motor_1.m_speed_set_rpm!=0)return fail("mode2 active speed must start ramped from measured speed");
     if(m_motor_1.m_iq_set_q4!=0)return fail("mode2 must not create Iq reference");
-    for(int i=0;i<8500;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<8500;i++)sim_isr_step();
     if(m_motor_1.m_speed_set_rpm!=50)return fail("mode2 speed ramp must reach 50 RPM");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 must remain speed control while running");
 
     /* Other speed commands use the same physical mechanical-RPM scale and the
      * same ramp. Check 100 RPM and a direction reversal to -50 RPM. */
     pwml=100; pwmr=-100;
-    for(int i=0;i<8500;i++)mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    for(int i=0;i<8500;i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=100 || m_motor_1.m_speed_set_rpm!=100)
         return fail("mode2 100 RPM scaling/ramp");
     pwml=-50; pwmr=50;
-    for(int i=0;i<25000;i++)mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    for(int i=0;i<25000;i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=-50 || m_motor_1.m_speed_set_rpm!=-50)
         return fail("mode2 reverse -50 RPM ramp");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 reverse must stay speed mode");
@@ -137,13 +153,14 @@ int main(void){
     /* STOP: target becomes zero, active setpoint ramps down gradually. It must
      * NOT release on the first zero command. Stop Vq is gently limited. */
     pwml=0; pwmr=0;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=0)return fail("mode2 STOP target zero");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must ramp before release");
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
-    for(int i=0;i<3500;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<3500;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
-    for(int i=0;i<5000;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<5000;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain VESC speed zero-vector");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_integrator!=0 || m_motor_1.m_id_integrator!=0)
         return fail("mode2 zero-vector must reset PI integrators");
@@ -158,13 +175,13 @@ int main(void){
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC speed mode entry");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
+    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
     if(m_motor_1.m_speed_set_rpm!=50)return fail("VESC speed ramp reach target");
     mcpwm_foc_set_pid_speed(0.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); mcpwm_foc_adc_int_handler(); }
+    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_vq!=0)return fail("VESC zero ERPM zero-vector");
     mcpwm_foc_set_pid_speed(200.0f,false);
     mcpwm_foc_vesc_override_touch(false);
@@ -192,14 +209,18 @@ int main(void){
 
     /* MODE 3 scaling remains exact: 50 cA = 0.50 A, 1500 cA = 15 A. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    legacy_sync();
     ctrlModReq=TRQ_MODE; pwml=1500; pwmr=-1500;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_iq_target_q4!=12000)return fail("TRQ 1500cA = 15A scaling");
     if(m_motor_2.m_iq_target_q4!=-12000)return fail("TRQ right 15A internal mirror scaling");
 
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    legacy_sync();
     ctrlModReq=TRQ_MODE; pwml=50; pwmr=-50;
-    for(int i=0;i<1000;i++)mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    for(int i=0;i<1000;i++)sim_isr_step();
     if(m_motor_1.m_iq_target_q4!=400)return fail("TRQ 50cA target scaling");
     if(m_motor_1.m_iq_set_q4!=400)return fail("TRQ slew must reach 0.50A");
     if(m_motor_1.m_id_set_q4!=0)return fail("TRQ Id must remain zero");
@@ -208,28 +229,32 @@ int main(void){
     /* MODE 3 STOP: no current-brake state. Ramp Iq reference to zero and then
      * release/high-impedance so the wheel keeps free-running. */
     motorRunReq=0u; pwml=0; pwmr=0;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_control_mode==CONTROL_MODE_CURRENT_BRAKE)return fail("TRQ STOP must not brake");
     if(m_motor_1.m_iq_target_q4!=0)return fail("TRQ STOP target must be zero");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT)return fail("TRQ STOP must slew current before release");
-    for(int i=0;i<1200;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<1200;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("TRQ STOP must release after Iq ramp");
     if(m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_iq_target_q4!=0)return fail("TRQ release current state");
-    for(int i=0;i<20;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<20;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("TRQ STOP must stay released");
 
     /* MODE 4 unchanged: sensorless Id current, Iq=0, 2 -> 2 A and 6 A safety clamp. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    legacy_sync();
     ctrlModReq=SVPWM_MODE; pwml=2; pwmr=-2;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_id_set_q4>=1600)return fail("mode4 Id must slew, not step");
-    for(uint32_t i=0u;i<((uint32_t)PWM_FREQ*SVPWM_ALIGN_MS/1000u)+32u;i++)mcpwm_foc_adc_int_handler();
+    for(uint32_t i=0u;i<((uint32_t)PWM_FREQ*SVPWM_ALIGN_MS/1000u)+32u;i++)sim_isr_step();
     if(m_motor_1.m_openloop_id_target_q4!=1600)return fail("mode4 2A target");
     if(m_motor_1.m_id_set_q4!=1600)return fail("mode4 Id ramp reaches 2A");
     if(m_motor_1.m_iq_set_q4!=0)return fail("mode4 Iq target zero");
     if(m_motor_1.m_phase!=m_motor_1.m_phase_openloop)return fail("mode4 synthetic phase offset");
     ctrlModReq=SVPWM_MODE; pwml=10; pwmr=-10;
-    mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    sim_isr_step();
     if(m_motor_1.m_openloop_id_target_q4!=SVPWM_MAX_ID_A*FOC_CURRENT_Q4_PER_A)return fail("mode4 Id safety clamp");
 
     /* Standard VESC open-loop APIs are distinct from the legacy SVPWM utility:
@@ -241,7 +266,7 @@ int main(void){
     if(m_motor_1.m_control_mode!=CONTROL_MODE_OPENLOOP ||
        m_motor_1.m_iq_target_q4!=FOC_CURRENT_Q4_PER_A || m_motor_1.m_id_set_q4!=0 ||
        m_motor_1.m_openloop_speed_q16!=(600<<16)) return fail("VESC openloop current set semantics");
-    for(int i=0;i<160;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<160;i++)sim_isr_step();
     if(m_motor_1.m_phase_openloop<6500u || m_motor_1.m_phase_openloop>6610u)
         return fail("VESC openloop electrical RPM integration");
     if(m_motor_1.m_iq_set_q4!=FOC_CURRENT_Q4_PER_A || m_motor_1.m_id_set_q4!=0)
@@ -255,12 +280,13 @@ int main(void){
     /* RIGHT Hall direction regression. Honor the configured VESC Hall majority
      * filter before applying the edge debounce assertion. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; ctrlModReq=VLT_MODE; pwml=1;pwmr=-1;set_halls(3u,3u);
+    legacy_sync();
     if(!m_motor_2.m_conf.m_invert_direction)return fail("right default direction mirror config");
-    for(int i=0;i<100;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<100;i++)sim_isr_step();
     set_halls(2u,2u);
-    for(uint16_t i=0u;i<(uint16_t)m_motor_2.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;i++)mcpwm_foc_adc_int_handler();
+    for(uint16_t i=0u;i<(uint16_t)m_motor_2.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;i++)sim_isr_step();
     if(m_motor_2.m_hall_direction!=-1)return fail("right reverse Hall direction");
-    for(uint32_t i=0u;i<MCCONF_HALL_TIMEOUT_TICKS+100u;i++)mcpwm_foc_adc_int_handler();
+    for(uint32_t i=0u;i<MCCONF_HALL_TIMEOUT_TICKS+100u;i++)sim_isr_step();
     if(m_motor_2.m_hall_interp_active!=0u)return fail("Hall interpolation low-speed disable");
 
     /* V13 runtime tunables start from the proven V12 fixed-point values. */
@@ -279,6 +305,7 @@ int main(void){
      * Q4 units with A2BIT_CONV=50. Closed-loop current must also be allowed to
      * use the configured full-safe EFeru modulation rather than the historical 80% cap. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    legacy_sync();
     mc_configuration oneamp=m_motor_1.m_conf;
     oneamp.l_current_max=1.0f; oneamp.l_current_min=-1.0f; oneamp.l_max_duty=1.0f;
     oneamp.foc_current_filter_const=0.10f;
@@ -294,7 +321,7 @@ int main(void){
         return fail("SET_CURRENT must use command directly, never OFF measured Iq");
     if(m_motor_1.m_iq_target_q4!=FOC_CURRENT_Q4_PER_A)return fail("VESC SET_CURRENT 1A exact Q4 scaling");
     curL_phaA=curL_phaB=curL_DC=0;
-    for(int i=0;i<18000;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<18000;i++)sim_isr_step();
     if(abs(m_motor_1.m_vq)<=((MCCONF_FOC_VOLTAGE_MAX*8)/10))return fail("1A current PI still hard-capped at 80pct modulation");
     if(abs(m_motor_1.m_vq)>MCCONF_FOC_DUTY_VOLTAGE_MAX)return fail("1A current PI exceeds EFeru full-safe modulation");
 
@@ -302,6 +329,7 @@ int main(void){
      * counts and the driven polarity is offset-ADC. Prove the real DMA/ISR path,
      * not only conversion helpers: LEFT uses rlA/rlB/dcl and RIGHT rrB/rrC/dcr. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    legacy_sync();
     adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
@@ -309,6 +337,9 @@ int main(void){
     mcpwm_foc_set_current(0.10f,false); mcpwm_foc_vesc_override_touch(false);
     mcpwm_foc_set_current(0.10f,true);  mcpwm_foc_vesc_override_touch(true);
     for(int i=0;i<100;i++)DMA1_Channel1_IRQHandler();
+    /* Powered baseline completes in ISR accumulation, then mean/validity is
+     * finalized by the 5-ms housekeeping while both bridges remain zero-vector. */
+    legacy_sync();
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u || (RIGHT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("current-scale bridge setup");
     if(m_motor_1.m_bridge_settle_ticks!=0u || m_motor_2.m_bridge_settle_ticks!=0u)return fail("current-scale bridge settle");
     adc_buffer.rlA=1950; adc_buffer.rlB=2050; adc_buffer.dcl=1950;
@@ -323,6 +354,7 @@ int main(void){
      * dipelajari terpisah dari offset kontrol, dan perubahan ADC saat idle harus
      * muncul di Id/Iq/Ibattery tanpa pernah mengaktifkan PWM/proteksi arus. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    legacy_sync();
     mc_configuration telem=m_motor_1.m_conf; telem.foc_current_filter_const=0.10f;
     mcpwm_foc_set_configuration(&telem,false);
     adc_buffer.rlA=1977; adc_buffer.rlB=1994; adc_buffer.dcl=1925;
@@ -332,6 +364,7 @@ int main(void){
     /* Learn the actual high-Z amplifier zero after startup. */
     adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
     for(int i=0;i<(int)MCCONF_OFF_TELEM_SETTLE_SAMPLES+300;i++)DMA1_Channel1_IRQHandler();
+    legacy_sync(); /* telemetry LPF/average sekarang non-ISR */
     if(!m_motor_1.m_off_offset_valid)return fail("OFF telemetry offset did not calibrate");
     mc_values off0; mcpwm_foc_get_values(&off0,false);
     if(fabsf(off0.current_in)>0.05f || fabsf(off0.id)+fabsf(off0.iq)>0.10f)return fail("OFF baseline not near zero");
@@ -340,6 +373,7 @@ int main(void){
     m_motor_1.m_hall_direction=1; m_motor_1.m_hall_ticks=0u; m_motor_1.m_rpm=1;
     adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
     for(int i=0;i<120;i++)DMA1_Channel1_IRQHandler();
+    legacy_sync(); /* ambil snapshot sensor OFF ke telemetry slow-path */
     mc_values offv; mcpwm_foc_get_values(&offv,false);
     if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_vd!=0 || m_motor_1.m_vq!=0)return fail("undriven telemetry must keep bridge/control off");
     if(fabsf(offv.current_in)<0.01f)return fail("OFF live Ibattery telemetry missing");
@@ -353,13 +387,14 @@ int main(void){
      * would request about 0.24 A with a 1 A motor-current limit, but the
      * hardware-safe position-output cap must clamp that request deterministically. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
+    legacy_sync();
     mc_configuration pos1=m_motor_1.m_conf; pos1.l_current_max=1.0f; pos1.l_current_min=-1.0f;
     pos1.p_pid_kp=0.060f; pos1.p_pid_ki=0.0f; pos1.p_pid_kd=0.0f; pos1.p_pid_kd_filter=0.20f;
     mcpwm_foc_set_configuration(&pos1,false);
     mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
     mcpwm_foc_set_position_counts(1,false); mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
-    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    for(int i=0;i<6;i++)sim_isr_step();
     {
         const int32_t mdeg_per_count=360000/(6*(int32_t)MCCONF_POLE_PAIRS_LEFT);
         const int32_t p_q15=(int32_t)(((int64_t)mdeg_per_count*60*32768LL)/1000000LL);
@@ -389,8 +424,10 @@ int main(void){
      * 90 counts/revolution (4 mechanical degrees/count). User-facing positive
      * targets are mirrored internally for motor 2. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
+    legacy_sync();
     ctrlModReq=5u; positionCommandL=10; positionCommandR=10; pwml=0; pwmr=0;
-    for(int i=0;i<120;i++)mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    for(int i=0;i<120;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_POS || m_motor_2.m_control_mode!=CONTROL_MODE_POS)return fail("mode5 position control entry");
     if(m_motor_1.m_position_target_counts!=10 || m_motor_2.m_position_target_counts!=-10)return fail("mode5 right user sign normalization");
     if(m_motor_1.m_iq_target_q4<=0 || m_motor_2.m_iq_target_q4>=0)return fail("position PID must command signed Iq");
@@ -410,12 +447,14 @@ int main(void){
      * aliases the project's long-range count coordinate. Its normalized PID
      * output scales to the configured motor-current envelope exactly upstream. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
-    for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+    legacy_sync();
+    for(int i=0;i<6;i++)sim_isr_step();
     {
         const float now=mcpwm_foc_get_phase_motor(false);
         float target=now+60.0f; if(target>=360.0f)target-=360.0f;
         mcpwm_foc_set_pid_pos(target,false); mcpwm_foc_vesc_override_touch(false);
-        for(int i=0;i<12;i++)mcpwm_foc_adc_int_handler();
+        /* POSITION outer PID is serviced outside the ADC ISR at 200 Hz. */
+        for(int i=0;i<80;i++)sim_isr_step();
         if(!m_motor_1.m_pos_pid_phase_mode || m_motor_1.m_control_mode!=CONTROL_MODE_POS)return fail("VESC position Hall phase mode");
         if(m_motor_1.m_iq_target_q4<=0)return fail("VESC position positive phase error must request positive Iq");
         { const int32_t abs_iq=m_motor_1.m_iq_target_q4<0?-m_motor_1.m_iq_target_q4:m_motor_1.m_iq_target_q4;
@@ -425,7 +464,7 @@ int main(void){
               return fail("VESC position configured current envelope");
           if(abs_iq<=count_cap)return fail("standard VESC position must not use custom count cap"); }
         mcpwm_foc_set_pid_pos(mcpwm_foc_get_phase_motor(false),false);
-        for(int i=0;i<6;i++)mcpwm_foc_adc_int_handler();
+        for(int i=0;i<80;i++)sim_isr_step();
         if(m_motor_1.m_iq_target_q4!=0)return fail("VESC position zero error must produce zero torque");
     }
     mcpwm_foc_release_motor(false);
@@ -515,13 +554,13 @@ int main(void){
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         mcpwm_foc_set_board_temperature_x10(250);
-        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)sim_isr_step();
         if(m_motor_1.m_iq_set_q4>5*FOC_CURRENT_Q4_PER_A+4)return fail("VESC watt max 100W @40V mod_q0.5");
         m_motor_1.m_vq=MCCONF_FOC_VOLTAGE_MAX/2; /* positive voltage, negative Iq = regen */
         m_motor_1.m_iq_target_q4=-10*FOC_CURRENT_Q4_PER_A;
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
-        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)sim_isr_step();
         if(m_motor_1.m_iq_set_q4<-(4*FOC_CURRENT_Q4_PER_A+4))return fail("VESC watt min -80W @40V mod_q0.5");
 
         /* Pada 62,5 C (tengah 60..65 C) batas arus harus sekitar 50%. */
@@ -530,28 +569,35 @@ int main(void){
         m_motor_1.m_iq_set_q4=m_motor_1.m_iq_target_q4;
         m_motor_1.m_iq_set_ramp_q16=(int32_t)m_motor_1.m_iq_set_q4<<16;
         mcpwm_foc_set_board_temperature_x10(625);
-        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)mcpwm_foc_adc_int_handler();
+        for(uint32_t wi=0u;wi<MCCONF_FOC_CONTROL_DIV;wi++)sim_isr_step();
         if(m_motor_1.m_iq_set_q4>7500*FOC_CURRENT_Q4_PER_A/1000+8)return fail("VESC FET temperature current derating");
 
-        /* Fault temperatur menggunakan jalur DMA safety yang sama dengan board. */
+        /* Temperatur dan Vin adalah slow-health checks seperti timeout thread VESC;
+         * current/DC trip tetap berada di DMA. Startup ADC 2000 frame harus selesai
+         * sebelum health fault boleh aktif. */
         adc_buffer.rlA=adc_buffer.rlB=adc_buffer.rrB=adc_buffer.rrC=2000;
-        adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=(uint16_t)batVoltage;
+        adc_buffer.dcl=adc_buffer.dcr=2000;
+        adc_buffer.batt1=(uint16_t)(((uint32_t)m_motor_1.m_vin_min_adc+(uint32_t)m_motor_1.m_vin_max_adc)/2u);
         for(int i=0;i<2001;i++)DMA1_Channel1_IRQHandler();
+        /* Battery LPF starts from compiled nominal voltage. Settle it to the
+         * fixture midpoint before testing an unrelated temperature fault. */
+        for(int i=0;i<250;i++)legacy_sync();
         m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u;
+        m_motor_1.m_wrong_voltage_integrator=0u;
         mcpwm_foc_set_board_temperature_x10(650);
-        DMA1_Channel1_IRQHandler();
+        legacy_sync();
         if(m_motor_1.m_fault!=FAULT_CODE_OVER_TEMP_FET)return fail("VESC FET over-temperature fault");
 
-        /* Setelah recovery, Vin di bawah/atas konfigurasi harus memicu fault
-         * tanpa mematikan jalur telemetry. Integrator memakai ADC raw. */
+        /* Vin fault memakai battery LPF slow-path. Tahan ADC pada kondisi fault
+         * sampai filter + qualification melampaui threshold. */
         mcpwm_foc_set_board_temperature_x10(250);
         m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u; m_motor_1.m_wrong_voltage_integrator=0u;
-        batVoltage=(int16_t)(m_motor_1.m_vin_min_adc-120u);
-        for(int i=0;i<32 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)DMA1_Channel1_IRQHandler();
+        adc_buffer.batt1=(uint16_t)(m_motor_1.m_vin_min_adc>120u?m_motor_1.m_vin_min_adc-120u:0u);
+        for(int i=0;i<400 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)legacy_sync();
         if(m_motor_1.m_fault!=FAULT_CODE_UNDER_VOLTAGE)return fail("VESC under-voltage fault");
         m_motor_1.m_fault=FAULT_CODE_NONE; m_motor_1.m_fault_recovery_ticks=0u; m_motor_1.m_wrong_voltage_integrator=0u;
-        batVoltage=(int16_t)(m_motor_1.m_vin_max_adc+120u);
-        for(int i=0;i<32 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)DMA1_Channel1_IRQHandler();
+        adc_buffer.batt1=(uint16_t)(m_motor_1.m_vin_max_adc+120u);
+        for(int i=0;i<400 && m_motor_1.m_fault==FAULT_CODE_NONE;i++)legacy_sync();
         if(m_motor_1.m_fault!=FAULT_CODE_OVER_VOLTAGE)return fail("VESC over-voltage fault");
     }
 

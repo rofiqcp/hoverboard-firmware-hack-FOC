@@ -107,9 +107,9 @@ int main(void){
     cr.p_pid_kd_proc=0.0023456f; cr.p_pid_gain_dec_angle=45.6f;
     cr.si_motor_poles=14u; cr.si_gear_ratio=1.0f; cr.foc_current_filter_const=0.2197f; cr.foc_hall_interp_erpm=900.0f; cr.m_hall_extra_samples=2;
     cr.foc_motor_r=0.220456f; cr.foc_motor_l=0.00042156f; cr.foc_motor_ld_lq_diff=-0.0000098f; cr.foc_motor_flux_linkage=0.020876f;
-    cl.foc_pll_kp=2100.125f; cl.foc_pll_ki=31000.5f;
+    cl.foc_pll_kp=2100.125f; cl.foc_pll_ki=31000.5f; cl.foc_dt_us=0.1234f;
     cl.s_pid_speed_source=S_PID_SPEED_SRC_PLL; cl.foc_cc_decoupling=FOC_CC_DECOUPLING_CROSS_BEMF;
-    cr.foc_pll_kp=1800.25f; cr.foc_pll_ki=28000.75f;
+    cr.foc_pll_kp=1800.25f; cr.foc_pll_ki=28000.75f; cr.foc_dt_us=0.4564f;
     cr.s_pid_speed_source=S_PID_SPEED_SRC_FAST; cr.foc_cc_decoupling=FOC_CC_DECOUPLING_BEMF;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
@@ -213,8 +213,10 @@ int main(void){
        fabsf(m_motor_2.m_conf.foc_pll_kp-1800.25f)>1e-6f ||
        fabsf(m_motor_2.m_conf.foc_pll_ki-28000.75f)>1e-4f ||
        m_motor_2.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST ||
-       m_motor_2.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_BEMF)
-        return fail("PLL/decoupling exact persistence");
+       m_motor_2.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_BEMF ||
+       fabsf(m_motor_1.m_conf.foc_dt_us-0.123f)>0.00051f ||
+       fabsf(m_motor_2.m_conf.foc_dt_us-0.456f)>0.00051f)
+        return fail("PLL/decoupling/deadtime exact persistence");
     if(m_motor_1.m_conf.m_sensor_port_mode!=SENSOR_PORT_MODE_ABI || m_motor_1.m_conf.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER ||
        m_motor_1.m_conf.m_encoder_counts!=4096 || !m_motor_1.m_conf.foc_encoder_inverted ||
        fabsf(m_motor_1.m_conf.foc_encoder_offset-17.251234f)>0.000001f ||
@@ -294,8 +296,10 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.foc_pll_kp-MCCONF_FOC_PLL_KP_DEFAULT)>0.001f ||
        fabsf(m_motor_2.m_conf.foc_pll_ki-MCCONF_FOC_PLL_KI_DEFAULT)>0.001f ||
        m_motor_1.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED ||
-       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST)
-        return fail("V35 PLL/decoupling migration defaults");
+       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST ||
+       fabsf(m_motor_1.m_conf.foc_dt_us-MCCONF_FOC_DT_US_DEFAULT)>0.000001f ||
+       fabsf(m_motor_2.m_conf.foc_dt_us-MCCONF_FOC_DT_US_DEFAULT)>0.000001f)
+        return fail("V35 PLL/decoupling/deadtime migration defaults");
     if(ee_value[43]!=0x6022u || ee_value[44]!=0x6022u)
         return fail("V35 migration signature");
     for(unsigned i=260u;i<270u;i++)if(!ee_valid[i])return fail("V35 EXT11 rewrite");

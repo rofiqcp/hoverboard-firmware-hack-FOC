@@ -111,6 +111,7 @@ typedef struct {
     volatile uint32_t m_wrong_voltage_integrator;
     volatile int16_t m_abs_current_limit_counts; /* precomputed l_abs_current_max * A2BIT_CONV */
     volatile int16_t m_duty_limit_permille;      /* precomputed l_max_duty * 1000 */
+    int16_t m_voltage_limit_counts;              /* l_max_duty * FOC voltage ceiling, slow-precomputed */
     volatile int16_t m_duty_start_permille;      /* awal current derating terhadap duty */
     volatile int16_t m_duty_end_current_q4;      /* VESC: 5*cc_min_current di max duty */
     volatile int16_t m_cc_min_current_q4;         /* floor current controller standar VESC */
@@ -159,6 +160,11 @@ typedef struct {
     volatile uint8_t m_driven_offset_valid;
     volatile uint16_t m_driven_offset_samples;
     volatile int16_t m_driven_offset0, m_driven_offset1, m_driven_offsetdc;
+    /* Akumulasi zero-vector powered dilakukan tanpa pembagian di ISR. Setelah
+     * 80 sampel lengkap, housekeeping menghitung mean/validity sementara ISR
+     * tetap menahan bridge pada zero-vector (settle_ticks=1). */
+    int32_t m_driven_offset_sum0, m_driven_offset_sum1, m_driven_offset_sumdc;
+    volatile uint8_t m_driven_offset_finalize_pending;
     /* Separate zero-current ADC offsets while the bridge is high-impedance.
      * The low-side current amplifiers shift operating point between bridge-OFF
      * and centered-PWM states on this hoverboard hardware. */
@@ -484,6 +490,22 @@ typedef struct {
 void mcpwm_foc_rl_capture_start(bool is_second_motor);
 void mcpwm_foc_rl_capture_stop(bool is_second_motor);
 void mcpwm_foc_rl_capture_get(bool is_second_motor, mcpwm_foc_rl_capture_t *out);
+
+typedef struct {
+    uint32_t total_max_cycles, deadline_miss_count;
+    uint32_t pre_max_cycles, control_max_cycles, post_max_cycles;
+    uint32_t pre_fault_max_cycles, pre_offset_max_cycles, pre_protect_max_cycles;
+    uint32_t motor_step_max_cycles[2], motor_control_max_cycles[2], motor_hold_max_cycles[2];
+    uint32_t sensor_max_cycles, pll_max_cycles, current_max_cycles, regulator_max_cycles;
+    uint32_t position_pid_max_cycles, speed_pid_max_cycles, current_circle_max_cycles;
+    uint32_t id_pi_max_cycles, iq_pi_max_cycles, decouple_limit_max_cycles;
+    uint32_t svpwm_max_cycles, duty_mag_max_cycles, overrun_total;
+    /* Profiler acceptance minimal: worst-case dan miss per scheduler slot 0..5.
+     * Tidak menambah DWT read baru; memakai elapsed ISR yang sudah tersedia. */
+    uint32_t slot_max_cycles[6], slot_miss_count[6];
+} mcpwm_foc_isr_profile_t;
+void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out);
+void mcpwm_foc_reset_isr_profile(void);
 
 /* Hardware calibration / ISR diagnostics. */
 bool mcpwm_foc_dc_cal_done(void);

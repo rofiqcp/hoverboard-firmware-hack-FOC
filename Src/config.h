@@ -25,7 +25,10 @@
 #define FOC_SVPWM_VECTOR_MAX     ((FOC_SVPWM_VECTOR_FULL_SAFE * VESC_DUTY_PHYSICAL_SCALE_PERMILLE) / 1000)
 #define ADC_CONV_TIME_7C5        20
 #define ADC_CONV_CLOCK_CYCLES    ADC_CONV_TIME_7C5
-#define ADC_CLOCK_DIV            4
+/* PCLK2=64 MHz; DIV6 => ADCCLK=10,667 MHz (<=14 MHz batas STM32F103).
+ * Konstanta ini juga mengubah offset TIM8 agar alignment sampling tetap sama
+ * dalam satuan cycle timer 64 MHz. */
+#define ADC_CLOCK_DIV            6
 #define ADC_TOTAL_CONV_TIME      (ADC_CLOCK_DIV * ADC_CONV_CLOCK_CYCLES)
 
 #define BAT_FILT_COEF            655
@@ -129,6 +132,12 @@
 #define SERIAL_TIMEOUT           160
 #define USART3_BAUD              F103_VESC_UART_BAUD
 #define USART3_WORDLENGTH        UART_WORDLENGTH_8B
+
+/* Batas watchdog aktuator lokal. ROS/F411 boleh lebih ketat, tetapi F103 adalah
+ * otoritas terakhir yang benar-benar mematikan PWM bila command stream hilang. */
+#define VESC_RUNTIME_TIMEOUT_DEFAULT_MS  300u
+#define VESC_RUNTIME_TIMEOUT_MIN_MS       50u
+#define VESC_RUNTIME_TIMEOUT_MAX_MS      500u
 
 #define SERIAL_STATUS_ENABLED    (1u << 0)
 #define SERIAL_STATUS_TIMEOUT    (1u << 1)

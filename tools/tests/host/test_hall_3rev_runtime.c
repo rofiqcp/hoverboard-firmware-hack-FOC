@@ -20,6 +20,8 @@ extern volatile uint8_t motorRunReq;
 extern volatile int pwml,pwmr;
 void filtLowPass32(int16_t u,uint16_t coef,int32_t*y){int32_t e=(int32_t)u-(*y>>16);if(e>32767)e=32767;if(e<-32768)e=-32768;*y+=(int32_t)coef*e;}
 void HAL_Delay(uint32_t ms){(void)ms;}
+static uint32_t slow_ms=1u;
+static void legacy_sync(void){mcpwm_foc_housekeeping_non_isr(slow_ms);slow_ms+=5u;}
 
 static void set_hall(GPIO_TypeDef *p,uint16_t pu,uint16_t pv,uint16_t pw,uint8_t h){
     p->IDR|=(uint32_t)(pu|pv|pw);
@@ -44,6 +46,7 @@ static int run_motor(int second,const uint8_t table[8]){
     memcpy(c.foc_hall_table,table,8);
     mcpwm_foc_set_configuration(&c,second!=0);
     enable=1u; motorRunReq=1u; ctrlModReq=VLT_MODE; pwml=1; pwmr=-1;
+    legacy_sync();
     uint8_t li=2,ri=2;
     if(second)ri=seq[0]; else li=seq[0];
     set_halls(li,ri);

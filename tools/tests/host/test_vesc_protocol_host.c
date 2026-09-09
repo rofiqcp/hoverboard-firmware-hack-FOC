@@ -76,6 +76,7 @@ void foc_sin_cos_q15(uint16_t phase, int16_t *sn, int16_t *cs) {
     if(sn)*sn=(int16_t)lround(sin(a)*32767.0);
     if(cs)*cs=(int16_t)lround(cos(a)*32767.0);
 }
+float foc_sqrtf_slow(float x) { return x>0.0f?sqrtf(x):0.0f; }
 
 void mc_interface_select_motor_thread(int motor) { selected_motor=motor; }
 bool mc_interface_dccal_done(void){return true;}
@@ -244,6 +245,12 @@ bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *rat
 }
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
+void mcpwm_foc_reset_isr_profile(void) {}
+void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
+    if(!out)return;
+    memset(out,0,sizeof(*out));
+    out->total_max_cycles=2345u;
+}
 float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}
@@ -617,12 +624,12 @@ int main(void){
 
     {
         app_configuration ac=*app_vesc_get_configuration(false);
-        ac.timeout_msec=4321u;
+        ac.timeout_msec=432u;
         uint8_t ap[700]; ap[0]=COMM_SET_APPCONF_NO_STORE;
         const int32_t an=confgenerator_serialize_appconf(ap+1,&ac);
         if(an<=0||!transact(ap,(uint16_t)(an+1),r,&rn)||rn!=1u||r[0]!=COMM_SET_APPCONF_NO_STORE)
             return fail("appconf no-store ack");
-        if(app_vesc_get_configuration(false)->timeout_msec!=4321u)return fail("appconf no-store live apply");
+        if(app_vesc_get_configuration(false)->timeout_msec!=432u)return fail("appconf no-store live apply");
     }
     uint8_t rpm[5]={COMM_SET_RPM,0,0,0,0}; k=1;buffer_append_int32(rpm,300,&k);if(!transact(rpm,sizeof(rpm),r,&rn))return fail("local rpm frame");
     if(fabsf(set_rpm[0]-300.0f)>0.001f||touch_count[0]==0u)return fail("local rpm");

@@ -272,8 +272,11 @@ void SystemClock_Config(void) {
   HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
 
   PeriphClkInit.PeriphClockSelection    = RCC_PERIPHCLK_ADC;
-  // PeriphClkInit.AdcClockSelection    = RCC_ADCPCLK2_DIV8;  // 8 MHz
-  PeriphClkInit.AdcClockSelection       = RCC_ADCPCLK2_DIV4;  // 16 MHz
+  /* PCLK2 runtime adalah 64 MHz. STM32F103xC/D/E membatasi ADCCLK sampai
+   * 14 MHz, jadi DIV6 memberi 10,667 MHz dan tetap menyelesaikan sequence
+   * dual-ADC jauh di dalam frame PWM 62,5 us. Nilai ADC_CLOCK_DIV di config.h
+   * wajib sama karena dipakai untuk offset sinkronisasi TIM8 terhadap ADC. */
+  PeriphClkInit.AdcClockSelection       = RCC_ADCPCLK2_DIV6;  // 10,667 MHz
   HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
 
   /**Configure the Systick interrupt time

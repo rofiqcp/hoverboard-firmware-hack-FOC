@@ -52,24 +52,17 @@ static void deadband(float *v, float tres) {
     }
 }
 
-/* Same three curve families used by upstream VESC utils_throttle_curve(). */
+/* F103 hanya menjalankan keluarga POLY standar VESC. EXPO/NATURAL memerlukan
+ * powf/expf yang menarik beberapa KiB libm/soft-double pada Cortex-M3. App
+ * config tetap wire-compatible dan mode unsupported dicanonicalize ke POLY,
+ * sehingga VESC Tool tidak pernah membaca kembali opsi yang diam-diam diabaikan. */
 static float throttle_curve(float val, float curve_acc, float curve_brake, int mode) {
+    (void)mode;
     val = clampf(val, -1.0f, 1.0f);
     const float a = fabsf(val);
     const float curve = val >= 0.0f ? curve_acc : curve_brake;
-    float ret = a;
-    if (mode == THR_EXP_EXPO) {
-        ret = curve >= 0.0f ? 1.0f - powf(1.0f - a, 1.0f + curve) : powf(a, 1.0f - curve);
-    } else if (mode == THR_EXP_NATURAL) {
-        if (fabsf(curve) >= 1e-10f) {
-            ret = curve >= 0.0f ?
-                1.0f - ((expf(curve * (1.0f - a)) - 1.0f) / (expf(curve) - 1.0f)) :
-                (expf(-curve * a) - 1.0f) / (expf(-curve) - 1.0f);
-        }
-    } else if (mode == THR_EXP_POLY) {
-        ret = curve >= 0.0f ? 1.0f - ((1.0f - a) / (1.0f + curve * a)) :
-                              a / (1.0f - curve * (1.0f - a));
-    }
+    const float ret = curve >= 0.0f ? 1.0f - ((1.0f - a) / (1.0f + curve * a)) :
+                                      a / (1.0f - curve * (1.0f - a));
     return val < 0.0f ? -ret : ret;
 }
 
@@ -185,7 +178,7 @@ void app_vesc_defaults(app_configuration *a, uint8_t id) {
     if (!a) return;
     memset(a, 0, sizeof(*a));
     a->controller_id = id;
-    a->timeout_msec = 10000u;
+    a->timeout_msec = VESC_RUNTIME_TIMEOUT_DEFAULT_MS;
     a->timeout_brake_current = 0.0f;
     a->can_baud_rate = CAN_BAUD_500K;
     a->pairing_done = true;
@@ -204,7 +197,9 @@ void app_vesc_defaults(app_configuration *a, uint8_t id) {
     a->app_adc_conf.voltage2_end = 3.0f;
     a->app_adc_conf.use_filter = true;
     a->app_adc_conf.safe_start = SAFE_START_REGULAR;
-    a->app_adc_conf.throttle_exp_mode = THR_EXP_EXPO;
+    /* POLY adalah satu-satunya curve yang sengaja didukung pada F103. Curve
+     * default 0 tetap identitas sama seperti default EXPO VESC. */
+    a->app_adc_conf.throttle_exp_mode = THR_EXP_POLY;
     a->app_adc_conf.ramp_time_pos = 0.3f;
     a->app_adc_conf.ramp_time_neg = 0.1f;
     a->app_adc_conf.update_rate_hz = 200u;
@@ -240,7 +235,14 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
         c.app_to_use = APP_UART;
     }
     if (c.app_adc_conf.ctrl_type > ADC_CTRL_TYPE_PID_REV_BUTTON) c.app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
+    if (c.app_adc_conf.throttle_exp_mode != THR_EXP_POLY) c.app_adc_conf.throttle_exp_mode = THR_EXP_POLY;
     if (c.app_adc_conf.update_rate_hz == 0u) c.app_adc_conf.update_rate_hz = 1u;
+    /* Fail-closed production policy: App Config tidak boleh menonaktifkan atau
+     * memperpanjang timeout aktuator lokal melewati 500 ms. Nilai 0 dari VESC
+     * Tool dikembalikan ke default aman 300 ms. */
+    if (c.timeout_msec == 0u) c.timeout_msec = VESC_RUNTIME_TIMEOUT_DEFAULT_MS;
+    else if (c.timeout_msec < VESC_RUNTIME_TIMEOUT_MIN_MS) c.timeout_msec = VESC_RUNTIME_TIMEOUT_MIN_MS;
+    else if (c.timeout_msec > VESC_RUNTIME_TIMEOUT_MAX_MS) c.timeout_msec = VESC_RUNTIME_TIMEOUT_MAX_MS;
     /* This board has one physical VESC UART. Keep its electrical link fixed at
      * F103_VESC_UART_BAUD so writing App Config cannot strand VESC Tool on an unknown baud. */
     c.app_uart_baudrate = USART3_BAUD;

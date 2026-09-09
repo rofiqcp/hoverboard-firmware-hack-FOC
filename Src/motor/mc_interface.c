@@ -909,6 +909,9 @@ bool mc_interface_store_configuration_motor(bool second) {
         const uint16_t mode_slot=second?EE_R_EXT11_MODE_FLAGS:EE_L_EXT11_MODE_FLAGS;
         uint16_t flags=(uint16_t)m->m_conf.foc_cc_decoupling & 0x0003u;
         flags|=(uint16_t)(((uint16_t)m->m_conf.s_pid_speed_source & 0x0003u)<<2);
+        uint32_t dt_ns=(uint32_t)(m->m_conf.foc_dt_us*1000.0f+0.5f);
+        if(dt_ns>MCCONF_FOC_DT_NS_MAX)dt_ns=MCCONF_FOC_DT_NS_MAX;
+        flags|=(uint16_t)(dt_ns<<4);
         ok &= ee_write_float32_pair(pll_kp_slot,m->m_conf.foc_pll_kp);
         ok &= ee_write_float32_pair(pll_ki_slot,m->m_conf.foc_pll_ki);
         ok &= ee_write_slot(mode_slot,flags);
@@ -1294,17 +1297,20 @@ bool mc_interface_load_configuration_motor(bool second) {
            !ee_read_slot(mode_slot,&flags))return false;
         const uint8_t dec=(uint8_t)(flags&0x03u);
         const uint8_t src=(uint8_t)((flags>>2)&0x03u);
+        const uint16_t dt_ns=(uint16_t)(flags>>4);
         if(!(pk>=0.0f&&pk<=10000.0f) || !(pi>=0.0f&&pi<=200000.0f) ||
            dec>(uint8_t)FOC_CC_DECOUPLING_CROSS_BEMF || src>(uint8_t)S_PID_SPEED_SRC_FASTER)return false;
         m->m_conf.foc_pll_kp=pk;
         m->m_conf.foc_pll_ki=pi;
         m->m_conf.foc_cc_decoupling=(mc_foc_cc_decoupling_mode)dec;
         m->m_conf.s_pid_speed_source=(S_PID_SPEED_SRC)src;
+        m->m_conf.foc_dt_us=(float)dt_ns*0.001f;
     }else{
         m->m_conf.foc_pll_kp=MCCONF_FOC_PLL_KP_DEFAULT;
         m->m_conf.foc_pll_ki=MCCONF_FOC_PLL_KI_DEFAULT;
         m->m_conf.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
         m->m_conf.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
+        m->m_conf.foc_dt_us=MCCONF_FOC_DT_US_DEFAULT;
     }
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);
     m->m_conf.s_pid_min_erpm = (float)((uint32_t)m->m_speed_release_rpm * pp);

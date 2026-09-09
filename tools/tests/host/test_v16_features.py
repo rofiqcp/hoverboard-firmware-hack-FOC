@@ -25,8 +25,12 @@ assert 'm_phase_hall_target' in mch and 'phase_diff_u16' in mc
 assert 'rate-limits corrected Hall phase' in mc
 assert 'm_hall_reject_counted_state' in mch and 'm->m_hall_reject_counted_state != h' in mc
 assert 'period_for_filter' in mc and 'floor_period' in mc and 'm->m_hall_period_reject_count++' in mc, 'Hall timing outlier slew-limit path missing'
-assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
-assert 'stop_zone' in mc and 'zero-vector' in mc and 'm->m_iq_set_q4 = m->m_iq_target_q4;' in mc
+motor_step_start=mc.index('static void motor_control_step')
+motor_step=mc[motor_step_start:mc.index('static int16_t duty_permille_from_vdq',motor_step_start)]
+assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step
+assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step
+assert 'stop_zone' in motor_step and 'm->m_iq_set_q4=m->m_iq_target_q4;' in motor_step
+assert 'motor_outer_loop_virtual_steps' not in mc
 assert 'm->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;' in mc, 'speed STOP must force VESC zero-vector reference'
 assert 'VESC speed PID -> Iq' in mc
 assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
@@ -50,7 +54,7 @@ assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrat
 # VESC-like detector: 1s current ramp, 3 forward + 3 reverse complete 1-degree sweeps.
 assert 'i < 1000u' in mc and 'HAL_Delay(1u)' in mc
 assert 'pass < 3u' in mc and 'deg < 360u' in mc and 'deg = 360; deg >= 0' in mc and 'HAL_Delay(5u)' in mc
-assert 'mcpwm_foc_hall_detect_angle200' in mc and 'atan2f((float)sum_s,(float)sum_c)' in mc
+assert 'mcpwm_foc_hall_detect_angle200' in mc and 'foc_atan2_phase_u16(ys,xc)' in mc
 assert 'foc_sin_cos_q15(ph,&sn,&cs)' in mc and 'int64_t best_dot' not in mc and 'int64_t best_dot' not in vp, 'Hall must use F103 Q15 circular samples with upstream atan2 finalization, not nearest-bin search'
 assert 'mcpwm_foc_hall_detect_command_start' in vp and 'mcpwm_foc_hall_detect_process' in vp and 'standalone detect is not a store' in vp
 assert 'mc_interface_store_configuration_motor(second)' in vp and 'case COMM_SET_MCCONF:' in vp and 'case COMM_DETECT_APPLY_ALL_FOC:' in vp

@@ -21,6 +21,52 @@ int main(void){
     if(ec>max_trig_err)max_trig_err=ec;
     if(es>4||ec>4)return fail("sin/cos LUT interpolation error");
   }
+  double max_sqrt_rel=0.0;
+  for(int e=-20;e<=20;e++){
+    for(int m=1;m<=97;m+=3){
+      const double x=ldexp((double)m/97.0,e);
+      const double ref=sqrt(x);
+      const double got=(double)foc_sqrtf_slow((float)x);
+      const double rel=fabs(got-ref)/(ref>0.0?ref:1.0);
+      if(rel>max_sqrt_rel)max_sqrt_rel=rel;
+      if(rel>2.0e-6)return fail("slow sqrt relative error");
+    }
+  }
+  if(foc_sqrtf_slow(0.0f)!=0.0f||foc_sqrtf_slow(-1.0f)!=0.0f)return fail("slow sqrt nonpositive");
+  double max_atan_err=0.0;
+  for(int k=0;k<3600;k++){
+    const double a=6.28318530717958647692*(double)k/3600.0;
+    const int32_t x=(int32_t)lround(cos(a)*1000000.0);
+    const int32_t y=(int32_t)lround(sin(a)*1000000.0);
+    const uint16_t ph=foc_atan2_phase_u16(y,x);
+    const int32_t ref=(int32_t)lround((double)k*65536.0/3600.0)&0xffff;
+    int32_t de=(int32_t)ph-ref; if(de>32767)de-=65536; if(de<-32768)de+=65536;
+    const double err=fabs((double)de*360.0/65536.0);
+    if(err>max_atan_err)max_atan_err=err;
+    if(err>0.40)return fail("fixed atan2 phase error");
+  }
+  /* Dead-time phase-sign helper harus identik dengan rumus upstream. Hindari
+   * titik tepat pada zero crossing karena SIGN(0) memang diskontinu. */
+  int32_t dtsa=0,dtsb=0;
+  foc_deadtime_sign_q15(1000,0,&dtsa,&dtsb);
+  if(abs(dtsa-43690)>1||dtsb!=0)return fail("deadtime sign cardinal alpha+");
+  foc_deadtime_sign_q15(-1000,0,&dtsa,&dtsb);
+  if(abs(dtsa+43690)>1||dtsb!=0)return fail("deadtime sign cardinal alpha-");
+  foc_deadtime_sign_q15(0,1000,&dtsa,&dtsb);
+  if(dtsa!=0||dtsb!=2*FOC_INV_SQRT3_Q15)return fail("deadtime sign cardinal beta+");
+  for(int32_t aa=-3000;aa<=3000;aa+=137){
+    for(int32_t bb=-3000;bb<=3000;bb+=149){
+      const double pa=(double)aa;
+      const double pb=-0.5*(double)aa+0.8660254037844386*(double)bb;
+      const double pc=-0.5*(double)aa-0.8660254037844386*(double)bb;
+      if(fabs(pa)<1.0||fabs(pb)<1.0||fabs(pc)<1.0)continue;
+      const int sa=(pa>0)-(pa<0), sb=(pb>0)-(pb<0), sc=(pc>0)-(pc<0);
+      const int32_t ra=(int32_t)lround(((2.0*sa-sb-sc)/3.0)*32768.0);
+      const int32_t rb=(int32_t)lround(((sb-sc)/sqrt(3.0))*32768.0);
+      foc_deadtime_sign_q15((int16_t)aa,(int16_t)bb,&dtsa,&dtsb);
+      if(abs(dtsa-ra)>1||abs(dtsb-rb)>2)return fail("deadtime sign differential");
+    }
+  }
   foc_ab_t ab={1200,-700},ab2={0,0}; foc_dq_t dq={0,0};
   foc_park_q4(&ab,10000,&dq); foc_inv_park(&dq,10000,&ab2);
   if(abs(ab.alpha-ab2.alpha)>3||abs(ab.beta-ab2.beta)>3)return fail("park roundtrip");
@@ -68,6 +114,6 @@ int main(void){
   if(FOC_SVPWM_VECTOR_MAX!=(FOC_SVPWM_VECTOR_FULL_SAFE*VESC_DUTY_PHYSICAL_SCALE_PERMILLE)/1000)
     return fail("config duty scale arithmetic");
   if(scaled_abs<850||scaled_abs>856)return fail("0.960 physical duty scale PWM range");
-  printf("FOC_FIXEDPOINT_RUNTIME_PASS lut_max_err=%d pwm=%d,%d,%d eferu_max_abs=%d scaled960_abs=%d span=%d\n",max_trig_err,pwm.a,pwm.b,pwm.c,max_abs,scaled_abs,max_span);
+  printf("FOC_FIXEDPOINT_RUNTIME_PASS lut_max_err=%d atan_max_deg=%.3f sqrt_rel=%.3g pwm=%d,%d,%d eferu_max_abs=%d scaled960_abs=%d span=%d\n",max_trig_err,max_atan_err,max_sqrt_rel,pwm.a,pwm.b,pwm.c,max_abs,scaled_abs,max_span);
   return 0;
 }

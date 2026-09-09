@@ -94,6 +94,13 @@
  * fixed-point pada saat konfigurasi berubah; tidak ada float di ADC ISR. */
 #define MCCONF_FOC_PLL_KP_DEFAULT              2000.0f
 #define MCCONF_FOC_PLL_KI_DEFAULT             30000.0f
+/* Dead-time compensation mengikuti field VESC foc_dt_us, tetapi hanya
+ * mengoreksi model tegangan/observer; tidak mengubah switching command SVPWM.
+ * Default OFF sampai karakterisasi hardware dilakukan. EEPROM EXT11 menyimpan
+ * nilai dengan resolusi 1 ns pada 12 bit (0..4,095 us). */
+#define MCCONF_FOC_DT_US_DEFAULT                  0.0f
+#define MCCONF_FOC_DT_US_MAX                      4.095f
+#define MCCONF_FOC_DT_NS_MAX                      4095u
 /* VESC speed PID uses normalized output/current scaling. Hardware step tests at
  * +/-750 ERPM selected Kp=0.002, Ki=0.002, Kd=0 for this Hall hoverboard: the
  * doubled Ki removed ~3.3% steady error without excessive current; Kd stays 0
@@ -136,6 +143,10 @@
 #define MCCONF_CURRENT_OFFSET_CENTER_ADC         2048
 #define MCCONF_CURRENT_OFFSET_MAX_DEVIATION_ADC   900
 #define MCCONF_CURRENT_OFFSET_MAX_PAIR_DELTA_ADC  900
+/* Saat MOE aktif, low-side current amplifier LEFT dapat bergeser common-mode
+ * lebih dari 900 count dari midscale walaupun kedua channel masih sehat.
+ * Powered zero-vector memakai validator terpisah: jauh dari rail + pair delta. */
+#define MCCONF_DRIVEN_OFFSET_RAIL_MARGIN_ADC      128
 /* LEFT ABI: batas delta dibuat jauh di atas kecepatan steering normal. Nilai
  * ini hanya menangkap loncatan counter/glitch; hard-stop calibration OPENLOOP
  * tetap diizinkan karena gerak aktualnya sangat lambat. */

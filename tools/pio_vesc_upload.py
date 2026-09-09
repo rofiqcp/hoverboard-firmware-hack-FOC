@@ -5,59 +5,12 @@ from pathlib import Path
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 MAX_FW=120*1024-6
 
-ROS_PROCESS_MARKERS = (
-    "/opt/ros/",
-    "/home/otomasi/ros/install/",
-    "ros2 launch ",
-    "ros2 run ",
-)
 
-def _protected_pids():
-    protected={os.getpid()}
-    pid=os.getppid()
-    while pid>1 and pid not in protected:
-        protected.add(pid)
-        try:
-            raw=Path(f'/proc/{pid}/stat').read_text().split()
-            pid=int(raw[3])
-        except Exception:
-            break
-    return protected
-
-def _cmdline(pid):
+def _cmdline_local(pid):
     try:
         return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace').strip()
     except Exception:
         return ''
-
-def stop_ros_processes():
-    protected=_protected_pids(); victims=[]
-    for ent in Path('/proc').iterdir():
-        if not ent.name.isdigit(): continue
-        pid=int(ent.name)
-        if pid in protected: continue
-        cmd=_cmdline(pid)
-        if cmd and any(m in cmd for m in ROS_PROCESS_MARKERS):
-            victims.append((pid,cmd))
-    if not victims:
-        print('[UPLOAD] ROS stack already stopped', flush=True); return
-    pids=[pid for pid,_ in victims]
-    print(f'[UPLOAD] stopping ROS processes: {pids}', flush=True)
-    for pid in pids:
-        try: os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError): pass
-    deadline=time.monotonic()+4.0
-    while time.monotonic()<deadline:
-        alive=[pid for pid in pids if Path(f'/proc/{pid}').exists()]
-        if not alive: return
-        time.sleep(.10)
-    alive=[pid for pid in pids if Path(f'/proc/{pid}').exists()]
-    if alive:
-        print(f'[UPLOAD] force-stopping remaining ROS processes: {alive}', flush=True)
-    for pid in alive:
-        try: os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError): pass
-    time.sleep(.20)
 
 class RestartUploadSession(RuntimeError):
     pass
@@ -99,8 +52,22 @@ def frame(payload: bytes)->bytes:
 
 class Link:
     def __init__(self,args):
-        self.args=args; self.sock=None; self.ser=None; self.buf=bytearray(); self.linebuf=bytearray(); self.f411_direct=False; self.last_maintenance_refresh=0.0
-        self.open()
+        self.args=args; self.sock=None; self.ser=None; self.buf=bytearray(); self.linebuf=bytearray()
+        self.f411_direct=False; self.last_maintenance_refresh=0.0; self.route="unknown"
+        self._suspended_launch_pids=[]
+        try:
+            self.open()
+        except Exception:
+            try:
+                if self.sock is not None:
+                    self.sock.close()
+                if self.ser is not None:
+                    self.ser.close()
+            except Exception:
+                pass
+            self.sock=None; self.ser=None; self.f411_direct=False
+            self._resume_ros_launch()
+            raise
 
     def _holders(self, port):
         real=os.path.realpath(port)
@@ -114,6 +81,75 @@ class Link:
             except Exception: cmd=''
             out.append((pid,cmd))
         return out
+
+    def _parent_pid(self, pid):
+        try:
+            raw=Path(f'/proc/{pid}/stat').read_text().split()
+            return int(raw[3])
+        except Exception:
+            return 0
+
+    def _suspend_ros_launch_ancestors(self, pids):
+        suspended=[]
+        seen=set()
+        for child in pids:
+            pid=self._parent_pid(child)
+            while pid>1 and pid not in seen:
+                seen.add(pid)
+                cmd=_cmdline_local(pid)
+                if 'ros2 launch ' in cmd or '/opt/ros/' in cmd and ' launch ' in cmd:
+                    try:
+                        os.kill(pid, signal.SIGSTOP)
+                        suspended.append(pid)
+                        print(f'[F411] paused ROS launch pid={pid} during direct CDC fallback',flush=True)
+                    except (ProcessLookupError,PermissionError):
+                        pass
+                    break
+                pid=self._parent_pid(pid)
+        self._suspended_launch_pids.extend(x for x in suspended if x not in self._suspended_launch_pids)
+
+    def _resume_ros_launch(self):
+        for pid in reversed(self._suspended_launch_pids):
+            try:
+                os.kill(pid,signal.SIGCONT)
+                print(f'[F411] resumed ROS launch pid={pid}',flush=True)
+            except (ProcessLookupError,PermissionError):
+                pass
+        self._suspended_launch_pids.clear()
+
+    def _prefer_tcp_f411(self, max_wait=5.0):
+        wait=max(0.0,min(float(max_wait),5.0))
+        deadline=time.monotonic()+wait
+        last=None; attempt=0
+        while True:
+            attempt+=1
+            try:
+                self._open_tcp(attempts=1)
+                self.route='tcp65101'
+                holders=self._holders(self.args.serial_port)
+                hpids=[pid for pid,_ in holders]
+                print(f'[F411] TCP maintenance selected {self.args.host}:{self.args.port} '
+                      f'after {attempt} probe(s); CDC holders={hpids or "none"}',flush=True)
+                return True
+            except Exception as e:
+                last=e
+                if time.monotonic()>=deadline:
+                    break
+                time.sleep(min(.20,max(0.0,deadline-time.monotonic())))
+        print(f'[F411] TCP maintenance unavailable within {wait:.1f}s: {last}; falling back to direct CDC',flush=True)
+        return False
+
+    def _prepare_direct_f411(self):
+        holders=self._holders(self.args.serial_port)
+        if not holders:
+            return
+        official=[x for x in holders if 'stmf4_hmi_bridge' in x[1]]
+        unknown=[x for x in holders if x not in official]
+        if unknown:
+            raise RuntimeError('F411 CDC busy by unknown process(es): '+', '.join(f'{pid}:{cmd[:80]}' for pid,cmd in unknown))
+        pids=[pid for pid,_ in official]
+        self._suspend_ros_launch_ancestors(pids)
+        self._stop_official_bridge(official)
 
     def _open_tcp(self, attempts=2):
         last=None
@@ -215,20 +251,20 @@ class Link:
 
     def open(self):
         if self.args.transport=='tcp':
-            self._open_tcp(); return
+            self._open_tcp(); self.route='tcp'; return
         if self.args.transport=='f411':
-            # APP_F411 is intentionally USB-only. Firmware upload must not depend
-            # on ROS, TCP port 65101/65102, or vesc_tool_bridge being alive.
-            stop_ros_processes()
-            holders=self._holders(self.args.serial_port)
-            if holders:
-                pids=[pid for pid,_ in holders]
-                print(f'[F411] releasing CDC holders pid={pids}',flush=True)
-                self._stop_official_bridge(holders)
-            print(f'[F411] using direct USB CDC only: {self.args.serial_port} @ 1000000',flush=True)
-            self._open_f411_direct(); return
+            # Normal AGV runtime: stmf4_hmi_bridge owns the BlackPill CDC and
+            # vesc_tool_bridge exposes the priority-100 Python maintenance route
+            # on localhost:65101. Never tear ROS down when that route is alive.
+            # Probe for at most five seconds; only then reclaim the CDC directly.
+            if self._prefer_tcp_f411(self.args.tcp_wait):
+                return
+            self._prepare_direct_f411()
+            print(f'[F411] using direct USB CDC fallback: {self.args.serial_port} @ 1000000',flush=True)
+            self._open_f411_direct(); self.route='f411_direct'; return
         import serial
         self.ser=serial.Serial(self.args.serial_port,self.args.baud,timeout=.1,write_timeout=2)
+        self.route='serial'
 
     def close(self):
         try:
@@ -240,6 +276,7 @@ class Link:
                 self.ser.close()
         finally:
             self.sock=None; self.ser=None; self.f411_direct=False
+            self._resume_ros_launch()
 
     def write(self,b):
         if self.sock:
@@ -477,6 +514,7 @@ def main():
     ap.add_argument('--transport',choices=['serial','tcp','f411'])
     ap.add_argument('--serial-port'); ap.add_argument('--baud',type=int,default=1000000)
     ap.add_argument('--host',default='127.0.0.1'); ap.add_argument('--port',type=int,default=65101)
+    ap.add_argument('--tcp-wait',type=float,default=5.0,help='maksimum deteksi TCP maintenance sebelum fallback F411 CDC (maks 5 s)')
     ap.add_argument('--firmware'); ap.add_argument('--selftest',action='store_true')
     a=ap.parse_args()
     if a.selftest: selftest(); return

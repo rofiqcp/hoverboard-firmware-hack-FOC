@@ -102,6 +102,7 @@ extern CoreDebug_Type _CoreDebug;
 #define RCC_HCLK_DIV2 2u
 #define RCC_PERIPHCLK_ADC 1u
 #define RCC_ADCPCLK2_DIV4 4u
+#define RCC_ADCPCLK2_DIV6 6u
 #define RCC_ADCPCLK2_DIV8 8u
 #define FLASH_LATENCY_2 2u
 #define SYSTICK_CLKSOURCE_HCLK 1u

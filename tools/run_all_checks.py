@@ -50,25 +50,43 @@ def check_static():
     cfg=(ROOT/'Src/config.h').read_text()
     assert 'current_scale.h' not in cfg and 'CURRENT_COUNTS_PER_A' not in cfg, 'obsolete current_scale dependency remains'
     assert re.search(r'#define\s+A2BIT_CONV\s+50\b',cfg), 'A2BIT_CONV must be defined directly as 50 in config.h'
+    assert re.search(r'#define\s+ADC_CLOCK_DIV\s+6\b',cfg), 'F103 ADC clock must be PCLK2/6 (10.667 MHz at 64 MHz PCLK2)'
+    mainc_hw=(ROOT/'Src/main.c').read_text()
+    assert 'RCC_ADCPCLK2_DIV6' in mainc_hw and 'RCC_ADCPCLK2_DIV4' not in mainc_hw, 'production ADC clock must not exceed STM32F103 14-MHz limit'
     assert re.search(r'#define\s+SERIAL_BUFFER_SIZE\s+768\b',cfg), 'USART3 RX DMA buffer is not 768 bytes'
     mc=(ROOT/'Src/motor/mcpwm_foc.c').read_text()
     mathc=(ROOT/'Src/motor/foc_math.c').read_text()
     mcc=(ROOT/'Src/motor/mcconf_default.h').read_text()
     assert re.search(r'#define\s+MCCONF_FOC_CONTROL_DIV\s+6u',mcc), 'FOC scheduler must match current 1-of-6 CPU-safe cadence'
+    assert 'c->foc_f_zv=(float)PWM_FREQ;' in mc and 'MCCONF_FOC_DT_US_MAX' in mc and 'dt_ns' in mc, 'fixed 16-kHz PWM or bounded foc_dt_us canonicalization missing'
+    assert 'c->foc_overmod_factor=1.0f;' in mc and 'c->foc_mag_vd_max=1.0f;' in mc, 'unsupported VESC overmod/Vd fields must read back as fixed-safe values'
+    assert 'foc_deadtime_sign_q15' in mc and 'nilai kompensasi TIDAK ditambahkan ke switching command' in mc, 'VESC dead-time model compensation missing'
     assert 'speed_pid_iq_target_step' in mc and 'error_q16' in mc, 'VESC speed PID fixed-point ERPM path missing'
-    assert 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc, 'mode2 speed PID must command Iq'
+    motor_step_start=mc.index('static void motor_control_step')
+    motor_step_end=mc.index('static int16_t duty_permille_from_vdq',motor_step_start)
+    motor_step=mc[motor_step_start:motor_step_end]
+    # Baseline 61c control semantics: outer SPEED/POS loops use fresh feedback on
+    # each PWM/6 regulator tick. Monitoring remains slow-path and must not be
+    # reintroduced merely to reproduce the older ISR's unnecessary overhead.
+    assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step, 'mode2 speed PID must execute on regulator tick like 61c baseline'
+    assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step, 'position PID must execute on regulator tick like 61c baseline'
+    assert 'motor_outer_loop_virtual_steps' not in mc, 'stale-feedback 200-Hz virtual outer-loop architecture must not remain'
     assert 'speed PI drives Vq directly' not in mc, 'obsolete EFeru speed-PI-to-Vq architecture remains'
-    assert 'current_pi_vesc_state' in mc and 'm_current_kpq_v_q16' in mc, 'mode2 must close upstream-style physical current PI before Vq'
-    assert 'speed_setpoint_slew_step' in mc and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp missing'
-    assert 'stop_zone' in mc and 'zero-vector' in mc and 'm->m_iq_set_q4=0' in mc, 'mode2 STOP must enter VESC zero-vector below s_pid_min_erpm'
-    assert 'CONTROL_MODE_SPEED' in mc and 'goto control_done' in mc, 'mode2 low-speed VESC zero-vector path missing'
+    assert 'current_pi_vesc_state' in motor_step and 'm_current_kpq_v_q16' in mc, 'ISR must retain upstream-style physical Id/Iq current PI'
+    assert 'speed_setpoint_slew_step(m)' in motor_step and 'm_speed_target_rpm' in mc, 'mode2 VESC-style speed ramp must follow regulator cadence'
+    assert 'stop_zone' in motor_step and 'm->m_iq_set_q4=0' in motor_step and 'reset_current_pi(m)' in motor_step, 'mode2 STOP zero-vector reset missing from regulator path'
+    assert 'if(m->m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED)' in motor_step, 'redundant final vector sqrt must be skipped when decoupling is disabled'
     assert 'CONTROL_MODE_CURRENT_BRAKE' not in mc[mc.index('if (mode==TRQ_MODE)'):mc.index('} else if (mode==SPD_MODE)')], 'legacy TRQ STOP must not brake'
     assert 'm_duty_limit_permille' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'voltage_circle_q_limit' in mc, 'runtime l_max_duty voltage-circle anti-windup missing'
     assert 's_sqrt_q7[257]' in mathc and '__builtin_clz' in mathc and 'for(uint8_t k=0u;k<4u' in mathc, 'ISR integer sqrt must use bounded Flash LUT implementation'
     assert 'uint32_t op=x, res=0, one=1u<<30' not in mathc, 'legacy iterative restoring sqrt remains in ISR math'
     assert 'watt_current_limits_refresh' in mc and 'm_watt_current_max_q4' in mc and 'm_watt_current_regen_q4' in mc, 'VESC watt P/V limit must be cached outside ISR'
-    fault_block=mc[mc.index('static void motor_fault_set'):mc.index('static void motor_fault_recovery_tick')]
-    assert 'uint64_t' not in fault_block and '__aeabi' not in fault_block and 'm_fault_stop_ticks' in fault_block, 'fault ISR path must use precomputed timeout ticks'
+    fault_block=mc[mc.index('static void motor_fault_set'):mc.index('static void motor_reset')]
+    assert 'uint64_t' not in fault_block and '__aeabi' not in fault_block and 'm_fault_stop_ticks' in fault_block, 'fault set path must use precomputed timeout ticks'
+    house=mc[mc.index('void mcpwm_foc_housekeeping_non_isr'):mc.index('void mcpwm_foc_adc_int_handler')]
+    adc_handler=mc[mc.index('void mcpwm_foc_adc_int_handler'):mc.index('void mcpwm_foc_set_board_temperature_x10')]
+    assert 'm_fault_recovery_ticks' in house and 's_vesc_timeout_ticks' in house and 's_estop_ticks' in house, 'millisecond recovery/timeout timers must live in non-ISR housekeeping'
+    assert 'm_fault_recovery_ticks' not in adc_handler and 's_vesc_timeout_ticks' not in adc_handler and 'mcpwm_foc_set_mode_command' not in adc_handler, 'hot ADC handler must not service recovery/timeout/source arbitration'
     assert 'm->m_iq_set_q4=m->m_iq_target_q4' in mc and 'MCCONF_CURRENT_SLEW_A_PER_S' not in mcc, 'SET_CURRENT must be direct VESC reference without legacy slew'
     assert 'MCCONF_SPEED_GAIN_SCALE' in mc and 'MCCONF_SPEED_GAIN_SCALE' in mcc, 'high-resolution speed PID gain scale missing'
     assert 'm_brake_current_q4' in mc and 'feedback_motion_direction' in mc and 'encoder_motion_fresh' in mc and 'm->m_hall_ticks>fresh' in mc and 'CONTROL_MODE_CURRENT_BRAKE' in mc, 'VESC live-direction current brake path missing'
@@ -81,7 +99,7 @@ def check_static():
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'if(openloop_phase) m->m_phase=m->m_phase_openloop;' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
-    assert 'mcpwm_foc_hall_detect' in mc and 'fails == 2u' in mc and 'atan2f((float)sum_s,(float)sum_c)' in mc, 'upstream VESC Hall detector/finalization missing'
+    assert 'mcpwm_foc_hall_detect' in mc and 'fails == 2u' in mc and 'foc_atan2_phase_u16(ys,xc)' in mc, 'upstream-equivalent Hall detector/fixed-point finalization missing'
     assert 'MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT' in mcc and 'hall_interp_recompute' in mc and 'm_hall_interp_max_ticks' in mc and 'm_hall_rate_min_step' in mc and 'err_same_direction' in mc, 'VESC foc_hall_interp_erpm runtime semantics missing'
     assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
@@ -90,7 +108,7 @@ def check_static():
     assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 EFeru full-safe modulation ceiling missing'
     assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+1\.00f',mcc), 'VESC normalized duty max must be 1.00'
     assert re.search(r'#define\s+MCCONF_L_IN_CURRENT_MAX\s+15\.0f',mcc) and re.search(r'#define\s+MCCONF_L_IN_CURRENT_MIN\s+-15\.0f',mcc), 'DC-link soft limit must be +/-15A'
-    assert 'const int32_t mod_q=(int32_t)m->m_vq;' in mc and 'MCCONF_FOC_VOLTAGE_MAX)/amod_q' in mc, 'FOC input-current limit must use VESC mod_q*Iq semantics, not total duty magnitude'
+    assert ('const int32_t mod_q=(int32_t)m->m_vq;' in mc and 'const int32_t in_num=in_lim*(int32_t)MCCONF_FOC_VOLTAGE_MAX;' in mc and 'if(in_num < lim*amod_q)' in mc and 'motor_from_input=in_num/amod_q' in mc), 'FOC input-current limit must retain exact VESC mod_q*Iq semantics with divide only when it can tighten the limit'
     assert '|Ibus| ~= |Iq|*|duty|' not in mc, 'obsolete duty-magnitude input-current approximation remains'
     assert 'MCCONF_DUTY_RAMP_STEP_DEFAULT' in mcc and 'm_duty_ramp_permille' not in mc and 'duty_setpoint_slew_step' not in mc and 'm_duty_set_permille' in mc, 'FOC duty must use direct VESC target; m_duty_ramp_step is wire-compatible BLDC config only'
     assert re.search(r'#define\s+VESC_DUTY_PHYSICAL_SCALE_PERMILLE\s+960',cfg), 'board VESC duty scale must be 0.960'
@@ -164,7 +182,10 @@ def check_static():
     assert 'APP_ADC_UART' in appv and 'app_vesc_process' in appv, 'APP_ADC/UART runtime missing'
     assert 'second ? -amp : amp' not in appv and 'second ? -duty : duty' not in appv and 'second ? -erpm : erpm' not in appv, 'App ADC must use mc_interface DIR_MULT, not endpoint-specific sign hacks'
     assert 'ADC_CTRL_TYPE_NONE is telemetry-only' in appv and 'if (c->ctrl_type == ADC_CTRL_TYPE_NONE)' in appv, 'ADC NONE must not energize/touch motor'
-    assert 'a->timeout_msec = 10000u;' in appv, 'VESC App Config default timeout must be 10000 ms'
+    assert 'c.app_adc_conf.throttle_exp_mode != THR_EXP_POLY' in appv and 'powf(' not in appv and 'expf(' not in appv, 'F103 App ADC must canonicalize heavy EXPO/NATURAL curves to standard POLY'
+    assert 'a->timeout_msec = VESC_RUNTIME_TIMEOUT_DEFAULT_MS;' in appv, 'VESC App Config default must use local hard watchdog'
+    assert 'VESC_RUNTIME_TIMEOUT_DEFAULT_MS  300u' in cfg and 'VESC_RUNTIME_TIMEOUT_MAX_MS      500u' in cfg, 'F103 hard watchdog bounds missing'
+    assert 'c.timeout_msec == 0u' in appv and 'VESC_RUNTIME_TIMEOUT_MAX_MS' in appv, 'App Config must not disable/extend actuator watchdog'
     assert 'mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current)' in appv, 'App Config timeout/brake must drive motor watchdog'
     assert 'mc_interface_set_current_rel(rel)' in appv and 'mc_interface_set_brake_current_rel(rel)' in appv, 'App ADC current modes must use upstream VESC relative-current helpers'
     assert 'void mc_interface_set_current_rel(float val)' in mci and 'void mc_interface_set_brake_current_rel(float val)' in mci, 'VESC current-rel helpers missing from mc_interface'
@@ -239,6 +260,7 @@ if __name__ == '__main__':
     run([sys.executable,'-m','py_compile',*py_files])
     run([sys.executable,'tools/tests/host/host_compile_check.py'])
     run([sys.executable,'tools/tests/host/test_foc_math.py'])
+    run([sys.executable,'tools/tests/host/test_buffer_float_auto.py'])
     run([sys.executable,'tools/tests/host/test_motor_control_v12.py'])
     run([sys.executable,'tools/tests/host/test_motor_control_v13.py'])
     run([sys.executable,'tools/tests/host/test_vesc_protocol_host.py'])
@@ -249,6 +271,7 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_bootloader_layout.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_recovery.py'])
+    run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_f411_route.py'])
     run([sys.executable,'tools/tests/host/test_v15_features.py'])
     run([sys.executable,'tools/tests/host/test_v16_features.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])

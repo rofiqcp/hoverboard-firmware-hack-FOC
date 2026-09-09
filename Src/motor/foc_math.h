@@ -34,5 +34,8 @@ void foc_inv_park(const foc_dq_t *vdvq, uint16_t phase, foc_ab_t *ab);
 void foc_vector_limit(foc_dq_t *vdvq, int16_t max_mag);
 void foc_centered_svpwm(const foc_dq_t *vdvq, uint16_t phase, foc_abc_t *pwm_signed);
 uint32_t foc_isqrt_u32(uint32_t x);
+uint16_t foc_atan2_phase_u16(int32_t y, int32_t x);
+float foc_sqrtf_slow(float x);
+void foc_deadtime_sign_q15(int16_t alpha_q4, int16_t beta_q4, int32_t *sign_alpha_q15, int32_t *sign_beta_q15);
 
 #endif

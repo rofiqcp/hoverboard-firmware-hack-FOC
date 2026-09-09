@@ -62,4 +62,25 @@ link.transact=fake_transact
 off,ratio,inv=link.detect_encoder(1.25,False); assert cap[-1][0]==bytes([vd.COMM_DETECT_ENCODER])+struct.pack('>i',1250) and cap[-1][1]==vd.COMM_DETECT_ENCODER
 assert abs(off-17.25)<1e-9 and abs(ratio-15.0)<1e-9 and inv
 
-print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f} tool_builders=exact')
+# Auto transport contract: TCP 65101 has priority; direct F411 is only fallback.
+orig_tcp,orig_direct=vd.TcpSerialTransport,vd.F411DirectTransport
+old_wait=vd.os.environ.get("VESC_TCP_WAIT_SEC")
+vd.os.environ["VESC_TCP_WAIT_SEC"]="0"
+try:
+    class FakeTcpOk:
+        def __init__(self,endpoint,timeout=0.01): self.endpoint="tcp://127.0.0.1:65101"
+    class FakeDirect:
+        calls=[]
+        def __init__(self,path,timeout=0.01,reclaim=False): self.path=path; self.reclaim=reclaim; FakeDirect.calls.append((path,reclaim))
+    vd.TcpSerialTransport=FakeTcpOk; vd.F411DirectTransport=FakeDirect
+    tr=vd.open_transport("auto"); assert isinstance(tr,FakeTcpOk) and not FakeDirect.calls
+    class FakeTcpFail:
+        def __init__(self,*a,**k): raise OSError("mock tcp down")
+    vd.TcpSerialTransport=FakeTcpFail
+    tr=vd.open_transport("auto"); assert isinstance(tr,FakeDirect) and FakeDirect.calls[-1][1] is True
+finally:
+    vd.TcpSerialTransport,vd.F411DirectTransport=orig_tcp,orig_direct
+    if old_wait is None: vd.os.environ.pop("VESC_TCP_WAIT_SEC",None)
+    else: vd.os.environ["VESC_TCP_WAIT_SEC"]=old_wait
+
+print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f} tool_builders=exact auto_route=1')

@@ -16,7 +16,13 @@ halltest=(R/'tools/tests/host/test_hall_detect_algorithm.c').read_text()
 assert re.search(r'#define\s+MCCONF_HALL_TIMEOUT_TICKS\s+8000u',mcc)
 assert 'm_speed_target_rpm_q16' in mch and 'erpm_to_mech_rpm_q16' in mc
 assert 'measured_mech_rpm_q16' in mc
-assert 'speed_pid_iq_target_step' in mc and 'm->m_iq_target_q4 = speed_pid_iq_target_step' in mc
+motor_step_start=mc.index('static void motor_control_step')
+motor_step=mc[motor_step_start:mc.index('static int16_t duty_permille_from_vdq',motor_step_start)]
+# Baseline 61c semantics: SPEED/POS outer control uses fresh feedback on each
+# regulator tick; telemetry remains decoupled from the high-priority ISR.
+assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in motor_step
+assert 'm->m_iq_target_q4=position_pid_iq_target_step' in motor_step
+assert 'motor_outer_loop_virtual_steps' not in mc
 assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 
