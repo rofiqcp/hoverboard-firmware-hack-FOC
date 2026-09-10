@@ -54,6 +54,8 @@ volatile int32_t positionCommandL = 0;
 volatile int32_t positionCommandR = 0;
 
 volatile uint32_t foc_isr_cycles = 0;
+static volatile uint32_t foc_adc_heartbeat = 0u;
+static volatile uint32_t foc_motor_heartbeat[2] = {0u, 0u};
 volatile uint8_t encoder_detect_stage = 0u;
 /* Startup-align black box. Kept separate from full encoder detect so HOME
  * failures after reboot can be diagnosed without repeating hard-stop calibration. */
@@ -545,6 +547,9 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
     out->outer_jitter_max_cycles=outer_control_jitter_max_cycles;
     out->outer_period_min_cycles=(outer_control_period_min_cycles==UINT32_MAX)?0u:outer_control_period_min_cycles;
     out->outer_period_max_cycles=outer_control_period_max_cycles;
+    out->adc_heartbeat=foc_adc_heartbeat;
+    out->motor_heartbeat[0]=foc_motor_heartbeat[0];
+    out->motor_heartbeat[1]=foc_motor_heartbeat[1];
 }
 
 
@@ -4584,7 +4589,9 @@ void mcpwm_foc_adc_int_handler(void) {
     const bool update_left=(control_slot==0u);
     const bool update_right=(MCCONF_FOC_CONTROL_DIV<=1u)?update_left:(control_slot==1u);
     motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left);
+    if(update_left)foc_motor_heartbeat[0]++;
     motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,update_right);
+    if(update_right)foc_motor_heartbeat[1]++;
     foc_iqL_q4=m_motor_1.m_iq_q4;foc_idL_q4=m_motor_1.m_id_q4;
     foc_iqR_q4=m_motor_2.m_iq_q4;foc_idR_q4=m_motor_2.m_id_q4;
     LEFT_TIM->LEFT_TIM_U=m_motor_1.m_ccr_a;LEFT_TIM->LEFT_TIM_V=m_motor_1.m_ccr_b;LEFT_TIM->LEFT_TIM_W=m_motor_1.m_ccr_c;
@@ -5006,6 +5013,9 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     if(leftDriveRequest && leftFeedbackReadyPost && !leftCurrentTrip && m_motor_1.m_fault==FAULT_CODE_NONE) LEFT_TIM->BDTR|=TIM_BDTR_MOE;
     if(rightDriveRequest && rightFeedbackReadyPost && !rightCurrentTrip && m_motor_2.m_fault==FAULT_CODE_NONE) RIGHT_TIM->BDTR|=TIM_BDTR_MOE;
     s_overrun=0;
+    /* Only a complete ISR pass counts as healthy progress. Startup calibration
+     * and overrun-abort paths intentionally do not increment this token. */
+    foc_adc_heartbeat++;
     foc_isr_monitor_end(focIsrStartCycles);
 }
 
@@ -5115,6 +5125,10 @@ exit_hall_detect:
 bool mcpwm_foc_dc_cal_done(void){return offsetcount>=2000u;}
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(!second){if(p0)*p0=offsetrlA;if(p1)*p1=offsetrlB;if(dc)*dc=offsetdcl;}else{if(p0)*p0=offsetrrB;if(p1)*p1=offsetrrC;if(dc)*dc=offsetdcr;}}
 uint32_t mcpwm_foc_get_isr_cycles(void){return foc_isr_cycles;}uint32_t mcpwm_foc_get_isr_cycles_max(void){return foc_isr_cycles_max;}
+void mcpwm_foc_get_liveness(uint32_t *adc_heartbeat,uint32_t motor_heartbeat[2]){
+    if(adc_heartbeat)*adc_heartbeat=foc_adc_heartbeat;
+    if(motor_heartbeat){motor_heartbeat[0]=foc_motor_heartbeat[0];motor_heartbeat[1]=foc_motor_heartbeat[1];}
+}
 
 static float q4_to_amp(int16_t q){return (float)q/(float)FOC_CURRENT_Q4_PER_A;}
 static float motor_current_vesc_a(const mcpwm_foc_motor_t *m){

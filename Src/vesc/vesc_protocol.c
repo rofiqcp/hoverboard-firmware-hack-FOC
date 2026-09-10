@@ -2243,6 +2243,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_miss_count[si]);
         APPP(p.outer_max_cycles); APPP(p.outer_miss_count); APPP(p.outer_jitter_max_cycles);
         APPP(p.outer_period_min_cycles); APPP(p.outer_period_max_cycles);
+        APPP(p.adc_heartbeat); APPP(p.motor_heartbeat[0]); APPP(p.motor_heartbeat[1]);
 #undef APPP
         uart_send_payload(b,(uint16_t)j); return;
     }

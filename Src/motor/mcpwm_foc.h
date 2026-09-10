@@ -512,6 +512,8 @@ typedef struct {
      * transaction so timing can be verified without attaching SWD to F103. */
     uint32_t outer_max_cycles, outer_miss_count, outer_jitter_max_cycles;
     uint32_t outer_period_min_cycles, outer_period_max_cycles;
+    uint32_t adc_heartbeat;
+    uint32_t motor_heartbeat[2];
 } mcpwm_foc_isr_profile_t;
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out);
 void mcpwm_foc_reset_isr_profile(void);
@@ -522,6 +524,7 @@ void mcpwm_foc_get_current_offsets(int16_t *pha0, int16_t *pha1, int16_t *dc,
                                    bool is_second_motor);
 uint32_t mcpwm_foc_get_isr_cycles(void);
 uint32_t mcpwm_foc_get_isr_cycles_max(void);
+void mcpwm_foc_get_liveness(uint32_t *adc_heartbeat, uint32_t motor_heartbeat[2]);
 
 /* Called from the original DMA1_Channel1_IRQHandler after ADC frame acquisition. */
 void mcpwm_foc_adc_int_handler(void);
