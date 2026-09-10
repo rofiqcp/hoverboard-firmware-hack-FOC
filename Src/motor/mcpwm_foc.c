@@ -56,6 +56,10 @@ volatile int32_t positionCommandR = 0;
 volatile uint32_t foc_isr_cycles = 0;
 static volatile uint32_t foc_adc_heartbeat = 0u;
 static volatile uint32_t foc_motor_heartbeat[2] = {0u, 0u};
+static mcpwm_foc_trace_sample_t s_foc_trace[MCPWM_FOC_TRACE_CAPACITY];
+static volatile uint8_t s_foc_trace_head=0u, s_foc_trace_count=0u, s_foc_trace_frozen=0u;
+static volatile uint8_t s_foc_trace_trigger_motor=0u, s_foc_trace_trigger_fault=0u;
+static volatile uint32_t s_foc_trace_write_count=0u;
 volatile uint8_t encoder_detect_stage = 0u;
 /* Startup-align black box. Kept separate from full encoder detect so HOME
  * failures after reboot can be diagnosed without repeating hard-stop calibration. */
@@ -249,10 +253,33 @@ static uint16_t default_motor_poles(bool second) {
 static uint16_t motor_pole_pairs(bool second) {
     const mc_configuration *c = second ? &m_motor_2.m_conf : &m_motor_1.m_conf;
     uint16_t poles = c->si_motor_poles;
-    if (poles < 2u || (poles & 1u)) {
-        poles = default_motor_poles(second);
-    }
+    if (poles < 2u || (poles & 1u)) poles = default_motor_poles(second);
     return (uint16_t)(poles / 2u);
+}
+
+static int16_t foc_trace_erpm(const mcpwm_foc_motor_t *m, bool second) {
+    int32_t e=m->m_pll_valid?(m->m_pll_erpm_q16>>16):((int32_t)m->m_rpm*(int32_t)motor_pole_pairs(second));
+    return (int16_t)CLAMP(e,-32768,32767);
+}
+
+static void foc_trace_capture_internal(uint8_t slot) {
+    if(s_foc_trace_frozen)return;
+    const uint8_t idx=s_foc_trace_head;
+    mcpwm_foc_trace_sample_t *t=&s_foc_trace[idx];
+    uint32_t g=t->guard; if(g&1u)g++;
+    t->guard=g+1u; FOC_MEMORY_BARRIER();
+    t->pwm_tick=buzzerTimer; t->isr_cycles=(uint16_t)CLAMP((int32_t)foc_isr_cycles,0,65535);
+    t->control_slot=slot; t->event_bits=(uint8_t)(((LEFT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u)|((RIGHT_TIM->BDTR&TIM_BDTR_MOE)?2u:0u));
+    t->left_id_q4=m_motor_1.m_id_q4; t->left_iq_q4=m_motor_1.m_iq_q4; t->left_id_set_q4=m_motor_1.m_id_set_q4; t->left_iq_set_q4=m_motor_1.m_iq_set_q4;
+    t->left_vd=m_motor_1.m_vd; t->left_vq=m_motor_1.m_vq; t->left_erpm=foc_trace_erpm(&m_motor_1,false);
+    t->right_id_q4=m_motor_2.m_id_q4; t->right_iq_q4=m_motor_2.m_iq_q4; t->right_id_set_q4=m_motor_2.m_id_set_q4; t->right_iq_set_q4=m_motor_2.m_iq_set_q4;
+    t->right_vd=m_motor_2.m_vd; t->right_vq=m_motor_2.m_vq; t->right_erpm=foc_trace_erpm(&m_motor_2,true);
+    t->vin_adc=(uint16_t)(batVoltage>0?batVoltage:0); t->left_fault=(uint8_t)m_motor_1.m_fault; t->right_fault=(uint8_t)m_motor_2.m_fault;
+    t->left_quality=0u; t->right_quality=0u;
+    FOC_MEMORY_BARRIER(); t->guard=g+2u;
+    s_foc_trace_head=(uint8_t)((idx+1u)%MCPWM_FOC_TRACE_CAPACITY);
+    if(s_foc_trace_count<MCPWM_FOC_TRACE_CAPACITY)s_foc_trace_count++;
+    s_foc_trace_write_count++;
 }
 
 
@@ -1144,6 +1171,14 @@ static void decoupling_coeff_recompute(mcpwm_foc_motor_t *m) {
 static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
     if(!m)return;
     m->m_fault=code;
+    if(code!=FAULT_CODE_NONE && !s_foc_trace_frozen){
+        /* First fault owns the black box. Capture one trigger-state sample then
+         * freeze all older pre-fault history without any formatting/memcpy. */
+        foc_trace_capture_internal(0xfeu);
+        s_foc_trace_trigger_motor=(m==&m_motor_2)?2u:1u;
+        s_foc_trace_trigger_fault=(uint8_t)code;
+        s_foc_trace_frozen=1u;
+    }
     /* Timeout telah dikonversi saat config berubah. Fault path ISR sekarang
      * O(1), tanpa software divide 64-bit pada kondisi yang justru kritis. */
     m->m_fault_recovery_ticks=m->m_fault_stop_ticks?m->m_fault_stop_ticks:1u;
@@ -4591,7 +4626,7 @@ void mcpwm_foc_adc_int_handler(void) {
     motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left);
     if(update_left)foc_motor_heartbeat[0]++;
     motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,update_right);
-    if(update_right)foc_motor_heartbeat[1]++;
+    if(update_right){foc_motor_heartbeat[1]++;foc_trace_capture_internal(control_slot);}
     foc_iqL_q4=m_motor_1.m_iq_q4;foc_idL_q4=m_motor_1.m_id_q4;
     foc_iqR_q4=m_motor_2.m_iq_q4;foc_idR_q4=m_motor_2.m_id_q4;
     LEFT_TIM->LEFT_TIM_U=m_motor_1.m_ccr_a;LEFT_TIM->LEFT_TIM_V=m_motor_1.m_ccr_b;LEFT_TIM->LEFT_TIM_W=m_motor_1.m_ccr_c;
@@ -5128,6 +5163,30 @@ uint32_t mcpwm_foc_get_isr_cycles(void){return foc_isr_cycles;}uint32_t mcpwm_fo
 void mcpwm_foc_get_liveness(uint32_t *adc_heartbeat,uint32_t motor_heartbeat[2]){
     if(adc_heartbeat)*adc_heartbeat=foc_adc_heartbeat;
     if(motor_heartbeat){motor_heartbeat[0]=foc_motor_heartbeat[0];motor_heartbeat[1]=foc_motor_heartbeat[1];}
+}
+void mcpwm_foc_trace_clear(void){
+    s_foc_trace_head=0u;s_foc_trace_count=0u;s_foc_trace_frozen=0u;
+    s_foc_trace_trigger_motor=0u;s_foc_trace_trigger_fault=0u;s_foc_trace_write_count=0u;
+}
+void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out){
+    if(!out)return;
+    out->write_count=s_foc_trace_write_count;
+    out->frozen=s_foc_trace_frozen;
+    out->trigger_motor=s_foc_trace_trigger_motor;out->trigger_fault=s_foc_trace_trigger_fault;
+    out->count=s_foc_trace_count;out->head=s_foc_trace_head;out->capacity=MCPWM_FOC_TRACE_CAPACITY;
+    out->sample_size=(uint16_t)sizeof(mcpwm_foc_trace_sample_t);
+}
+bool mcpwm_foc_trace_read(uint8_t chronological_index,mcpwm_foc_trace_sample_t *out){
+    if(!out)return false;
+    const uint8_t count=s_foc_trace_count;
+    if(chronological_index>=count)return false;
+    const uint8_t head=s_foc_trace_head; const uint8_t oldest=(uint8_t)((head+MCPWM_FOC_TRACE_CAPACITY-count)%MCPWM_FOC_TRACE_CAPACITY);
+    const mcpwm_foc_trace_sample_t *src=&s_foc_trace[(oldest+chronological_index)%MCPWM_FOC_TRACE_CAPACITY];
+    for(uint8_t retry=0u;retry<3u;++retry){
+        const uint32_t a=src->guard;if(a&1u)continue;FOC_MEMORY_BARRIER();mcpwm_foc_trace_sample_t tmp=*src;FOC_MEMORY_BARRIER();
+        const uint32_t b=src->guard;if(a==b && !(b&1u)){*out=tmp;return true;}
+    }
+    return false;
 }
 
 static float q4_to_amp(int16_t q){return (float)q/(float)FOC_CURRENT_Q4_PER_A;}

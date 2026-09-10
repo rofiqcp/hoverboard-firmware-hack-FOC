@@ -444,6 +444,9 @@ HB_GET_STEERING_CAL = 10
 HB_STEERING_HOME = 13
 HB_ENCODER_DEBUG = 14
 HB_GET_ISR_PROFILE = 17
+HB_GET_TRACE_META = 18
+HB_GET_TRACE_SAMPLE = 19
+HB_CLEAR_TRACE = 20
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -1352,6 +1355,26 @@ class VescDual:
             raise RuntimeError(f"isr_profile status={status} len={len(p)}")
         vals=struct.unpack_from(">"+"I"*len(names),p,6)
         return dict(zip(names,vals))
+
+    def trace_meta(self) -> dict[str, int]:
+        p=self.custom_transact(HB_GET_TRACE_META,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_TRACE_META)
+        if status or len(p)!=18: raise RuntimeError(f"trace_meta status={status} len={len(p)}")
+        write_count=struct.unpack_from(">I",p,6)[0]
+        frozen,trigger_motor,trigger_fault,count,head,capacity=struct.unpack_from(">6B",p,10)
+        sample_size=struct.unpack_from(">H",p,16)[0]
+        return {"write_count":write_count,"frozen":frozen,"trigger_motor":trigger_motor,"trigger_fault":trigger_fault,"count":count,"head":head,"capacity":capacity,"sample_size":sample_size}
+
+    def trace_sample(self, index: int) -> dict[str, int]:
+        if index < 0 or index > 255: raise ValueError("trace index out of range")
+        p=self.custom_transact(HB_GET_TRACE_SAMPLE,bytes((index,)),right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_TRACE_SAMPLE)
+        if status or len(p)!=48: raise RuntimeError(f"trace_sample status={status} len={len(p)}")
+        vals=struct.unpack_from(">IHBB14hH4B",p,6)
+        names=("pwm_tick","isr_cycles","control_slot","event_bits","left_id_q4","left_iq_q4","left_id_set_q4","left_iq_set_q4","left_vd","left_vq","left_erpm","right_id_q4","right_iq_q4","right_id_set_q4","right_iq_set_q4","right_vd","right_vq","right_erpm","vin_adc","left_fault","right_fault","left_quality","right_quality")
+        return dict(zip(names,vals))
+
+    def trace_clear(self):
+        p=self.custom_transact(HB_CLEAR_TRACE,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_CLEAR_TRACE)
+        if status: raise RuntimeError(f"trace_clear status={status}")
 
     def set_steering_deg(self, deg: float):
         """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""

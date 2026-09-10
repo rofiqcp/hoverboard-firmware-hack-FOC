@@ -54,6 +54,9 @@
 #define HB_CUSTOM_STEERING_SET_CENTER        15u /* redefine current LEFT ABI position as logical POS180 */
 #define HB_CUSTOM_GET_ROTOR_SNAPSHOT          16u /* simultaneous VESC-standard rotor/position diagnostics */
 #define HB_CUSTOM_GET_ISR_PROFILE             17u /* read/reset cycle profiler; diagnostic only */
+#define HB_CUSTOM_GET_TRACE_META               18u /* compact pre-fault flight-recorder metadata */
+#define HB_CUSTOM_GET_TRACE_SAMPLE             19u /* chronological trace sample */
+#define HB_CUSTOM_CLEAR_TRACE                  20u /* re-arm recorder after diagnosis */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -2247,6 +2250,32 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
 #undef APPP
         uart_send_payload(b,(uint16_t)j); return;
     }
+    if (op == HB_CUSTOM_GET_TRACE_META) {
+        mcpwm_foc_trace_meta_t t; mcpwm_foc_trace_get_meta(&t);
+        uint8_t b[32]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
+        buffer_append_uint32(b,t.write_count,&j);b[j++]=t.frozen;b[j++]=t.trigger_motor;b[j++]=t.trigger_fault;
+        b[j++]=t.count;b[j++]=t.head;b[j++]=t.capacity;buffer_append_uint16(b,t.sample_size,&j);
+        uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_GET_TRACE_SAMPLE) {
+        mcpwm_foc_trace_sample_t t; const uint8_t idx=n?d[0]:0xffu;
+        const uint8_t status=(n>=1u && mcpwm_foc_trace_read(idx,&t))?0u:1u;
+        uint8_t b[64];int32_t j=0;b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=status;
+        if(!status){
+            buffer_append_uint32(b,t.pwm_tick,&j);buffer_append_uint16(b,t.isr_cycles,&j);b[j++]=t.control_slot;b[j++]=t.event_bits;
+#define APPS(v) buffer_append_int16(b,(v),&j)
+            APPS(t.left_id_q4);APPS(t.left_iq_q4);APPS(t.left_id_set_q4);APPS(t.left_iq_set_q4);APPS(t.left_vd);APPS(t.left_vq);APPS(t.left_erpm);
+            APPS(t.right_id_q4);APPS(t.right_iq_q4);APPS(t.right_id_set_q4);APPS(t.right_iq_set_q4);APPS(t.right_vd);APPS(t.right_vq);APPS(t.right_erpm);
+#undef APPS
+            buffer_append_uint16(b,t.vin_adc,&j);b[j++]=t.left_fault;b[j++]=t.right_fault;b[j++]=t.left_quality;b[j++]=t.right_quality;
+        }
+        uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_CLEAR_TRACE) {
+        mcpwm_foc_trace_clear();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};uart_send_payload(b,6u);return;
+    }
+
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
         if(second)return;
         const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(false);

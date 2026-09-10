@@ -251,6 +251,9 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
     memset(out,0,sizeof(*out));
     out->total_max_cycles=2345u;
 }
+void mcpwm_foc_trace_clear(void) {}
+void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out){if(out){memset(out,0,sizeof(*out));out->capacity=MCPWM_FOC_TRACE_CAPACITY;out->sample_size=sizeof(mcpwm_foc_trace_sample_t);}}
+bool mcpwm_foc_trace_read(uint8_t index,mcpwm_foc_trace_sample_t *out){if(!out||index!=0u)return false;memset(out,0,sizeof(*out));out->pwm_tick=123u;return true;}
 float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}

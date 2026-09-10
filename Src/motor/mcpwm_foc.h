@@ -496,6 +496,29 @@ void mcpwm_foc_rl_capture_start(bool is_second_motor);
 void mcpwm_foc_rl_capture_stop(bool is_second_motor);
 void mcpwm_foc_rl_capture_get(bool is_second_motor, mcpwm_foc_rl_capture_t *out);
 
+#define MCPWM_FOC_TRACE_CAPACITY 40u
+
+typedef struct {
+    volatile uint32_t guard;
+    uint32_t pwm_tick;
+    uint16_t isr_cycles;
+    uint8_t control_slot, event_bits;
+    int16_t left_id_q4, left_iq_q4, left_id_set_q4, left_iq_set_q4, left_vd, left_vq, left_erpm;
+    int16_t right_id_q4, right_iq_q4, right_id_set_q4, right_iq_set_q4, right_vd, right_vq, right_erpm;
+    uint16_t vin_adc;
+    uint8_t left_fault, right_fault, left_quality, right_quality;
+} mcpwm_foc_trace_sample_t;
+
+typedef struct {
+    uint32_t write_count;
+    uint8_t frozen, trigger_motor, trigger_fault, count, head, capacity;
+    uint16_t sample_size;
+} mcpwm_foc_trace_meta_t;
+
+void mcpwm_foc_trace_clear(void);
+void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out);
+bool mcpwm_foc_trace_read(uint8_t chronological_index, mcpwm_foc_trace_sample_t *out);
+
 typedef struct {
     uint32_t total_max_cycles, deadline_miss_count;
     uint32_t pre_max_cycles, control_max_cycles, post_max_cycles;
