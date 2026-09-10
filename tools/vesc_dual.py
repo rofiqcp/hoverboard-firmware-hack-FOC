@@ -447,6 +447,7 @@ HB_GET_ISR_PROFILE = 17
 HB_GET_TRACE_META = 18
 HB_GET_TRACE_SAMPLE = 19
 HB_CLEAR_TRACE = 20
+HB_GET_PLATFORM_HEALTH = 21
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -1337,6 +1338,18 @@ class VescDual:
                 "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
                 "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
                 "span":span,"position":pos,"target":target,"pid_target":pid_target}
+
+    def platform_health(self) -> dict[str, int | bool]:
+        p=self.custom_transact(HB_GET_PLATFORM_HEALTH,right=False,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_PLATFORM_HEALTH)
+        if status or len(p)!=46:
+            raise RuntimeError(f"platform_health status={status} len={len(p)}")
+        enabled,healthy,boot_iwdg,_=p[6:10]
+        vals=struct.unpack_from(">9I",p,10)
+        names=("boot_reset_csr","boot_reset_reason","boot_reset_stage","feed_count","reject_count",
+               "adc_heartbeat","left_heartbeat","right_heartbeat","last_feed_ms")
+        out=dict(zip(names,vals)); out.update(enabled=bool(enabled),healthy=bool(healthy),boot_iwdg=bool(boot_iwdg))
+        return out
 
     def isr_profile(self, reset: bool = False) -> dict[str, int]:
         names=(

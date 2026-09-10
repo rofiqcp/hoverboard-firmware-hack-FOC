@@ -13,6 +13,7 @@
 #include "vesc/mcconf_serial.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "platform_watchdog.h"
 #include "motor/mcconf_default.h"
 #include "defines.h"
 
@@ -246,6 +247,8 @@ bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *rat
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
 void mcpwm_foc_reset_isr_profile(void) {}
+void platform_watchdog_get_status(platform_watchdog_status_t *out) { if(out) memset(out,0,sizeof(*out)); }
+bool platform_watchdog_boot_was_iwdg(void) { return false; }
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
     if(!out)return;
     memset(out,0,sizeof(*out));

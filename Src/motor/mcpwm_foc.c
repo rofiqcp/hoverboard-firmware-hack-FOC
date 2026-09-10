@@ -11,6 +11,7 @@
 #include "motor/foc_math.h"
 #include "motor/mcpwm_foc.h"
 #include "encoder/encoder.h"
+#include "platform_watchdog.h"
 
 /* ========================================================================== */
 /* Bare-metal VESC-style dual FOC state                                       */
@@ -513,6 +514,7 @@ static void foc_bounded_delay_ms(uint32_t ms) {
             encoder_gpio_diag_sample_non_isr();
 #endif
             driven_offset_finalize_non_isr();
+            platform_watchdog_service();
         }
         return;
     }
@@ -526,6 +528,7 @@ static void foc_bounded_delay_ms(uint32_t ms) {
         encoder_gpio_diag_sample_non_isr();
 #endif
         driven_offset_finalize_non_isr();
+        platform_watchdog_service();
     }
 }
 

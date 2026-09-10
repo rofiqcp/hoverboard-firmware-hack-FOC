@@ -20,6 +20,7 @@
 #include "vesc/mcconf_serial.h"
 #include "vesc/vesc_protocol.h"
 #include "vesc/app_vesc.h"
+#include "platform_watchdog.h"
 
 #define VESC_FW_MAJOR               6u
 #define VESC_FW_MINOR               0u
@@ -57,6 +58,7 @@
 #define HB_CUSTOM_GET_TRACE_META               18u /* compact pre-fault flight-recorder metadata */
 #define HB_CUSTOM_GET_TRACE_SAMPLE             19u /* chronological trace sample */
 #define HB_CUSTOM_CLEAR_TRACE                  20u /* re-arm recorder after diagnosis */
+#define HB_CUSTOM_GET_PLATFORM_HEALTH           21u /* reset cause + IWDG/liveness supervisory state */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -2249,6 +2251,18 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         APPP(p.adc_heartbeat); APPP(p.motor_heartbeat[0]); APPP(p.motor_heartbeat[1]);
 #undef APPP
         uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_PLATFORM_HEALTH) {
+        platform_watchdog_status_t w; platform_watchdog_get_status(&w);
+        uint8_t b[64]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        b[j++]=w.enabled; b[j++]=w.last_health_ok; b[j++]=w.boot_was_iwdg; b[j++]=0u;
+        buffer_append_uint32(b,w.boot_reset_csr,&j); buffer_append_uint32(b,w.boot_reset_reason,&j);
+        buffer_append_uint32(b,w.boot_reset_stage,&j); buffer_append_uint32(b,w.feed_count,&j);
+        buffer_append_uint32(b,w.reject_count,&j); buffer_append_uint32(b,w.last_adc_heartbeat,&j);
+        buffer_append_uint32(b,w.last_motor_heartbeat[0],&j); buffer_append_uint32(b,w.last_motor_heartbeat[1],&j);
+        buffer_append_uint32(b,w.last_feed_ms,&j); uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_GET_TRACE_META) {
         mcpwm_foc_trace_meta_t t; mcpwm_foc_trace_get_meta(&t);

@@ -12,6 +12,7 @@
 #include "vesc/f103_boot_layout.h"
 #include "vesc/app_vesc.h"
 #include "comms.h"
+#include "platform_watchdog.h"
 
 void SystemClock_Config(void);
 
@@ -129,6 +130,10 @@ int main(void) {
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) HAL_Delay(10);
 #endif
 
+  /* Start IWDG only after potentially long boot/home/button waits. From here on
+   * every intentional blocking commissioning helper services the same health gate. */
+  platform_watchdog_init();
+
   while (1) {
     uint32_t prof0=DWT->CYCCNT;
     /* Deadline control didahulukan dari parser komunikasi. Upstream VESC
@@ -138,6 +143,7 @@ int main(void) {
      * (latensi <=1 ms), tetapi burst VESC tidak boleh menambah jitter kontrol. */
     uint32_t vesc_now_ms = HAL_GetTick();
     mcpwm_foc_outer_control_non_isr(vesc_now_ms);
+    platform_watchdog_service();
 
     /* Drain USART3 circular DMA every main-loop pass as a deterministic
      * fallback to the IDLE-line IRQ, then process protocol in the remaining

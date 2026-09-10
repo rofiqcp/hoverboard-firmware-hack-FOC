@@ -5,6 +5,7 @@
 #include "eeprom.h"
 #include "motor/mcpwm_foc.h"
 #include "motor/mcconf_default.h"
+#include "platform_watchdog.h"
 #include "motor/mc_interface.h"
 
 static int s_motor_selected = 1;
@@ -363,6 +364,7 @@ static void steering_bounded_delay_ms(uint32_t ms) {
         while (ms-- > 0u) {
             HAL_Delay(1u);
             mcpwm_foc_outer_control_non_isr(HAL_GetTick());
+            platform_watchdog_service();
         }
         return;
     }
@@ -371,6 +373,7 @@ static void steering_bounded_delay_ms(uint32_t ms) {
         const uint32_t start = DWT->CYCCNT;
         while ((uint32_t)(DWT->CYCCNT - start) < cycles_per_ms) { (void)DWT->CYCCNT; }
         mcpwm_foc_outer_control_non_isr(HAL_GetTick());
+        platform_watchdog_service();
     }
 }
 
