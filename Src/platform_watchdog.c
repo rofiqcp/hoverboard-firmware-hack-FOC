@@ -17,12 +17,24 @@ static volatile uint32_t s_last_adc_heartbeat=0u;
 static volatile uint32_t s_last_motor_heartbeat[2]={0u,0u};
 static volatile uint8_t s_enabled=0u;
 static volatile uint8_t s_last_health_ok=0u;
+static volatile uint8_t s_init_failed=0u;
 
 static inline void platform_iwdg_reload(void) {
 #ifdef STM32F103xE
     IWDG->KR=0xAAAAu;
 #endif
 }
+
+void platform_watchdog_maintenance_kick(void) {
+#ifdef STM32F103xE
+    if (s_enabled && !s_init_failed) {
+        platform_iwdg_reload();
+        s_last_feed_ms=HAL_GetTick();
+        s_feed_count++;
+    }
+#endif
+}
+
 void platform_watchdog_init(void) {
     uint32_t hb=0u, mh[2]={0u,0u};
     mcpwm_foc_get_liveness(&hb,mh);
@@ -31,18 +43,31 @@ void platform_watchdog_init(void) {
     s_last_motor_heartbeat[1]=mh[1];
     s_last_feed_ms=HAL_GetTick();
 #ifdef STM32F103xE
+    s_init_failed=0u;
+    SET_BIT(RCC->CSR, RCC_CSR_LSION);
+    uint32_t guard=8000000u;
+    while ((RCC->CSR & RCC_CSR_LSIRDY) == 0u && guard-- != 0u) {}
+    if ((RCC->CSR & RCC_CSR_LSIRDY) == 0u) { s_init_failed=1u; goto fail_closed; }
     IWDG->KR=0x5555u;
     IWDG->PR=6u; /* divide LSI by 256 */
     IWDG->RLR=PLATFORM_IWDG_RELOAD;
-    while((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU))!=0u){}
+    guard=8000000u;
+    while ((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU)) != 0u && guard-- != 0u) {}
+    if ((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU)) != 0u) { s_init_failed=1u; goto fail_closed; }
     platform_iwdg_reload();
     IWDG->KR=0xCCCCu;
 #endif
-    s_enabled=1u;
-    s_last_health_ok=1u;
+    s_enabled=1u; s_last_health_ok=1u; return;
+fail_closed:
+    s_enabled=0u; s_last_health_ok=0u;
+    mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
 }
 
 void platform_watchdog_service(void) {
+    if (s_init_failed) {
+        mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+        return;
+    }
     if(!s_enabled)return;
     const uint32_t now=HAL_GetTick();
     if((uint32_t)(now-s_last_feed_ms)<PLATFORM_IWDG_SERVICE_MS)return;

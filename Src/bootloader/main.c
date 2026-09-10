@@ -19,9 +19,9 @@ static UART_HandleTypeDef huart3;
 void SysTick_Handler(void) { HAL_IncTick(); }
 static uint8_t rx_payload[RX_MAX_PAYLOAD];
 
-/* OTA staging is erased lazily, one 2-KiB flash page at a time. This avoids
- * a long 120-KiB blocking erase before COMM_ERASE_NEW_APP can ACK and keeps
- * every flash operation bounded. 120 KiB / 2 KiB = 60 pages. */
+/* Recovery update state is explicit and fail-closed. The host erases the
+ * complete staging region before a new session; duplicate chunk writes remain
+ * idempotent and PENDING metadata is written only after full-image CRC passes. */
 static bool stage_session_active = false;
 static uint32_t stage_session_total = 0u;
 
@@ -78,7 +78,7 @@ static void safe_gpio_init(void) {
     g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15; HAL_GPIO_Init(GPIOB, &g);
 
     g.Mode = GPIO_MODE_AF_PP; g.Pin = GPIO_PIN_10; HAL_GPIO_Init(GPIOB, &g);
-    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_NOPULL; g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOB, &g);
+    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOB, &g);
 }
 
 
@@ -104,7 +104,7 @@ static bool boot_clock_init(void) {
     return HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) == HAL_OK;
 }
 
-static void uart_init(void) {
+static bool uart_init(void) {
     huart3.Instance = USART3;
     huart3.Init.BaudRate = F103_VESC_UART_BAUD;
     huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -113,7 +113,7 @@ static void uart_init(void) {
     huart3.Init.Mode = UART_MODE_TX_RX;
     huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-    (void)HAL_UART_Init(&huart3);
+    return HAL_UART_Init(&huart3) == HAL_OK;
 }
 
 #define RAMFUNC __attribute__((section(".ramfunc"), noinline, long_call))
@@ -180,11 +180,19 @@ static RAMFUNC bool ram_flash_program_block(uint32_t base, const uint8_t *data, 
     return true;
 }
 
+static bool flash_page_erased(uint32_t address) {
+    for (uint32_t off=0u; off<F103_FLASH_PAGE_SIZE; off+=4u) {
+        if (*(volatile const uint32_t *)(address+off) != 0xFFFFFFFFu) return false;
+    }
+    return true;
+}
+
 static bool erase_pages(uint32_t base, uint32_t bytes) {
     if ((base & (F103_FLASH_PAGE_SIZE - 1u)) != 0u || bytes == 0u) return false;
-    const uint32_t pages = (bytes + F103_FLASH_PAGE_SIZE - 1u) / F103_FLASH_PAGE_SIZE;
-    for (uint32_t page = 0u; page < pages; ++page) {
-        if (!ram_flash_erase_page(base + page * F103_FLASH_PAGE_SIZE)) return false;
+    const uint32_t pages=(bytes+F103_FLASH_PAGE_SIZE-1u)/F103_FLASH_PAGE_SIZE;
+    for (uint32_t page=0u; page<pages; ++page) {
+        const uint32_t address=base+page*F103_FLASH_PAGE_SIZE;
+        if (!ram_flash_erase_page(address) || !flash_page_erased(address)) return false;
     }
     return true;
 }
@@ -209,15 +217,18 @@ static bool stage_valid(uint32_t *size_out, uint16_t *crc_out) {
     return true;
 }
 
-static bool app_vector_valid(void) {
-    const uint32_t sp = *(const uint32_t *)F103_APP_BASE_ADDR;
-    const uint32_t rv = *(const uint32_t *)(F103_APP_BASE_ADDR + 4u);
-    /* App linker reserves 0x2000BFF0..0x2000BFFF for boot/reset handoff.
-     * Never accept an initial MSP inside that reserved black-box region. */
+static bool app_vector_valid_for_size(uint32_t image_size) {
+    if (image_size < 8u || image_size > F103_APP_REGION_SIZE) return false;
+    const uint32_t sp=*(const uint32_t *)F103_APP_BASE_ADDR;
+    const uint32_t rv=*(const uint32_t *)(F103_APP_BASE_ADDR+4u);
     if (sp < 0x20000000u || sp > F103_BOOT_REQUEST_ADDR || (sp & 3u)) return false;
     if ((rv & 1u) == 0u) return false;
-    const uint32_t pc = rv & ~1u;
-    return pc >= F103_APP_BASE_ADDR && pc < (F103_APP_BASE_ADDR + F103_APP_REGION_SIZE);
+    const uint32_t pc=rv & ~1u;
+    return pc >= F103_APP_BASE_ADDR && pc < (F103_APP_BASE_ADDR+image_size);
+}
+
+static bool app_vector_valid(void) {
+    return app_vector_valid_for_size(F103_APP_REGION_SIZE);
 }
 
 static bool meta_valid(const f103_update_meta_t *m) {
@@ -225,7 +236,9 @@ static bool meta_valid(const f103_update_meta_t *m) {
     if (m->size != ~m->size_inv) return false;
     if ((uint16_t)(m->crc16 ^ m->crc16_inv) != 0xFFFFu) return false;
     if (m->version != F103_UPDATE_META_VERSION || (uint16_t)(m->version ^ m->version_inv) != 0xFFFFu) return false;
-    return m->state == F103_UPDATE_STATE_PENDING || m->state == F103_UPDATE_STATE_RECOVERY;
+    if (m->state == F103_UPDATE_STATE_PENDING) return m->size > 0u && m->size <= F103_MAX_FW_IMAGE_SIZE;
+    if (m->state == F103_UPDATE_STATE_RECOVERY) return m->size == 0u && m->crc16 == 0u;
+    return false;
 }
 
 static bool write_meta(uint32_t state, uint32_t size, uint16_t crc) {
@@ -280,7 +293,7 @@ static bool copy_pending_image(void) {
     }
     boot_diag_copy_crc_app = crc16((const uint8_t *)F103_APP_BASE_ADDR, size);
     if (boot_diag_copy_crc_app != wanted) { boot_diag_copy_code = 3000u; return false; }
-    if (!app_vector_valid()) { boot_diag_copy_code = 4000u; return false; }
+    if (!app_vector_valid_for_size(size)) { boot_diag_copy_code = 4000u; return false; }
     if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) { boot_diag_copy_code = 5000u; return false; }
     boot_diag_copy_code = 6000u;
     return true;
@@ -312,19 +325,24 @@ static void jump_app(void) {
 
 
 static bool uart_recv_byte(uint8_t *out, uint32_t timeout_ms) {
-    const uint32_t start = HAL_GetTick();
-    while ((HAL_GetTick() - start) < timeout_ms) {
-        const uint32_t sr = USART3->SR;
-        if ((sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) != 0u) {
-            volatile uint32_t discard = USART3->DR;
-            (void)discard;
-            ++boot_diag_uart_errors;
-            continue;
-        }
-        if ((sr & USART_SR_RXNE) != 0u) {
-            *out = (uint8_t)USART3->DR;
+    const uint32_t start=HAL_GetTick();
+    while ((HAL_GetTick()-start)<timeout_ms) {
+        const uint32_t sr=USART3->SR;
+        if ((sr & USART_SR_RXNE)!=0u) {
+            const uint8_t b=(uint8_t)USART3->DR;
+            if ((sr & (USART_SR_FE|USART_SR_NE|USART_SR_PE))!=0u) {
+                ++boot_diag_uart_errors;
+                continue;
+            }
+            if ((sr & USART_SR_ORE)!=0u) ++boot_diag_uart_errors;
+            *out=b;
             ++boot_diag_rx_bytes;
             return true;
+        }
+        if ((sr & USART_SR_ORE)!=0u) {
+            volatile uint32_t discard=USART3->DR;
+            (void)discard;
+            ++boot_diag_uart_errors;
         }
     }
     return false;
@@ -462,7 +480,9 @@ int main(void) {
         for (;;) { }
     }
     safe_gpio_init();
-    uart_init();
+    if (!uart_init()) {
+        for (;;) { HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_2); HAL_Delay(100u); }
+    }
 
     volatile uint32_t *const boot_request = (volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
     const bool force_recovery = boot_request[0] == F103_BOOT_REQUEST_MAGIC &&
@@ -473,23 +493,32 @@ int main(void) {
     boot_request[1] = 0u;
     __DSB();
 
-    const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
-    if (meta_valid(m) && m->state == F103_UPDATE_STATE_PENDING) {
+    const f103_update_meta_t *m=(const f103_update_meta_t *)F103_META_BASE_ADDR;
+    if (meta_valid(m) && m->state==F103_UPDATE_STATE_PENDING) {
         if (copy_pending_image()) NVIC_SystemReset();
-        (void)write_meta(F103_UPDATE_STATE_RECOVERY, 0u, 0u);
+        (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
     }
 
-    bool recovery = force_recovery ||
-                    (meta_valid((const f103_update_meta_t *)F103_META_BASE_ADDR) &&
-                     ((const f103_update_meta_t *)F103_META_BASE_ADDR)->state == F103_UPDATE_STATE_RECOVERY);
-    if (!recovery && app_vector_valid()) {
-        /* A valid application boots immediately. Runtime F411 traffic must never
-         * trap a healthy system in recovery. Firmware update enters here only
-         * through PENDING/RECOVERY metadata written by the application. */
-        jump_app();
-    } else {
-        recovery = true;
+    /* Match the VESC update order: the application already handled
+     * COMM_ERASE_NEW_APP and COMM_WRITE_NEW_APP_DATA. A forced bootloader entry
+     * means staging is complete; validate size+CRC before touching APP, persist
+     * PENDING, then copy. PENDING makes an interrupted copy power-loss safe. */
+    if (force_recovery) {
+        if (stage_to_pending_meta()) {
+            if (copy_pending_image()) NVIC_SystemReset();
+            (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
+        } else if (app_vector_valid()) {
+            /* Invalid/incomplete staging must never destroy or trap a valid app. */
+            jump_app();
+        } else {
+            (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
+        }
     }
+
+    bool recovery=meta_valid((const f103_update_meta_t *)F103_META_BASE_ADDR) &&
+                  ((const f103_update_meta_t *)F103_META_BASE_ADDR)->state==F103_UPDATE_STATE_RECOVERY;
+    if (!recovery && app_vector_valid()) jump_app();
+    recovery=true;
 
     uint32_t blink = HAL_GetTick();
     while (recovery) {

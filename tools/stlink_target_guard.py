@@ -9,9 +9,22 @@ EXPECTED_CORE = "Cortex-M3"
 EXPECTED_DEV_ID = 0x414  # STM32F103 high-density (xC/xD/xE)
 
 
+def resolve_stlink_transport(scripts: Path) -> str:
+    """Select the transport supported by the installed OpenOCD ST-Link driver."""
+    cfg = scripts / "interface" / "stlink.cfg"
+    try:
+        text = cfg.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        text = ""
+    if "adapter driver hla" in text or "hla_layout stlink" in text:
+        return "hla_swd"
+    return "swd"
+
+
 def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100) -> str:
+    transport = resolve_stlink_transport(scripts)
     cmd = [str(openocd), "-s", str(scripts), "-f", "interface/stlink.cfg",
-           "-c", "transport select swd",
+           "-c", f"transport select {transport}",
            "-c", "reset_config srst_only srst_nogate connect_assert_srst",
            "-f", "target/stm32f1x.cfg",
            "-c", f"adapter speed {int(speed)}",

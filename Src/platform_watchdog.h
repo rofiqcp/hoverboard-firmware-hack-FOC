@@ -19,6 +19,7 @@ typedef struct {
 } platform_watchdog_status_t;
 
 void platform_watchdog_init(void);
+void platform_watchdog_maintenance_kick(void);
 #ifdef STM32F103xE
 void platform_watchdog_service(void);
 #else

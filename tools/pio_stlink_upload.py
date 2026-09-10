@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from stlink_target_guard import verify_f103_target
+from stlink_target_guard import resolve_stlink_transport, verify_f103_target
 
 
 def parse_int(value: str) -> int:
@@ -40,10 +40,20 @@ def main() -> None:
         raise SystemExit(f"STLINK_UPLOAD_FAIL: size {size} exceeds {args.max_size}")
 
     pio_home = Path(os.environ.get("PLATFORMIO_CORE_DIR", Path.home() / ".platformio"))
-    openocd = pio_home / "packages/tool-openocd/bin/openocd"
-    scripts = pio_home / "packages/tool-openocd/openocd/scripts"
-    if not openocd.is_file():
-        raise SystemExit(f"STLINK_UPLOAD_FAIL: OpenOCD missing: {openocd}")
+    openocd_root = pio_home / "packages" / "tool-openocd"
+    scripts = openocd_root / "openocd" / "scripts"
+    openocd_candidates = [
+        openocd_root / "bin" / "openocd.exe",
+        openocd_root / "bin" / "openocd",
+    ]
+    openocd = next((candidate for candidate in openocd_candidates if candidate.is_file()), None)
+    if openocd is None:
+        checked = ", ".join(str(candidate) for candidate in openocd_candidates)
+        raise SystemExit(f"STLINK_UPLOAD_FAIL: OpenOCD missing; checked: {checked}")
+    if not scripts.is_dir():
+        raise SystemExit(f"STLINK_UPLOAD_FAIL: OpenOCD scripts missing: {scripts}")
+
+    transport = resolve_stlink_transport(scripts)
 
     try:
         verify_f103_target(openocd, scripts, 100)
@@ -58,18 +68,14 @@ def main() -> None:
         cmd = [
             str(openocd), "-s", str(scripts),
             "-f", "interface/stlink.cfg",
-            "-c", "transport select swd",
-            "-c", "reset_config srst_only srst_nogate connect_assert_srst",
+            "-c", f"transport select {transport}",
             "-f", "target/stm32f1x.cfg",
             "-c", f"adapter speed {speed}",
-            # Connect while NRST is asserted, halt before the application can
-            # execute, then use explicit erase/write/verify operations. Only
-            # release reset after verification has succeeded.
+            # Use OpenOCD's program helper for binary images. It performs the
+            # erase/program/verify sequence with the flash driver's supported
+            # reset flow, which is more reliable with HLA ST-Link on Windows.
             "-c", (
-                f"init; halt; "
-                f"flash write_image erase {{{image}}} 0x{args.address:08X} bin; "
-                f"verify_image {{{image}}} 0x{args.address:08X} bin; "
-                "mww 0xE000ED0C 0x05FA0004; shutdown"
+                f"program {{{image}}} 0x{args.address:08X} verify reset exit"
             ),
         ]
         print(

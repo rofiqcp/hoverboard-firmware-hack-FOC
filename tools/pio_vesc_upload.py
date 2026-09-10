@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-import argparse, fcntl, os, signal, socket, struct, subprocess, sys, time
+import argparse, os, signal, socket, struct, subprocess, sys, tempfile, time
 from pathlib import Path
+try:
+    import fcntl
+except ImportError:
+    fcntl=None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt=None
 
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 MAX_FW=120*1024-6
@@ -16,26 +24,43 @@ class RestartUploadSession(RuntimeError):
     pass
 
 class UploadProcessLock:
-    def __init__(self, key: str):
+    def __init__(self,key:str):
         safe=''.join(c if c.isalnum() else '_' for c in key)[:96]
-        self.path=Path('/tmp')/f'pio_vesc_upload_{safe}.lock'
+        self.path=Path(tempfile.gettempdir())/f'pio_vesc_upload_{safe}.lock'
         self.fd=None
     def __enter__(self):
-        self.fd=os.open(self.path, os.O_CREAT|os.O_RDWR, 0o660)
+        self.fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o660)
+        if os.name=='nt':
+            if msvcrt is None: raise RuntimeError('Windows locking unavailable')
+            if os.path.getsize(self.path)==0: os.write(self.fd,b'\0')
+            os.lseek(self.fd,0,os.SEEK_SET)
+            try: msvcrt.locking(self.fd,msvcrt.LK_NBLCK,1)
+            except OSError:
+                os.lseek(self.fd,1,os.SEEK_SET)
+                owner=os.read(self.fd,160).decode(errors='replace').strip()
+                os.close(self.fd); self.fd=None
+                raise RuntimeError('another firmware uploader is active'+(f' ({owner})' if owner else ''))
+        else:
+            if fcntl is None: raise RuntimeError('POSIX locking unavailable')
+            try: fcntl.flock(self.fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.lseek(self.fd,0,os.SEEK_SET)
+                owner=os.read(self.fd,160).decode(errors='replace').strip('\0').strip()
+                os.close(self.fd); self.fd=None
+                raise RuntimeError('another firmware uploader is active'+(f' ({owner})' if owner else ''))
+        meta=f'pid={os.getpid()} started={time.time():.3f}'.encode()
+        os.ftruncate(self.fd,0)
+        os.write(self.fd,b'\0'+meta if os.name=='nt' else meta)
+        os.fsync(self.fd); return self
+    def __exit__(self,exc_type,exc,tb):
+        if self.fd is None: return
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            try:
-                os.lseek(self.fd,0,os.SEEK_SET); owner=os.read(self.fd,128).decode(errors='replace').strip()
-            except Exception:
-                owner=''
-            raise RuntimeError(f'another firmware uploader is already active{f" ({owner})" if owner else ""}')
-        os.ftruncate(self.fd,0); os.write(self.fd, f'pid={os.getpid()} started={time.time():.3f}'.encode()); os.fsync(self.fd)
-        return self
-    def __exit__(self, exc_type, exc, tb):
-        if self.fd is not None:
-            try: fcntl.flock(self.fd, fcntl.LOCK_UN)
-            finally: os.close(self.fd); self.fd=None
+            if os.name=='nt':
+                os.lseek(self.fd,0,os.SEEK_SET); msvcrt.locking(self.fd,msvcrt.LK_UNLCK,1)
+            else:
+                fcntl.flock(self.fd,fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd); self.fd=None
 
 def crc16(data: bytes)->int:
     crc=0
@@ -49,6 +74,16 @@ def frame(payload: bytes)->bytes:
     h=bytes((2,n)) if n<=255 else bytes((3,(n>>8)&255,n&255))
     c=crc16(payload)
     return h+payload+bytes((c>>8,c&255,3))
+
+def _stable_linux_port(device:str)->str:
+    if os.name!='posix': return device
+    root=Path('/dev/serial/by-id')
+    try:
+        target=os.path.realpath(device)
+        for p in sorted(root.iterdir()):
+            if os.path.realpath(str(p))==target: return str(p)
+    except OSError: pass
+    return device
 
 class Link:
     def __init__(self,args):
@@ -264,6 +299,9 @@ class Link:
             self._open_f411_direct(); self.route='f411_direct'; return
         import serial
         self.ser=serial.Serial(self.args.serial_port,self.args.baud,timeout=.1,write_timeout=2)
+        try:
+            self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
+        except Exception: pass
         self.route='serial'
 
     def close(self):
@@ -347,50 +385,62 @@ def fw_version(link,timeout=2.0):
     if len(p)<4: return 'unknown'
     z=p.find(b'\0',3); return p[3:z if z>=0 else len(p)].decode(errors='replace')
 
-def wait_for_bootloader(link, initial_hw: str) -> str:
-    if 'bootloader' in initial_hw.lower():
-        return initial_hw
-    print(f'[VESC] application connected: {initial_hw}; entering resident bootloader', flush=True)
-    # The application writes only a dual-word SRAM boot request and resets.
-    # No flash write and no motor command is issued; recovery starts fail-safe.
-    link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
-    deadline=time.monotonic()+20.0
-    last=''
-    while time.monotonic()<deadline:
-        time.sleep(.25)
+
+def _serial_candidates():
+    import serial.tools.list_ports
+    ranked=[]
+    for p in serial.tools.list_ports.comports():
+        dev=_stable_linux_port(p.device)
+        meta=' '.join(str(x or '') for x in (p.description,p.manufacturer,p.hwid)).lower()
+        score=(100 if p.vid is not None else 0)+(40 if 'usb' in meta else 0)
+        if 'ch340' in meta or 'ch341' in meta or p.vid==0x1A86: score+=30
+        if '/dev/serial/by-id/' in dev: score+=25
+        if 'bluetooth' in meta or 'active management' in meta or 'amt' in meta: score-=150
+        ranked.append((-score,dev,p.description or ''))
+    ranked.sort(key=lambda x:(x[0],x[1])); out=[]
+    for _,dev,desc in ranked:
+        if dev not in [x[0] for x in out]: out.append((dev,desc))
+    return out
+
+def resolve_serial_port(args):
+    requested=(args.serial_port or 'auto').strip()
+    if requested.lower() not in ('auto','detect'): return requested
+    override=os.environ.get('VESC_SERIAL_PORT','').strip()
+    candidates=_serial_candidates()
+    if override: candidates=[(override,'VESC_SERIAL_PORT override')]+[x for x in candidates if x[0]!=override]
+    if not candidates: raise RuntimeError('no serial ports detected; use --serial-port explicitly')
+    errors=[]
+    for dev,desc in candidates:
+        probe=argparse.Namespace(**vars(args)); probe.serial_port=dev; link=None
         try:
-            last=fw_version(link,1.0)
-            if 'bootloader' in last.lower():
-                print(f'[VESC] bootloader ready: {last}', flush=True)
-                return last
-        except Exception:
-            pass
-    raise RuntimeError(f'bootloader did not appear; last={last!r}')
+            link=Link(probe); hw=fw_version(link,1.0)
+            print(f'[PORT] selected {dev} ({desc}) target={hw}',flush=True); return dev
+        except Exception as e:
+            errors.append(f'{dev}:{type(e).__name__}')
+        finally:
+            if link is not None:
+                try: link.close()
+                except Exception: pass
+    raise RuntimeError('no VESC/F103 target responded on serial ports: '+', '.join(errors))
 
-
-def _recover_bootloader_transport(link, reason: str):
-    print(f'[VESC] transport recovery: {reason}', flush=True)
+def _recover_staging_transport(link, reason: str):
+    print(f'[VESC] transport recovery during staging: {reason}',flush=True)
     last_error=None
     for attempt in range(1,5):
         try:
-            if link.sock is not None or link.args.transport in ('tcp','f411'):
-                if link.sock is not None:
-                    link.reconnect_tcp()
-                elif link.args.transport=='tcp':
-                    link._open_tcp(attempts=4)
+            if link.sock is not None:
+                link.reconnect_tcp()
+            elif link.args.transport=='tcp':
+                link._open_tcp(attempts=4)
             hw=fw_version(link,3.0)
-            if 'bootloader' in hw.lower():
-                print(f'[VESC] recovery probe bootloader ready: {hw}', flush=True)
-                return
-            wait_for_bootloader(link,hw)
-            raise RestartUploadSession('target application restarted; staging session must restart from erase')
+            print(f'[VESC] transport recovered target={hw}; restart staging from erase',flush=True)
+            raise RestartUploadSession('transport recovered; staging must restart from erase')
         except RestartUploadSession:
             raise
         except Exception as e:
             last_error=e
             time.sleep(.20*attempt)
     raise RuntimeError(f'transport recovery failed: {last_error}')
-
 
 def _stage_once(link,fw:bytes,session:int):
     p=link.transact(bytes((COMM_ERASE_NEW_APP,))+struct.pack('>I',len(fw)),COMM_ERASE_NEW_APP,10)
@@ -399,7 +449,7 @@ def _stage_once(link,fw:bytes,session:int):
     # The F411 path crosses TCP -> ROS -> USB CDC -> 115200 UART. Smaller
     # packets reduce worst-case blocking and USB/UART burst pressure while the
     # bootloader's idempotent writes make retries safe.
-    step=128 if link.args.transport=='f411' else 192
+    step=128 if link.args.transport in ('f411','tcp') else 384
     for off in range(0,len(staged),step):
         chunk=staged[off:off+step]
         request=bytes((COMM_WRITE_NEW_APP_DATA,))+struct.pack('>I',off)+chunk
@@ -423,7 +473,7 @@ def _stage_once(link,fw:bytes,session:int):
                 # One immediate idempotent retry handles a lost ACK. If two
                 # attempts fail on TCP, rebuild the socket/maintenance route.
                 if attempt==2 and link.sock is not None:
-                    _recover_bootloader_transport(link,f'offset={off}')
+                    _recover_staging_transport(link,f'offset={off}')
                 time.sleep(.08*attempt)
         if last_error is not None:
             raise RuntimeError(f'write failed at {off}: {last_error}')
@@ -433,32 +483,33 @@ def _stage_once(link,fw:bytes,session:int):
 
 
 def upload(link,fw:bytes):
-    if not fw or len(fw)>MAX_FW: raise RuntimeError(f'firmware size {len(fw)} exceeds {MAX_FW}')
+    if not fw or len(fw)>MAX_FW:
+        raise RuntimeError(f'firmware size {len(fw)} exceeds {MAX_FW}')
     hw=None; last_error=None
-    # An interrupted resident-bootloader staging/copy can leave the F103 busy for
-    # tens of seconds before the application services USART3 again. Keep the
-    # F411 maintenance ownership alive and probe gently instead of failing after
-    # a fixed handful of long transactions.
     probe_deadline=time.monotonic()+75.0
     attempt=0
     while time.monotonic()<probe_deadline:
-        attempt += 1
+        attempt+=1
         try:
             hw=fw_version(link,1.2)
             break
         except Exception as e:
             last_error=e
             if link.sock is not None and link.args.transport=='tcp':
-                try:
-                    link.reconnect_tcp()
-                except Exception as re:
-                    last_error=re
+                try: link.reconnect_tcp()
+                except Exception as re: last_error=re
             if attempt==1 or attempt%4==0:
                 remain=max(0,int(probe_deadline-time.monotonic()))
                 print(f'[VESC] waiting for F103 response attempt={attempt} remaining={remain}s',flush=True)
             time.sleep(.15)
-    if hw is None: raise RuntimeError(f'initial firmware probe failed after recovery window: {last_error}')
-    wait_for_bootloader(link,hw)
+    if hw is None:
+        raise RuntimeError(f'initial firmware probe failed after recovery window: {last_error}')
+
+    recovery_target='bootloader' in hw.lower()
+    if recovery_target:
+        print(f'[VESC] recovery bootloader connected: {hw}',flush=True)
+    else:
+        print(f'[VESC] application connected: {hw}; staging before bootloader jump',flush=True)
 
     stage_error=None
     for session in range(1,4):
@@ -470,38 +521,58 @@ def upload(link,fw:bytes):
             stage_error=e
         except Exception as e:
             stage_error=e
-        if session>=3: break
-        print(f'[VESC] staging session {session} failed: {stage_error}; restarting from erase', flush=True)
-        _recover_bootloader_transport(link,f'restart staging session {session+1}')
+        if session>=3:
+            break
+        print(f'[VESC] staging session {session} failed: {stage_error}; restarting from erase',flush=True)
+        try:
+            if link.sock is not None:
+                link.reconnect_tcp()
+            hw=fw_version(link,3.0)
+            recovery_target='bootloader' in hw.lower()
+        except Exception:
+            pass
     if stage_error is not None:
         raise RuntimeError(f'staging failed after recovery attempts: {stage_error}')
 
+    # VESC-standard ordering: ERASE/WRITE happen while application is alive.
+    # The bootloader is entered only after size+CRC+image are fully ACKed.
     link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
-    print('[VESC] staged CRC complete; bootloader copy requested', flush=True)
+    print('[VESC] staging complete; COMM_JUMP_TO_BOOTLOADER sent',flush=True)
     link.buf.clear()
-    if hasattr(link, 'linebuf'): link.linebuf.clear()
-    deadline=time.monotonic()+45
-    last=''; stable_app_probes=0; probe_failures=0
+    if hasattr(link,'linebuf'):
+        link.linebuf.clear()
+    if link.ser is not None and not link.f411_direct:
+        try: link.ser.reset_input_buffer()
+        except Exception: pass
+
+    deadline=time.monotonic()+60.0
+    last=''; stable_app_probes=0; probe_failures=0; bootloader_probes=0
     while time.monotonic()<deadline:
-        time.sleep(.4)
+        time.sleep(.40)
         try:
             last=fw_version(link,1.5)
             probe_failures=0
             if last and 'bootloader' not in last.lower():
-                stable_app_probes += 1
-                if stable_app_probes >= 2:
-                    print(f'[VESC] application returned stable: {last}', flush=True); return
+                stable_app_probes+=1
+                if stable_app_probes>=2:
+                    print(f'[VESC] application returned stable: {last}',flush=True)
+                    return
             else:
-                stable_app_probes = 0
+                stable_app_probes=0
+                bootloader_probes+=1
+                if bootloader_probes==1:
+                    print(f'[VESC] recovery bootloader visible while waiting for app: {last}',flush=True)
         except Exception as e:
-            stable_app_probes = 0; probe_failures += 1
+            stable_app_probes=0
+            probe_failures+=1
             if probe_failures>=3 and link.sock is not None:
                 try:
-                    link.reconnect_tcp(); probe_failures=0
-                    print(f'[VESC] reconnect while waiting for updated application: {e}', flush=True)
+                    link.reconnect_tcp()
+                    probe_failures=0
+                    print(f'[VESC] reconnect while waiting for updated application: {e}',flush=True)
                 except Exception:
                     pass
-    raise RuntimeError(f'application did not return stably after update; last={last!r}')
+    raise RuntimeError(f'application did not return stably after bootloader copy; last={last!r}')
 
 def selftest():
     p=b'\x00\x06\x00test\x00'; f=frame(p)
@@ -512,16 +583,27 @@ def selftest():
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--transport',choices=['serial','tcp','f411'])
-    ap.add_argument('--serial-port'); ap.add_argument('--baud',type=int,default=1000000)
+    ap.add_argument('--serial-port',default='auto',help='serial device, or auto for VESC/F103 probe-based detection')
+    ap.add_argument('--baud',type=int,default=1000000)
     ap.add_argument('--host',default='127.0.0.1'); ap.add_argument('--port',type=int,default=65101)
     ap.add_argument('--tcp-wait',type=float,default=5.0,help='maksimum deteksi TCP maintenance sebelum fallback F411 CDC (maks 5 s)')
-    ap.add_argument('--firmware'); ap.add_argument('--selftest',action='store_true')
+    ap.add_argument('--firmware'); ap.add_argument('--selftest',action='store_true'); ap.add_argument('--probe-only',action='store_true')
     a=ap.parse_args()
     if a.selftest: selftest(); return
-    if not a.transport or not a.firmware: ap.error('--transport and --firmware required')
-    if a.transport in ('serial','f411') and not a.serial_port: ap.error('--serial-port required')
-    fw=Path(a.firmware).read_bytes()
+    if not a.transport: ap.error('--transport required')
+    if a.transport=='serial':
+        a.serial_port=resolve_serial_port(a)
+    elif a.transport=='f411' and (not a.serial_port or a.serial_port.lower() in ('auto','detect')):
+        ap.error('--serial-port must be explicit for f411 transport')
     lock_key=f'{a.transport}_{a.host}_{a.port}_{a.serial_port or "none"}'
+    if a.probe_only:
+        with UploadProcessLock(lock_key):
+            link=Link(a)
+            try: print(f'VESC_TARGET_PROBE_PASS port={a.serial_port} hw={fw_version(link,2.0)}',flush=True)
+            finally: link.close()
+        return
+    if not a.firmware: ap.error('--firmware required unless --probe-only or --selftest')
+    fw=Path(a.firmware).read_bytes()
     with UploadProcessLock(lock_key):
         link=Link(a)
         try: upload(link,fw)
