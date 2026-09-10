@@ -4,129 +4,65 @@
 #include <stdint.h>
 #include <string.h>
 
-#define COMM_FW_VERSION          0u
-#define COMM_JUMP_TO_BOOTLOADER  1u
-#define COMM_ERASE_NEW_APP       2u
-#define COMM_WRITE_NEW_APP_DATA  3u
-#define COMM_REBOOT             29u
-#define COMM_ALIVE              30u
-
-#define RX_MAX_PAYLOAD 512u
-#define RECOVERY_IDLE_BLINK_MS  250u
-
-static UART_HandleTypeDef huart3;
-
-void SysTick_Handler(void) { HAL_IncTick(); }
-static uint8_t rx_payload[RX_MAX_PAYLOAD];
-
-/* Recovery update state is explicit and fail-closed. The host erases the
- * complete staging region before a new session; duplicate chunk writes remain
- * idempotent and PENDING metadata is written only after full-image CRC passes. */
-static bool stage_session_active = false;
-static uint32_t stage_session_total = 0u;
-
-/* SWD-readable recovery diagnostics; no protocol or motor-side effect. */
-volatile uint32_t boot_diag_rx_bytes = 0u;
-volatile uint32_t boot_diag_start_frames = 0u;
-volatile uint32_t boot_diag_packets_ok = 0u;
-volatile uint32_t boot_diag_crc_errors = 0u;
-volatile uint32_t boot_diag_tx_replies = 0u;
-volatile uint32_t boot_diag_uart_errors = 0u;
-volatile uint32_t boot_diag_copy_code = 0u;
-volatile uint32_t boot_diag_copy_page = 0u;
-volatile uint32_t boot_diag_copy_addr = 0u;
-volatile uint32_t boot_diag_copy_size = 0u;
-volatile uint32_t boot_diag_copy_crc_stage = 0u;
-volatile uint32_t boot_diag_copy_crc_app = 0u;
+#define RAMFUNC __attribute__((section(".ramfunc"), noinline, long_call))
+#define FLASH_ERROR_MASK (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)
+#define COPY_RETRIES 3u
 
 static uint16_t crc16(const uint8_t *data, uint32_t len) {
     uint16_t crc = 0u;
     for (uint32_t i = 0u; i < len; ++i) {
         crc ^= (uint16_t)data[i] << 8;
         for (uint8_t b = 0u; b < 8u; ++b) {
-            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+            crc = (crc & 0x8000u) ?
+                (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
         }
     }
     return crc;
 }
 
 static uint32_t be32(const uint8_t *p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
-static uint16_t be16(const uint8_t *p) { return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); }
 
+static uint16_t be16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
 static void safe_gpio_init(void) {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_AFIO_CLK_ENABLE();
-    __HAL_RCC_USART3_CLK_ENABLE();
 
-    /* Hoverboard half-bridges: high-side pins LOW, complementary low-side pins HIGH. */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET); /* keep power latch on */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET); /* buzzer off */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET); /* LED off */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_13 |
+                     GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
 
     GPIO_InitTypeDef g = {0};
-    g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_HIGH;
-    g.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8; HAL_GPIO_Init(GPIOC, &g);
-    g.Pin = GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_5 | GPIO_PIN_4; HAL_GPIO_Init(GPIOA, &g);
-    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15; HAL_GPIO_Init(GPIOB, &g);
-
-    g.Mode = GPIO_MODE_AF_PP; g.Pin = GPIO_PIN_10; HAL_GPIO_Init(GPIOB, &g);
-    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOB, &g);
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    g.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8;
+    HAL_GPIO_Init(GPIOC, &g);
+    g.Pin = GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 |
+            GPIO_PIN_5 | GPIO_PIN_4;
+    HAL_GPIO_Init(GPIOA, &g);
+    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13 |
+            GPIO_PIN_14 | GPIO_PIN_15;
+    HAL_GPIO_Init(GPIOB, &g);
 }
-
-
-static bool boot_clock_init(void) {
-    /* Match the application clock tree so USART3 can run the project-wide
-     * high-speed VESC transport: HSI/2 * 16 = 64 MHz SYSCLK, APB1 = 32 MHz.
-     * HAL_Init() is called first with a correct 8-MHz SystemCoreClock model,
-     * therefore the oscillator-switch timeouts and SysTick are valid. */
-    RCC_OscInitTypeDef osc = {0};
-    RCC_ClkInitTypeDef clk = {0};
-    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-    osc.HSIState = RCC_HSI_ON;
-    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    osc.PLL.PLLState = RCC_PLL_ON;
-    osc.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
-    osc.PLL.PLLMUL = RCC_PLL_MUL16;
-    if (HAL_RCC_OscConfig(&osc) != HAL_OK) return false;
-    clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV2;
-    clk.APB2CLKDivider = RCC_HCLK_DIV1;
-    return HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) == HAL_OK;
-}
-
-static bool uart_init(void) {
-    huart3.Instance = USART3;
-    huart3.Init.BaudRate = F103_VESC_UART_BAUD;
-    huart3.Init.WordLength = UART_WORDLENGTH_8B;
-    huart3.Init.StopBits = UART_STOPBITS_1;
-    huart3.Init.Parity = UART_PARITY_NONE;
-    huart3.Init.Mode = UART_MODE_TX_RX;
-    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-    return HAL_UART_Init(&huart3) == HAL_OK;
-}
-
-#define RAMFUNC __attribute__((section(".ramfunc"), noinline, long_call))
-#define FLASH_ERROR_MASK (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)
-
-static RAMFUNC bool ram_flash_wait_ready(uint32_t guard) {
+static RAMFUNC bool flash_wait_ready(uint32_t guard) {
     while ((FLASH->SR & FLASH_SR_BSY) != 0u) {
         if (guard-- == 0u) return false;
     }
     return true;
 }
 
-static RAMFUNC bool ram_flash_unlock(void) {
+static RAMFUNC bool flash_unlock(void) {
     if ((FLASH->CR & FLASH_CR_LOCK) != 0u) {
         FLASH->KEYR = FLASH_KEY1;
         FLASH->KEYR = FLASH_KEY2;
@@ -134,43 +70,44 @@ static RAMFUNC bool ram_flash_unlock(void) {
     return (FLASH->CR & FLASH_CR_LOCK) == 0u;
 }
 
-static RAMFUNC void ram_flash_clear_status(void) {
+static RAMFUNC void flash_clear_status(void) {
     FLASH->SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
 }
 
-static RAMFUNC bool ram_flash_erase_page(uint32_t address) {
-    if (!ram_flash_wait_ready(8000000u) || !ram_flash_unlock()) return false;
-    ram_flash_clear_status();
+static RAMFUNC bool flash_erase_page(uint32_t address) {
+    if (!flash_wait_ready(8000000u) || !flash_unlock()) return false;
+    flash_clear_status();
     FLASH->CR |= FLASH_CR_PER;
     FLASH->AR = address;
     FLASH->CR |= FLASH_CR_STRT;
-    const bool ready = ram_flash_wait_ready(8000000u);
+    const bool ready = flash_wait_ready(8000000u);
     const uint32_t sr = FLASH->SR;
     FLASH->CR &= ~FLASH_CR_PER;
     FLASH->CR |= FLASH_CR_LOCK;
-    ram_flash_clear_status();
+    flash_clear_status();
     return ready && (sr & FLASH_ERROR_MASK) == 0u;
 }
-
-static RAMFUNC bool ram_flash_program_block(uint32_t base, const uint8_t *data, uint32_t len) {
-    if (!data || (base & 1u) != 0u || !ram_flash_wait_ready(8000000u) || !ram_flash_unlock()) return false;
-    ram_flash_clear_status();
+static RAMFUNC bool flash_program_block(uint32_t base,
+                                        const uint8_t *data,
+                                        uint32_t len) {
+    if (!data || (base & 1u) != 0u ||
+        !flash_wait_ready(8000000u) || !flash_unlock()) return false;
+    flash_clear_status();
     for (uint32_t i = 0u; i < len; i += 2u) {
         uint16_t wanted = data[i];
         wanted |= (uint16_t)((i + 1u < len ? data[i + 1u] : 0xFFu) << 8);
         volatile uint16_t *dst = (volatile uint16_t *)(base + i);
-        const uint16_t current = *dst;
-        if (current == wanted) continue;
-        if (current != 0xFFFFu) {
+        if (*dst == wanted) continue;
+        if (*dst != 0xFFFFu) {
             FLASH->CR |= FLASH_CR_LOCK;
             return false;
         }
         FLASH->CR |= FLASH_CR_PG;
         *dst = wanted;
-        const bool ready = ram_flash_wait_ready(1000000u);
+        const bool ready = flash_wait_ready(1000000u);
         const uint32_t sr = FLASH->SR;
         FLASH->CR &= ~FLASH_CR_PG;
-        ram_flash_clear_status();
+        flash_clear_status();
         if (!ready || (sr & FLASH_ERROR_MASK) != 0u || *dst != wanted) {
             FLASH->CR |= FLASH_CR_LOCK;
             return false;
@@ -179,37 +116,25 @@ static RAMFUNC bool ram_flash_program_block(uint32_t base, const uint8_t *data, 
     FLASH->CR |= FLASH_CR_LOCK;
     return true;
 }
-
-static bool flash_page_erased(uint32_t address) {
-    for (uint32_t off=0u; off<F103_FLASH_PAGE_SIZE; off+=4u) {
-        if (*(volatile const uint32_t *)(address+off) != 0xFFFFFFFFu) return false;
+static bool page_erased(uint32_t address) {
+    for (uint32_t off = 0u; off < F103_FLASH_PAGE_SIZE; off += 4u) {
+        if (*(volatile const uint32_t *)(address + off) != 0xFFFFFFFFu) return false;
     }
     return true;
 }
 
-static bool erase_pages(uint32_t base, uint32_t bytes) {
-    if ((base & (F103_FLASH_PAGE_SIZE - 1u)) != 0u || bytes == 0u) return false;
-    const uint32_t pages=(bytes+F103_FLASH_PAGE_SIZE-1u)/F103_FLASH_PAGE_SIZE;
-    for (uint32_t page=0u; page<pages; ++page) {
-        const uint32_t address=base+page*F103_FLASH_PAGE_SIZE;
-        if (!ram_flash_erase_page(address) || !flash_page_erased(address)) return false;
-    }
-    return true;
+static bool erase_page(uint32_t address) {
+    return flash_erase_page(address) && page_erased(address);
 }
 
-static bool program_halfwords(uint32_t base, const uint8_t *data, uint32_t len) {
-    if (!data || (base & 1u) != 0u) return false;
-    if (!ram_flash_program_block(base, data, len)) return false;
-    return memcmp((const void *)base, data, len) == 0;
-}
-
-static bool erase_one_page(uint32_t address) {
-    return erase_pages(address, F103_FLASH_PAGE_SIZE);
+static bool erase_meta(void) {
+    return erase_page(F103_META_BASE_ADDR);
 }
 
 static bool stage_valid(uint32_t *size_out, uint16_t *crc_out) {
     const uint8_t *s = (const uint8_t *)F103_STAGE_BASE_ADDR;
-    uint32_t size = be32(s); uint16_t wanted = be16(s + 4u);
+    const uint32_t size = be32(s);
+    const uint16_t wanted = be16(s + 4u);
     if (size == 0u || size > F103_MAX_FW_IMAGE_SIZE) return false;
     if (crc16(s + F103_VESC_IMAGE_HEADER_SIZE, size) != wanted) return false;
     if (size_out) *size_out = size;
@@ -217,90 +142,72 @@ static bool stage_valid(uint32_t *size_out, uint16_t *crc_out) {
     return true;
 }
 
-static bool app_vector_valid_for_size(uint32_t image_size) {
-    if (image_size < 8u || image_size > F103_APP_REGION_SIZE) return false;
-    const uint32_t sp=*(const uint32_t *)F103_APP_BASE_ADDR;
-    const uint32_t rv=*(const uint32_t *)(F103_APP_BASE_ADDR+4u);
-    if (sp < 0x20000000u || sp > F103_BOOT_REQUEST_ADDR || (sp & 3u)) return false;
-    if ((rv & 1u) == 0u) return false;
-    const uint32_t pc=rv & ~1u;
-    return pc >= F103_APP_BASE_ADDR && pc < (F103_APP_BASE_ADDR+image_size);
-}
-
-static bool app_vector_valid(void) {
-    return app_vector_valid_for_size(F103_APP_REGION_SIZE);
-}
-
-static bool meta_valid(const f103_update_meta_t *m) {
+static bool pending_valid(const f103_update_meta_t *m) {
     if (!m || m->magic != F103_UPDATE_META_MAGIC) return false;
+    if (m->state != F103_UPDATE_STATE_PENDING) return false;
+    if (m->size == 0u || m->size > F103_MAX_FW_IMAGE_SIZE) return false;
     if (m->size != ~m->size_inv) return false;
     if ((uint16_t)(m->crc16 ^ m->crc16_inv) != 0xFFFFu) return false;
-    if (m->version != F103_UPDATE_META_VERSION || (uint16_t)(m->version ^ m->version_inv) != 0xFFFFu) return false;
-    if (m->state == F103_UPDATE_STATE_PENDING) return m->size > 0u && m->size <= F103_MAX_FW_IMAGE_SIZE;
-    if (m->state == F103_UPDATE_STATE_RECOVERY) return m->size == 0u && m->crc16 == 0u;
-    return false;
-}
-
-static bool write_meta(uint32_t state, uint32_t size, uint16_t crc) {
-    f103_update_meta_t m;
-    m.magic = F103_UPDATE_META_MAGIC; m.state = state;
-    m.size = size; m.size_inv = ~size;
-    m.crc16 = crc; m.crc16_inv = (uint16_t)~crc;
-    m.version = F103_UPDATE_META_VERSION; m.version_inv = (uint16_t)~F103_UPDATE_META_VERSION;
-    if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) return false;
-    return program_halfwords(F103_META_BASE_ADDR, (const uint8_t *)&m, sizeof(m));
-}
-
-static bool stage_to_pending_meta(void) {
-    uint32_t size = 0u; uint16_t crc = 0u;
-    if (!stage_valid(&size, &crc)) return false;
-    return write_meta(F103_UPDATE_STATE_PENDING, size, crc);
-}
-
-static bool copy_pending_image(void) {
-    const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
-    boot_diag_copy_code = 1u;
-    if (!meta_valid(m) || m->state != F103_UPDATE_STATE_PENDING) return false;
-    uint32_t size = 0u; uint16_t wanted = 0u;
-    boot_diag_copy_code = 2u;
-    if (!stage_valid(&size, &wanted)) return false;
-    boot_diag_copy_size = size;
-    boot_diag_copy_crc_stage = crc16((const uint8_t *)(F103_STAGE_BASE_ADDR + F103_VESC_IMAGE_HEADER_SIZE), size);
-    boot_diag_copy_code = 3u;
-    if (size != m->size || wanted != m->crc16) return false;
-
-    /* Copy page-by-page. PENDING metadata stays intact until the complete app
-     * CRC and vector are valid, so a power loss retries from page zero safely. */
-    /* STM32F103 is single-bank flash. Never use the staging flash address as
-     * the source while erasing/programming another page in that same bank.
-     * Snapshot one page into SRAM first, then erase and program from SRAM. */
-    static uint8_t page_buf[F103_FLASH_PAGE_SIZE];
-    uint32_t copied = 0u;
-    uint32_t page = 0u;
-    while (copied < size) {
-        const uint32_t remain = size - copied;
-        const uint32_t chunk = remain < F103_FLASH_PAGE_SIZE ? remain : F103_FLASH_PAGE_SIZE;
-        const uint32_t dst = F103_APP_BASE_ADDR + copied;
-        const uint8_t *src = (const uint8_t *)(F103_STAGE_BASE_ADDR + F103_VESC_IMAGE_HEADER_SIZE + copied);
-        boot_diag_copy_page = page;
-        boot_diag_copy_addr = dst;
-        boot_diag_copy_code = 100u + page;
-        memcpy(page_buf, src, chunk);
-        if (!erase_one_page(dst)) { boot_diag_copy_code = 1000u + page; return false; }
-        if (!program_halfwords(dst, page_buf, chunk)) { boot_diag_copy_code = 2000u + page; return false; }
-        copied += chunk;
-        ++page;
-    }
-    boot_diag_copy_crc_app = crc16((const uint8_t *)F103_APP_BASE_ADDR, size);
-    if (boot_diag_copy_crc_app != wanted) { boot_diag_copy_code = 3000u; return false; }
-    if (!app_vector_valid_for_size(size)) { boot_diag_copy_code = 4000u; return false; }
-    if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) { boot_diag_copy_code = 5000u; return false; }
-    boot_diag_copy_code = 6000u;
+    if (m->version != F103_UPDATE_META_VERSION) return false;
+    if ((uint16_t)(m->version ^ m->version_inv) != 0xFFFFu) return false;
     return true;
 }
 
+static bool vector_valid_at(uint32_t base, uint32_t image_size) {
+    if (image_size < 8u || image_size > F103_APP_REGION_SIZE) return false;
+    const uint32_t sp = *(const uint32_t *)base;
+    const uint32_t rv = *(const uint32_t *)(base + 4u);
+    if (sp < 0x20000000u || sp > F103_BOOT_REQUEST_ADDR || (sp & 3u)) return false;
+    if ((rv & 1u) == 0u) return false;
+    const uint32_t pc = rv & ~1u;
+    return pc >= F103_APP_BASE_ADDR && pc < (F103_APP_BASE_ADDR + image_size);
+}
+
+static bool app_valid(void) {
+    const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
+    if (pending_valid(m)) return false;
+    const uint32_t sp = *(const uint32_t *)F103_APP_BASE_ADDR;
+    const uint32_t rv = *(const uint32_t *)(F103_APP_BASE_ADDR + 4u);
+    if (sp < 0x20000000u || sp > F103_BOOT_REQUEST_ADDR || (sp & 3u)) return false;
+    if ((rv & 1u) == 0u) return false;
+    const uint32_t pc = rv & ~1u;
+    return pc >= F103_APP_BASE_ADDR && pc <
+           (F103_APP_BASE_ADDR + F103_APP_REGION_SIZE);
+}
+static bool copy_pending_image(void) {
+    const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
+    if (!pending_valid(m)) return false;
+
+    uint32_t size = 0u;
+    uint16_t wanted = 0u;
+    if (!stage_valid(&size, &wanted)) return false;
+    if (size != m->size || wanted != m->crc16) return false;
+
+    const uint8_t *stage = (const uint8_t *)(F103_STAGE_BASE_ADDR +
+                                            F103_VESC_IMAGE_HEADER_SIZE);
+    if (!vector_valid_at((uint32_t)stage, size)) return false;
+
+    static uint8_t page_buf[F103_FLASH_PAGE_SIZE];
+    uint32_t copied = 0u;
+    while (copied < size) {
+        const uint32_t remain = size - copied;
+        const uint32_t chunk = remain < F103_FLASH_PAGE_SIZE ?
+                               remain : F103_FLASH_PAGE_SIZE;
+        const uint32_t dst = F103_APP_BASE_ADDR + copied;
+        memcpy(page_buf, stage + copied, chunk);
+        if (!erase_page(dst)) return false;
+        if (!flash_program_block(dst, page_buf, chunk)) return false;
+        if (memcmp((const void *)dst, page_buf, chunk) != 0) return false;
+        copied += chunk;
+    }
+
+    if (crc16((const uint8_t *)F103_APP_BASE_ADDR, size) != wanted) return false;
+    if (!vector_valid_at(F103_APP_BASE_ADDR, size)) return false;
+    return erase_meta();
+}
 __attribute__((naked, noreturn)) static void branch_to_app(uint32_t sp, uint32_t rv) {
-    (void)sp; (void)rv;
+    (void)sp;
+    (void)rv;
     __asm volatile (
         "msr msp, r0\n"
         "bx r1\n"
@@ -310,223 +217,43 @@ __attribute__((naked, noreturn)) static void branch_to_app(uint32_t sp, uint32_t
 static void jump_app(void) {
     const uint32_t sp = *(const uint32_t *)F103_APP_BASE_ADDR;
     const uint32_t rv = *(const uint32_t *)(F103_APP_BASE_ADDR + 4u);
-    (void)HAL_UART_DeInit(&huart3);
-    HAL_SuspendTick();
     __disable_irq();
-    SysTick->CTRL = 0u; SysTick->LOAD = 0u; SysTick->VAL = 0u;
-    for (uint32_t i = 0u; i < 8u; ++i) { NVIC->ICER[i] = 0xFFFFFFFFu; NVIC->ICPR[i] = 0xFFFFFFFFu; }
+    SysTick->CTRL = 0u;
+    SysTick->LOAD = 0u;
+    SysTick->VAL = 0u;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        NVIC->ICER[i] = 0xFFFFFFFFu;
+        NVIC->ICPR[i] = 0xFFFFFFFFu;
+    }
     SCB->VTOR = F103_APP_BASE_ADDR;
     __DSB();
     __ISB();
-    /* Never execute C code after MSP changes. branch_to_app is naked and
-     * transfers directly to the application's Reset_Handler. */
     branch_to_app(sp, rv);
 }
 
-
-static bool uart_recv_byte(uint8_t *out, uint32_t timeout_ms) {
-    const uint32_t start=HAL_GetTick();
-    while ((HAL_GetTick()-start)<timeout_ms) {
-        const uint32_t sr=USART3->SR;
-        if ((sr & USART_SR_RXNE)!=0u) {
-            const uint8_t b=(uint8_t)USART3->DR;
-            if ((sr & (USART_SR_FE|USART_SR_NE|USART_SR_PE))!=0u) {
-                ++boot_diag_uart_errors;
-                continue;
-            }
-            if ((sr & USART_SR_ORE)!=0u) ++boot_diag_uart_errors;
-            *out=b;
-            ++boot_diag_rx_bytes;
-            return true;
-        }
-        if ((sr & USART_SR_ORE)!=0u) {
-            volatile uint32_t discard=USART3->DR;
-            (void)discard;
-            ++boot_diag_uart_errors;
-        }
-    }
-    return false;
+static __attribute__((noreturn)) void safe_fault(void) {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+    __disable_irq();
+    for (;;) { __WFI(); }
 }
-
-static bool uart_send_bytes(const uint8_t *data, uint16_t len, uint32_t timeout_ms) {
-    if (!data || len == 0u) return false;
-    for (uint16_t i = 0u; i < len; ++i) {
-        const uint32_t start = HAL_GetTick();
-        while ((USART3->SR & USART_SR_TXE) == 0u) {
-            if ((HAL_GetTick() - start) >= timeout_ms) { ++boot_diag_uart_errors; return false; }
-        }
-        USART3->DR = data[i];
-    }
-    const uint32_t start = HAL_GetTick();
-    while ((USART3->SR & USART_SR_TC) == 0u) {
-        if ((HAL_GetTick() - start) >= timeout_ms) { ++boot_diag_uart_errors; return false; }
-    }
-    return true;
-}
-
-static void send_payload(const uint8_t *p, uint16_t len) {
-    uint8_t tx[RX_MAX_PAYLOAD + 7u]; uint16_t i = 0u;
-    if (!p || len == 0u || len > RX_MAX_PAYLOAD) return;
-    if (len <= 255u) { tx[i++] = 2u; tx[i++] = (uint8_t)len; }
-    else { tx[i++] = 3u; tx[i++] = (uint8_t)(len >> 8); tx[i++] = (uint8_t)len; }
-    memcpy(&tx[i], p, len); i = (uint16_t)(i + len);
-    uint16_t c = crc16(p, len); tx[i++] = (uint8_t)(c >> 8); tx[i++] = (uint8_t)c; tx[i++] = 3u;
-    if (uart_send_bytes(tx, i, 1000u)) ++boot_diag_tx_replies;
-}
-
-static bool recv_payload(uint32_t timeout_ms, uint16_t *len_out) {
-    const uint32_t start_ms = HAL_GetTick();
-    uint8_t b = 0u;
-    while ((HAL_GetTick() - start_ms) < timeout_ms) {
-        if (!uart_recv_byte(&b, 10u)) continue;
-        if (b != 2u && b != 3u) continue;
-        ++boot_diag_start_frames;
-        uint16_t len = 0u;
-        if (b == 2u) {
-            if (!uart_recv_byte(&b, 50u)) continue;
-            len = b;
-        } else {
-            uint8_t l0 = 0u, l1 = 0u;
-            if (!uart_recv_byte(&l0, 50u) || !uart_recv_byte(&l1, 50u)) continue;
-            len = (uint16_t)(((uint16_t)l0 << 8) | l1);
-        }
-        if (len == 0u || len > RX_MAX_PAYLOAD) continue;
-        bool ok = true;
-        for (uint16_t i = 0u; i < len; ++i) {
-            if (!uart_recv_byte(&rx_payload[i], 1000u)) { ok = false; break; }
-        }
-        if (!ok) continue;
-        uint8_t c0 = 0u, c1 = 0u, tail = 0u;
-        if (!uart_recv_byte(&c0, 100u) || !uart_recv_byte(&c1, 100u) || !uart_recv_byte(&tail, 100u)) continue;
-        const uint16_t got = (uint16_t)(((uint16_t)c0 << 8) | c1);
-        if (tail != 3u || got != crc16(rx_payload, len)) { ++boot_diag_crc_errors; continue; }
-        ++boot_diag_packets_ok;
-        if (len_out) *len_out = len;
-        return true;
-    }
-    return false;
-}
-
-static void reply_fw_version(void) {
-    uint8_t b[72]; uint16_t i = 0u;
-    const char hw[] = "f103rc_bootloader"; const char fw[] = "f103rc_bootloader";
-    b[i++] = COMM_FW_VERSION; b[i++] = 6u; b[i++] = 0u;
-    memcpy(&b[i], hw, sizeof(hw)); i += sizeof(hw);
-    memcpy(&b[i], (const void *)0x1FFFF7E8u, 12u); i += 12u;
-    b[i++] = 1u; b[i++] = 0u; b[i++] = 0u; b[i++] = 0u;
-    b[i++] = 0u; b[i++] = 0u; b[i++] = 0u; b[i++] = 0u;
-    memcpy(&b[i], fw, sizeof(fw)); i += sizeof(fw);
-    send_payload(b, i);
-}
-
-static bool recovery_command(uint16_t len) {
-    if (len == 0u) return true;
-    const uint8_t id = rx_payload[0]; const uint8_t *d = rx_payload + 1u; uint16_t n = len - 1u;
-    if (id == COMM_FW_VERSION) { reply_fw_version(); return true; }
-    if (id == COMM_ALIVE) return true;
-    if (id == COMM_ERASE_NEW_APP) {
-        uint8_t r[2] = {COMM_ERASE_NEW_APP, 0u};
-        if (n >= 4u) {
-            const uint32_t size = be32(d);
-            if (size > 0u && size <= F103_MAX_FW_IMAGE_SIZE &&
-                erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE) &&
-                erase_pages(F103_STAGE_BASE_ADDR, F103_STAGE_REGION_SIZE)) {
-                stage_session_active = true;
-                stage_session_total = size + F103_VESC_IMAGE_HEADER_SIZE;
-                r[1] = 1u;
-            }
-        }
-        send_payload(r, sizeof(r)); return true;
-    }
-    if (id == COMM_WRITE_NEW_APP_DATA) {
-        uint8_t r[6] = {COMM_WRITE_NEW_APP_DATA,0u,0u,0u,0u,0u};
-        if (n >= 4u) {
-            const uint32_t off = be32(d); const uint32_t dl = n - 4u;
-            r[2] = (uint8_t)(off >> 24); r[3] = (uint8_t)(off >> 16); r[4] = (uint8_t)(off >> 8); r[5] = (uint8_t)off;
-            if (stage_session_active && (off & 1u) == 0u && dl > 0u &&
-                off <= stage_session_total && dl <= stage_session_total - off) {
-                const uint32_t dst = F103_STAGE_BASE_ADDR + off;
-                /* OTA writes are idempotent: if an ACK is lost, the host may
-                 * resend the exact same chunk without re-erasing or attempting
-                 * to reprogram an already-programmed halfword. */
-                if (memcmp((const void *)dst, d + 4u, dl) == 0) {
-                    r[1] = 1u;
-                } else {
-                    r[1] = program_halfwords(dst, d + 4u, dl) ? 1u : 0u;
-                }
-            }
-        }
-        send_payload(r, sizeof(r)); return true;
-    }
-    if (id == COMM_JUMP_TO_BOOTLOADER) {
-        if (stage_to_pending_meta() && copy_pending_image()) NVIC_SystemReset();
-        (void)write_meta(F103_UPDATE_STATE_RECOVERY, 0u, 0u); return true;
-    }
-    if (id == COMM_REBOOT) {
-        (void)erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE);
-        if (app_vector_valid()) NVIC_SystemReset();
-        return true;
-    }
-    return true;
-}
-
 int main(void) {
-    /* Startup SystemInit() leaves the MCU on HSI=8 MHz but the CMSIS variable
-     * defaults to 72 MHz. Fix the software model first, then raise the actual
-     * clock to the same 64/32-MHz tree as the application before USART3 init. */
-    SystemCoreClockUpdate();
-    HAL_Init();
-    if (!boot_clock_init()) {
-        for (;;) { }
-    }
     safe_gpio_init();
-    if (!uart_init()) {
-        for (;;) { HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_2); HAL_Delay(100u); }
-    }
 
-    volatile uint32_t *const boot_request = (volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
-    const bool force_recovery = boot_request[0] == F103_BOOT_REQUEST_MAGIC &&
-                                boot_request[1] == F103_BOOT_REQUEST_MAGIC_INV;
-    /* Consume immediately so any later reset boots normally unless another
-     * explicit request or persistent PENDING/RECOVERY metadata exists. */
-    boot_request[0] = 0u;
-    boot_request[1] = 0u;
-    __DSB();
+    const f103_update_meta_t *m =
+        (const f103_update_meta_t *)F103_META_BASE_ADDR;
 
-    const f103_update_meta_t *m=(const f103_update_meta_t *)F103_META_BASE_ADDR;
-    if (meta_valid(m) && m->state==F103_UPDATE_STATE_PENDING) {
-        if (copy_pending_image()) NVIC_SystemReset();
-        (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
-    }
-
-    /* Match the VESC update order: the application already handled
-     * COMM_ERASE_NEW_APP and COMM_WRITE_NEW_APP_DATA. A forced bootloader entry
-     * means staging is complete; validate size+CRC before touching APP, persist
-     * PENDING, then copy. PENDING makes an interrupted copy power-loss safe. */
-    if (force_recovery) {
-        if (stage_to_pending_meta()) {
-            if (copy_pending_image()) NVIC_SystemReset();
-            (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
-        } else if (app_vector_valid()) {
-            /* Invalid/incomplete staging must never destroy or trap a valid app. */
-            jump_app();
-        } else {
-            (void)write_meta(F103_UPDATE_STATE_RECOVERY,0u,0u);
+    if (pending_valid(m)) {
+        for (uint32_t attempt = 0u; attempt < COPY_RETRIES; ++attempt) {
+            if (copy_pending_image()) {
+                NVIC_SystemReset();
+            }
         }
+        safe_fault();
     }
 
-    bool recovery=meta_valid((const f103_update_meta_t *)F103_META_BASE_ADDR) &&
-                  ((const f103_update_meta_t *)F103_META_BASE_ADDR)->state==F103_UPDATE_STATE_RECOVERY;
-    if (!recovery && app_vector_valid()) jump_app();
-    recovery=true;
-
-    uint32_t blink = HAL_GetTick();
-    while (recovery) {
-        uint16_t len = 0u;
-        if (recv_payload(50u, &len)) recovery_command(len);
-        if ((HAL_GetTick() - blink) >= RECOVERY_IDLE_BLINK_MS) {
-            HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2); blink = HAL_GetTick();
-        }
+    if (app_valid()) {
+        jump_app();
     }
-    for (;;) { }
+
+    safe_fault();
 }

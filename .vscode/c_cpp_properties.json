@@ -121,7 +121,6 @@
                 "USE_HAL_DRIVER",
                 "STM32F103xE",
                 "VARIANT_USART",
-                "VECT_TAB_OFFSET=0x00002800U",
                 "USE_HAL_DRIVER",
                 "F_CPU=72000000L",
                 ""

@@ -423,156 +423,105 @@ def resolve_serial_port(args):
                 except Exception: pass
     raise RuntimeError('no VESC/F103 target responded on serial ports: '+', '.join(errors))
 
-def _recover_staging_transport(link, reason: str):
-    print(f'[VESC] transport recovery during staging: {reason}',flush=True)
-    last_error=None
-    for attempt in range(1,5):
-        try:
-            if link.sock is not None:
-                link.reconnect_tcp()
-            elif link.args.transport=='tcp':
-                link._open_tcp(attempts=4)
-            hw=fw_version(link,3.0)
-            print(f'[VESC] transport recovered target={hw}; restart staging from erase',flush=True)
-            raise RestartUploadSession('transport recovered; staging must restart from erase')
-        except RestartUploadSession:
-            raise
-        except Exception as e:
-            last_error=e
-            time.sleep(.20*attempt)
-    raise RuntimeError(f'transport recovery failed: {last_error}')
-
 def _stage_once(link,fw:bytes,session:int):
-    p=link.transact(bytes((COMM_ERASE_NEW_APP,))+struct.pack('>I',len(fw)),COMM_ERASE_NEW_APP,10)
-    if len(p)<2 or p[1]!=1: raise RuntimeError('erase staging rejected')
+    erase=bytes((COMM_ERASE_NEW_APP,))+struct.pack('>I',len(fw))
+    p=link.transact(erase,COMM_ERASE_NEW_APP,12.0)
+    if len(p)<2 or p[1]!=1:
+        raise RuntimeError('COMM_ERASE_NEW_APP rejected')
+
     staged=struct.pack('>IH',len(fw),crc16(fw))+fw
-    # The F411 path crosses TCP -> ROS -> USB CDC -> 115200 UART. Smaller
-    # packets reduce worst-case blocking and USB/UART burst pressure while the
-    # bootloader's idempotent writes make retries safe.
     step=128 if link.args.transport in ('f411','tcp') else 384
     for off in range(0,len(staged),step):
         chunk=staged[off:off+step]
-        request=bytes((COMM_WRITE_NEW_APP_DATA,))+struct.pack('>I',off)+chunk
-        last_error=None
-        for attempt in range(1,5):
+        req=bytes((COMM_WRITE_NEW_APP_DATA,))+struct.pack('>I',off)+chunk
+        last=None
+        for attempt in range(1,4):
             try:
-                p=link.transact(request,COMM_WRITE_NEW_APP_DATA,2.5)
-                if len(p)>=6 and p[1]==1 and struct.unpack('>I',p[2:6])[0]==off:
-                    last_error=None; break
-                last_error=RuntimeError(f'bad write ACK at {off}: {p.hex()}')
+                p=link.transact(req,COMM_WRITE_NEW_APP_DATA,3.0)
+                ack_off=struct.unpack('>I',p[2:6])[0] if len(p)>=6 else -1
+                if len(p)>=6 and p[1]==1 and ack_off==off:
+                    last=None
+                    break
+                last=RuntimeError(f'bad ACK {p.hex()}')
             except Exception as e:
-                last_error=e
-                if link.f411_direct and 'OWNER:RUNTIME' in str(e):
-                    try:
-                        link._refresh_f411_maintenance(force=True)
-                        print(f'[F411] maintenance ownership restored at offset={off}', flush=True)
-                    except Exception as me:
-                        last_error=RuntimeError(f'{e}; maintenance restore failed: {me}')
-            if attempt<4:
-                print(f'[VESC] retry offset={off} attempt={attempt+1} reason={last_error}', flush=True)
-                # One immediate idempotent retry handles a lost ACK. If two
-                # attempts fail on TCP, rebuild the socket/maintenance route.
-                if attempt==2 and link.sock is not None:
-                    _recover_staging_transport(link,f'offset={off}')
-                time.sleep(.08*attempt)
-        if last_error is not None:
-            raise RuntimeError(f'write failed at {off}: {last_error}')
-        if off==0 or off+len(chunk)>=len(staged) or off%(step*40)==0:
-            print(f'[VESC] session={session} write {min(off+len(chunk),len(staged))}/{len(staged)}', flush=True)
-        time.sleep(.001)
+                last=e
+            if attempt<3:
+                time.sleep(.05*attempt)
+        if last is not None:
+            raise RuntimeError(f'write failed offset={off}: {last}')
+        done=min(off+len(chunk),len(staged))
+        if off==0 or done==len(staged) or (off//step)%20==0:
+            print(f'[VESC] session={session} write {done}/{len(staged)}',flush=True)
 
 
 def upload(link,fw:bytes):
     if not fw or len(fw)>MAX_FW:
         raise RuntimeError(f'firmware size {len(fw)} exceeds {MAX_FW}')
-    hw=None; last_error=None
-    probe_deadline=time.monotonic()+75.0
-    attempt=0
-    while time.monotonic()<probe_deadline:
-        attempt+=1
+
+    hw=None
+    last=None
+    for attempt in range(1,6):
         try:
-            hw=fw_version(link,1.2)
+            hw=fw_version(link,1.5)
             break
         except Exception as e:
-            last_error=e
-            if link.sock is not None and link.args.transport=='tcp':
-                try: link.reconnect_tcp()
-                except Exception as re: last_error=re
-            if attempt==1 or attempt%4==0:
-                remain=max(0,int(probe_deadline-time.monotonic()))
-                print(f'[VESC] waiting for F103 response attempt={attempt} remaining={remain}s',flush=True)
-            time.sleep(.15)
+            last=e
+            time.sleep(.20*attempt)
     if hw is None:
-        raise RuntimeError(f'initial firmware probe failed after recovery window: {last_error}')
-
-    recovery_target='bootloader' in hw.lower()
-    if recovery_target:
-        print(f'[VESC] recovery bootloader connected: {hw}',flush=True)
-    else:
-        print(f'[VESC] application connected: {hw}; staging before bootloader jump',flush=True)
+        raise RuntimeError(f'application handshake failed: {last}')
+    if 'bootloader' in hw.lower():
+        raise RuntimeError('target is not running application firmware')
+    print(f'[VESC] application connected: {hw}',flush=True)
 
     stage_error=None
-    for session in range(1,4):
+    for session in range(1,3):
         try:
             _stage_once(link,fw,session)
             stage_error=None
             break
-        except RestartUploadSession as e:
-            stage_error=e
         except Exception as e:
             stage_error=e
-        if session>=3:
-            break
-        print(f'[VESC] staging session {session} failed: {stage_error}; restarting from erase',flush=True)
-        try:
-            if link.sock is not None:
-                link.reconnect_tcp()
-            hw=fw_version(link,3.0)
-            recovery_target='bootloader' in hw.lower()
-        except Exception:
-            pass
+            if session<2:
+                print(f'[VESC] staging retry from erase: {e}',flush=True)
+                time.sleep(.25)
     if stage_error is not None:
-        raise RuntimeError(f'staging failed after recovery attempts: {stage_error}')
+        raise RuntimeError(f'staging failed: {stage_error}')
 
-    # VESC-standard ordering: ERASE/WRITE happen while application is alive.
-    # The bootloader is entered only after size+CRC+image are fully ACKed.
     link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
     print('[VESC] staging complete; COMM_JUMP_TO_BOOTLOADER sent',flush=True)
     link.buf.clear()
     if hasattr(link,'linebuf'):
         link.linebuf.clear()
     if link.ser is not None and not link.f411_direct:
-        try: link.ser.reset_input_buffer()
-        except Exception: pass
-
-    deadline=time.monotonic()+60.0
-    last=''; stable_app_probes=0; probe_failures=0; bootloader_probes=0
-    while time.monotonic()<deadline:
-        time.sleep(.40)
         try:
-            last=fw_version(link,1.5)
-            probe_failures=0
-            if last and 'bootloader' not in last.lower():
-                stable_app_probes+=1
-                if stable_app_probes>=2:
-                    print(f'[VESC] application returned stable: {last}',flush=True)
-                    return
-            else:
-                stable_app_probes=0
-                bootloader_probes+=1
-                if bootloader_probes==1:
-                    print(f'[VESC] recovery bootloader visible while waiting for app: {last}',flush=True)
-        except Exception as e:
-            stable_app_probes=0
-            probe_failures+=1
-            if probe_failures>=3 and link.sock is not None:
-                try:
-                    link.reconnect_tcp()
-                    probe_failures=0
-                    print(f'[VESC] reconnect while waiting for updated application: {e}',flush=True)
-                except Exception:
-                    pass
-    raise RuntimeError(f'application did not return stably after bootloader copy; last={last!r}')
+            link.ser.reset_input_buffer()
+        except Exception:
+            pass
+
+    start_wait=time.monotonic()
+    deadline=start_wait+45.0
+    saw_gap=False
+    stable=0
+    last_hw=''
+    while time.monotonic()<deadline:
+        time.sleep(.25)
+        try:
+            last_hw=fw_version(link,.75)
+            if not saw_gap:
+                if time.monotonic()-start_wait>2.0:
+                    raise RuntimeError('target never reset after COMM_JUMP_TO_BOOTLOADER')
+                continue
+            stable+=1
+            if stable>=2:
+                print(f'[VESC] application returned stable: {last_hw}',flush=True)
+                return
+        except RuntimeError:
+            raise
+        except Exception:
+            saw_gap=True
+            stable=0
+    raise RuntimeError(f'application did not return after bootloader copy; last={last_hw!r}')
+
 
 def selftest():
     p=b'\x00\x06\x00test\x00'; f=frame(p)
