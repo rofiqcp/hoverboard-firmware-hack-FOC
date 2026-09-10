@@ -38,6 +38,7 @@ static volatile uint32_t usart3RxRestartCount = 0u;
 static volatile uint32_t usart3ForcedRecoveryCount = 0u;
 static volatile uint8_t usart3RxErrorPending = 0u;
 static uint32_t usart3LastByteMs = 0u;
+static uint32_t usart3RxEpochMs = 0u;
 static uint32_t usart3LastValidFrameMs = 0u;
 static uint32_t usart3LastValidCount = 0u;
 static uint32_t usart3LastForcedRecoveryMs = 0u;
@@ -101,6 +102,7 @@ void Input_Init(void) {
   HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
   UART_EnableRxErrorRecovery(&huart3);
   usart3LastByteMs = HAL_GetTick();
+  usart3RxEpochMs = usart3LastByteMs;
   usart3LastValidFrameMs = usart3LastByteMs;
   usart3LastValidCount = 0u;
   usart3LastForcedRecoveryMs = 0u;
@@ -232,6 +234,7 @@ static bool usart3_restart_rx_main(bool reset_protocol) {
   huart3.ErrorCode = HAL_UART_ERROR_NONE;
   huart3.RxState = HAL_UART_STATE_READY;
   if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) != HAL_OK) return false;
+  usart3RxEpochMs = HAL_GetTick();
   ++usart3RxRestartCount;
   __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
   return true;
@@ -260,7 +263,16 @@ void usart3_rx_check(void) {
   }
   const uint32_t pos = sizeof(rxBuffer) - __HAL_DMA_GET_COUNTER(huart3.hdmarx);
   if (pos == usart3RxOldPos) return;
-  usart3LastByteMs = HAL_GetTick();
+  const uint32_t rx_now = HAL_GetTick();
+  if ((uint32_t)(rx_now - usart3LastByteMs) > USART3_RAW_RECENT_MS) {
+    /* New traffic epoch after an idle wire. Give the first VESC frame a full
+     * valid-progress window before recovery is allowed. Without this guard the
+     * first bytes made RAW recent while last-valid was still old, so recovery
+     * reset USART3 in the middle of the first frame and emitted a deterministic
+     * 0xFF artifact / lost first reply. */
+    usart3RxEpochMs = rx_now;
+  }
+  usart3LastByteMs = rx_now;
 
   if (pos > usart3RxOldPos) {
     for (uint32_t i = usart3RxOldPos; i < pos; ++i) serialAcceptByte(rxBuffer[i]);
@@ -281,6 +293,7 @@ void usart3_recovery_tick(uint32_t now_ms) {
     return;
   }
   if ((uint32_t)(now_ms - usart3LastByteMs) > USART3_RAW_RECENT_MS) return;
+  if ((uint32_t)(now_ms - usart3RxEpochMs) < USART3_VALID_PROGRESS_TIMEOUT_MS) return;
   if ((uint32_t)(now_ms - usart3LastValidFrameMs) < USART3_VALID_PROGRESS_TIMEOUT_MS) return;
   if ((uint32_t)(now_ms - usart3LastForcedRecoveryMs) < USART3_RECOVERY_COOLDOWN_MS) return;
 
@@ -304,6 +317,7 @@ void usart3_recovery_tick(uint32_t now_ms) {
   ++usart3ForcedRecoveryCount;
   if (usart3RecoveryStreak < 0xffu) ++usart3RecoveryStreak;
   usart3LastForcedRecoveryMs = now_ms;
+  usart3RxEpochMs = now_ms;
   usart3LastValidFrameMs = now_ms; // fresh grace interval after UART restart
 
   if (usart3EverValid && usart3RecoveryStreak >= USART3_RECOVERY_BEFORE_RESET) {
