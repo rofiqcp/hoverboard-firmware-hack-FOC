@@ -70,6 +70,12 @@
 #define MCCONF_STEERING_BREAKAWAY_DELAY_MS           150u
 #define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        1000u /* no high-current assist inside +/-1 degree */
 #define MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS     32u /* require ~0.39 deg real rack motion; reject encoder/mechanical chatter */
+#define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
+#define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
+#define MCCONF_STEERING_CENTER_PID_MS             2500u
+#define MCCONF_STEERING_CENTER_TRIM_TIMEOUT_MS    2500u
+#define MCCONF_STEERING_CENTER_PULSE_MS             15u
+#define MCCONF_STEERING_CENTER_REST_MS              70u
 #define MCCONF_STEERING_HOME_CURRENT_A             3.00f
 #define MCCONF_STEERING_CAL_CURRENT_MAX_A         15.00f /* commissioning only; runtime steering stays capped separately */
 #define MCCONF_STEERING_DETECT_CURRENT_START_A      3.00f

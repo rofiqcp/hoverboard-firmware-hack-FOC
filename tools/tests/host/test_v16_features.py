@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 R=next(p for p in Path(__file__).resolve().parents if (p/'platformio.ini').exists())
 mc=(R/'Src/motor/mcpwm_foc.c').read_text()
+mci=(R/'Src/motor/mc_interface.c').read_text()
 fm=(R/'Src/motor/foc_math.c').read_text()
 assert 'second ? FOC_SENSOR_MODE_HALL : FOC_SENSOR_MODE_ENCODER' in mc and 'second ? SENSOR_PORT_MODE_HALL : SENSOR_PORT_MODE_ABI' in mc, 'Blank/default config must be LEFT ABI encoder + RIGHT Hall'
 mch=(R/'Src/motor/mcpwm_foc.h').read_text()
@@ -161,6 +162,10 @@ dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
 assert 'Jangan hapus nilai telemetry itu' in mc, 'idle live current telemetry path missing'
+assert 'steering_center_after_span_calibration' in mci, 'steering detect must have bounded midpoint finalizer'
+assert 'ok=mc_interface_store_configuration_motor(false);' in vp, 'Detect Encoder must persist detected ABI electrical config before success'
+assert 'MCCONF_STEERING_CENTER_TOL_COUNTS' in mci and 'steering_stage_set(0xE8u)' in mci, 'detect must fail closed when midpoint centering fails'
+assert 'mcpwm_foc_steering_rebase_center()' in mci, 'successful detect must rebase measured midpoint to logical zero'
 print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo16=1 vesc_request_reply=1 brake_dynamic=1 std_pos=1 custom_count_cap=1 std_openloop=1')
 
 assert 'MCCONF_STEERING_POS_MIN_DEG' in (R/'Src/motor/mcconf_default.h').read_text()

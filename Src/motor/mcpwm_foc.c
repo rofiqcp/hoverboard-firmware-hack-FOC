@@ -3497,13 +3497,12 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
      * standstill. m_rpm*pp is signed ERPM, so this is exactly -deg/s*Kd_proc. */
     int64_t dproc64=-(int64_t)m->m_rpm*(int32_t)motor_pole_pairs(second)*
                     (int64_t)m->m_position_kd_proc_coeff_q16;
-    /* ABI encoder direction is electrical. For an inverted ABI encoder the
-     * measured mechanical RPM sign is opposite the user/count coordinate used
-     * by the position loop. Apply the same sign transform to process-D as the
-     * position error. This matches the historically stable steering behavior
-     * and prevents the center limit-cycle seen when the transform was omitted. */
-    if(encoder_count_mode && m->m_conf.foc_encoder_inverted)
-        dproc64=-dproc64;
+    /* Encoder RPM is already transformed into the corrected FOC direction in
+     * encoder_feedback_finalize_speed_non_isr() via dc_foc. Do not apply
+     * foc_encoder_inverted a second time here: doing so turns -velocity process-D
+     * into positive feedback on inverted ABI steering and causes stop-to-stop
+     * oscillation. Position error and measured RPM are already in the same
+     * corrected electrical coordinate at this point. */
     dproc64 >>= 16;
     if(dproc64>32768)dproc64=32768; else if(dproc64<-32768)dproc64=-32768;
     const int32_t dproc_raw_q15=(int32_t)((dproc64*(int64_t)gain_scale)>>15);

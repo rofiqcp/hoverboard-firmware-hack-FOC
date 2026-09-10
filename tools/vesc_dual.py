@@ -264,6 +264,7 @@ class F411DirectTransport:
             self.ser.write(b"\n"); self.ser.flush(); time.sleep(0.03); self.ser.reset_input_buffer()
             self._command("VESC:MODE:MAINTENANCE", "VESC:MODE:MAINTENANCE", 3.0)
             self._command("VESC:STATUS", "mode=MAINTENANCE", 2.0)
+            self._last_maintenance_keepalive = time.monotonic()
             time.sleep(0.30)
         except Exception:
             try:
@@ -286,8 +287,25 @@ class F411DirectTransport:
                 except ValueError as exc:
                     raise RuntimeError(f"bad F411 VESC hex: {hx[:80]}") from exc
 
+    def _maintenance_keepalive(self) -> None:
+        """Refresh the F411 maintenance lease during long blocking VESC commands.
+
+        F411 intentionally expires maintenance ownership after a few seconds.
+        Encoder/steering detection can legitimately take tens of seconds, so
+        keep the lease alive while this direct transport remains the exclusive
+        CDC owner. The gateway ACK is a normal text line and _pump() ignores it.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_maintenance_keepalive", 0.0)
+        if now - last < 1.5:
+            return
+        self.ser.write(b"VESC:MODE:MAINTENANCE\n")
+        self.ser.flush()
+        self._last_maintenance_keepalive = now
+
     def _pump(self, deadline: float) -> None:
         while time.monotonic() < deadline:
+            self._maintenance_keepalive()
             waiting = self.ser.in_waiting
             chunk = self.ser.read(waiting or 1)
             if not chunk:

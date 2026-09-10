@@ -3057,12 +3057,20 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
                 ok=mc_interface_steering_detect_calibrate(current,&span_off,&span_ratio,&logical_inv,
                                                            &raw_left,&raw_right,&span);
                 if(ok){
-                    /* Wire reply remains stock VESC electrical semantics. Span
-                     * is persisted separately by the project calibration path. */
+                    /* Standalone Detect Encoder changes real electrical ABI
+                     * parameters. Persist them together with the already stored
+                     * steering span before returning success; otherwise a reboot
+                     * can silently restore the old inversion/ratio and make the
+                     * geometric calibration unsafe. */
+                    ok=mc_interface_store_configuration_motor(false);
+                }
+                if(ok){
+                    /* Wire reply remains stock VESC electrical semantics. */
                     off=eoff; ratio=eratio; inv=einv;
                 }else{
                     mc_configuration restore=backup;
                     mc_interface_set_configuration(&restore);
+                    (void)mc_interface_store_configuration_motor(false);
                     (void)mc_interface_set_steering_logical_inverted(old_logical_inv);
                     if(old_cal && old_span!=0)
                         (void)mcpwm_foc_steering_set_span(old_span,old_homed);

@@ -29,7 +29,8 @@ assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc an
 assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
 assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 5.0 A runtime safety limit'
 assert 'MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering Kp multiplier must stay bounded'
-assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' in mc, 'ABI process-D sign must follow encoder inversion in steering count mode'
+assert 'const int32_t dc_foc=m->m_conf.foc_encoder_inverted?-dc:dc;' in mc, 'ABI RPM estimator must apply encoder inversion exactly once'
+assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' not in mc, 'process-D must not double-apply encoder inversion after RPM correction'
 assert 'SerialFeedback' not in main and 'legacyTelemetryPrevMs' not in main, 'dead legacy telemetry must stay removed'
 assert 'USART3 hanya membawa protokol VESC' in main, 'VESC-exclusive USART3 rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp

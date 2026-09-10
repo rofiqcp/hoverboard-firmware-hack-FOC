@@ -354,14 +354,23 @@ static bool hall_table_sane(const uint8_t t[8]) {
 
 static void steering_bounded_delay_ms(uint32_t ms) {
     if (ms == 0u) return;
+    /* Steering commissioning is intentionally synchronous, but the normal main
+     * loop is therefore blocked while it runs. Service the public 1-kHz outer
+     * control slow path once per elapsed millisecond so powered current-zero
+     * finalization and the position/speed outer loops continue to make forward
+     * progress. The hard realtime current/PWM loop remains exclusively in ISR. */
     if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0u) {
-        HAL_Delay(ms);
+        while (ms-- > 0u) {
+            HAL_Delay(1u);
+            mcpwm_foc_outer_control_non_isr(HAL_GetTick());
+        }
         return;
     }
     const uint32_t cycles_per_ms = 64000u;
     while (ms-- > 0u) {
         const uint32_t start = DWT->CYCCNT;
         while ((uint32_t)(DWT->CYCCNT - start) < cycles_per_ms) { (void)DWT->CYCCNT; }
+        mcpwm_foc_outer_control_non_isr(HAL_GetTick());
     }
 }
 
@@ -379,16 +388,22 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
     if(current<0.30f)current=0.30f;
     if(current>max_current)current=max_current;
     const float step=MCCONF_STEERING_DETECT_CURRENT_STEP_A;
+    /* User steering direction is a mechanical/count coordinate. For an ABI
+     * encoder whose electrical direction is inverted, the Iq sign required to
+     * move that coordinate is inverted too. Position PID applies this same
+     * transform via position_error_sign(); commissioning must not bypass it. */
+    const float electrical_dir=m->m_conf.foc_encoder_inverted ? -(float)user_dir : (float)user_dir;
 
     uint32_t age=0u;
     uint32_t level_age=0u;
     uint32_t last_move_age=0u;
-    int32_t last=m->m_position_counts;
+    const int32_t origin=m->m_position_counts;
+    int32_t last=origin;
     bool direction_has_moved=false;
 
     while(age<MCCONF_STEERING_SEEK_TIMEOUT_MS){
         mc_interface_select_motor_thread(1);
-        mc_interface_set_current((float)user_dir*current); /* Iq torque after Id/phase sync */
+        mc_interface_set_current(electrical_dir*current); /* Iq torque after Id/phase sync */
         mcpwm_foc_vesc_override_touch(false);
         steering_bounded_delay_ms(5u);
         age+=5u; level_age+=5u;
@@ -396,10 +411,22 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
 
         const int32_t now=m->m_position_counts;
         int32_t d=now-last; if(d<0)d=-d;
-        if(d>=1){
+        if(!direction_has_moved){
+            /* Do not let one or two ABI chatter counts masquerade as real rack
+             * motion. Commissioning may start below breakaway torque, so require
+             * the same meaningful progress threshold used by runtime steering
+             * before arming hard-stop detection. Until then the adaptive current
+             * ramp remains active. */
+            int32_t progress=(now-origin)*(int32_t)user_dir;
+            if(progress>=(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS){
+                direction_has_moved=true;
+                last=now;
+                last_move_age=age;
+                level_age=0u;
+            }
+        }else if(d>=1){
             last=now;
             last_move_age=age;
-            direction_has_moved=true;
         }
 
         /* If the selected current cannot break static friction, follow the VESC
@@ -427,7 +454,7 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
                 bool resumed=false;
                 uint32_t confirm_ms=0u;
                 while(confirm_ms<MCCONF_STEERING_STOP_CONFIRM_MS){
-                    mc_interface_set_current((float)user_dir*confirm);
+                    mc_interface_set_current(electrical_dir*confirm);
                     mcpwm_foc_vesc_override_touch(false);
                     steering_bounded_delay_ms(5u);
                     age+=5u; confirm_ms+=5u;
@@ -451,6 +478,97 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
         }
     }
 seek_fail:
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(false);
+    return false;
+}
+
+static bool steering_center_after_span_calibration(void){
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(false);
+    if(!m || !mcpwm_foc_encoder_is_synced(false) || !mcpwm_foc_steering_is_calibrated())return false;
+
+    const int32_t span=mcpwm_foc_steering_span_counts();
+    const int32_t span_abs=span<0?-span:span;
+    if(span_abs<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
+    const int32_t hard_margin=span_abs/2+(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS*2;
+
+    /* Coarse return uses the normal calibrated position loop, now with the
+     * corrected process-D sign. It limits acceleration far better than a long
+     * open current command from the positive hard-stop. */
+    if(!mcpwm_foc_set_steering_deg(0.0f))return false;
+    uint32_t age=0u;
+    while(age<MCCONF_STEERING_CENTER_PID_MS){
+        mcpwm_foc_vesc_override_touch(false);
+        steering_bounded_delay_ms(5u);
+        age+=5u;
+        if(m->m_fault!=FAULT_CODE_NONE)goto center_fail;
+        int32_t pos=m->m_position_counts;
+        int32_t ap=pos<0?-pos:pos;
+        if(ap>hard_margin)goto center_fail;
+        if(ap<=(int32_t)MCCONF_STEERING_CENTER_TOL_COUNTS){
+            mc_interface_release_motor();
+            mcpwm_foc_vesc_override_clear(false);
+            steering_bounded_delay_ms(120u);
+            return mcpwm_foc_steering_rebase_center();
+        }
+    }
+
+    /* Runtime PID can settle just outside center when its sub-ampere command is
+     * below rack stiction. Release first, then use short commissioning-only
+     * pulses. Every pulse is followed by a coast interval and a fresh encoder
+     * direction check, preventing the high-momentum overshoot of continuous Iq. */
+    mc_interface_release_motor();
+    mcpwm_foc_vesc_override_clear(false);
+    steering_bounded_delay_ms(120u);
+
+    float max_current=MCCONF_STEERING_HOME_CURRENT_A;
+    float cfg_max=m->m_conf.l_current_max*m->m_conf.l_current_max_scale;
+    if(!(cfg_max>0.0f))cfg_max=m->m_conf.l_current_max;
+    if(max_current>cfg_max)max_current=cfg_max;
+    if(max_current>(float)I_MOT_MAX)max_current=(float)I_MOT_MAX;
+    float current=MCCONF_STEERING_CENTER_CURRENT_A;
+    if(current>max_current)current=max_current;
+    if(current<0.30f)goto center_fail;
+
+    age=0u;
+    uint8_t no_progress_pulses=0u;
+    while(age<MCCONF_STEERING_CENTER_TRIM_TIMEOUT_MS){
+        const int32_t before=m->m_position_counts;
+        const int32_t ab=before<0?-before:before;
+        if(ab<=(int32_t)MCCONF_STEERING_CENTER_TOL_COUNTS){
+            steering_bounded_delay_ms(120u);
+            return mcpwm_foc_steering_rebase_center();
+        }
+        if(ab>hard_margin)goto center_fail;
+
+        const int8_t user_dir=(before>0)?-1:1;
+        const float electrical_dir=m->m_conf.foc_encoder_inverted?-(float)user_dir:(float)user_dir;
+        mc_interface_select_motor_thread(1);
+        mc_interface_set_current(electrical_dir*current);
+        mcpwm_foc_vesc_override_touch(false);
+        steering_bounded_delay_ms(MCCONF_STEERING_CENTER_PULSE_MS);
+        mc_interface_release_motor();
+        mcpwm_foc_vesc_override_clear(false);
+        steering_bounded_delay_ms(MCCONF_STEERING_CENTER_REST_MS);
+        age+=MCCONF_STEERING_CENTER_PULSE_MS+MCCONF_STEERING_CENTER_REST_MS;
+        if(m->m_fault!=FAULT_CODE_NONE)goto center_fail;
+
+        const int32_t after=m->m_position_counts;
+        const int32_t aa=after<0?-after:after;
+        const int32_t directed=(after-before)*(int32_t)user_dir;
+        if(directed<-(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS)goto center_fail;
+        if(aa+(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS<ab){
+            no_progress_pulses=0u;
+        }else if(no_progress_pulses<255u){
+            no_progress_pulses++;
+        }
+        if(no_progress_pulses>=3u && current<max_current-0.01f){
+            current+=0.50f;
+            if(current>max_current)current=max_current;
+            no_progress_pulses=0u;
+        }
+    }
+center_fail:
     mc_interface_release_motor();
     mcpwm_foc_vesc_override_clear(false);
     return false;
@@ -611,8 +729,8 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     m->m_position_target_counts=m->m_position_counts;
     if(!mcpwm_foc_steering_set_span(signed_span,true)){steering_stage_set(0xE6u);return false;}
 
-    /* Span calibration is geometric. Once two full sweeps are repeatable, keep
-     * that valid span independent of the optional return-to-center motion. */
+    /* Span calibration is geometric, but commissioning is accepted only after
+     * the measured midpoint has also been reached and rebased to logical zero. */
     steering_stage_set(8u);
     if(!mc_interface_store_steering_calibration()){
         mcpwm_foc_steering_clear_calibration();
@@ -620,20 +738,16 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
         return false;
     }
 
-    /* Return using exactly the same target as VESC COMM_SET_POS=180: LEFT
-     * physical steering 0 deg. Hold for a bounded 2 s, then always RELEASE.
-     * Do not invalidate a repeatable span just because the mechanism needs more
-     * time to settle; position tracking is verified separately. */
+    /* Return to the measured mechanical midpoint with a commissioning-only
+     * bounded current controller, then rebase that physical midpoint to count 0.
+     * Runtime position tuning is deliberately not part of encoder calibration. */
     steering_stage_set(9u);
-    bool center_commanded=mcpwm_foc_set_steering_deg(0.0f);
-    uint32_t center_elapsed=0u;
-    while(center_commanded && center_elapsed<2000u && m->m_fault==FAULT_CODE_NONE){
-        mcpwm_foc_vesc_override_touch(false);
-        steering_bounded_delay_ms(5u);
-        center_elapsed += 5u;
+    if(!steering_center_after_span_calibration()){
+        mcpwm_foc_release_motor(false);
+        mcpwm_foc_vesc_override_clear(false);
+        steering_stage_set(0xE8u);
+        return false;
     }
-    mcpwm_foc_release_motor(false);
-    mcpwm_foc_vesc_override_clear(false);
     steering_stage_set(10u);
     if(offset)*offset=cc->foc_encoder_offset;
     if(ratio)*ratio=cc->foc_encoder_ratio;
